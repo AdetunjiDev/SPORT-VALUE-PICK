@@ -1,0 +1,98 @@
+# =====================================================
+# PRODUCTION stack — run on an always-on server (VPS).
+#   docker compose -f docker-compose.prod.yml up -d --build
+# Postgres + Redis are internal only. Caddy terminates HTTPS
+# and password-protects the dashboard. Only 80/443 are public.
+# Requires a .env with strong secrets (see .env.example) plus:
+#   DOMAIN=yourdomain.com
+#   ACME_EMAIL=you@example.com
+#   DASH_BASICAUTH="user <bcrypt-hash>"   (see deploy/DEPLOY.md)
+# =====================================================
+name: sportybet-ai-prod
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # No published ports — internal network only.
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # One-shot: apply migrations + seed, then exit. crawler waits for it.
+  migrate:
+    build:
+      context: .
+      dockerfile: services/crawler/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    working_dir: /app/packages/db
+    command: sh -c "pnpm exec prisma migrate deploy && pnpm exec tsx prisma/seed.ts"
+    restart: "no"
+
+  crawler:
+    build:
+      context: .
+      dockerfile: services/crawler/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      REDIS_URL: redis://redis:6379
+      CRAWLER_PORT: "4100"
+      DEFAULT_CRAWL_INTERVAL_SEC: "180"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # No published port — Caddy reaches it on the internal network.
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+      DASH_BASICAUTH: ${DASH_BASICAUTH}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - crawler
+
+volumes:
+  postgres_data:
+  redis_data:
+  caddy_data:
+  caddy_config:

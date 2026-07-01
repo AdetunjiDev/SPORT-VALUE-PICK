@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Builds
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# Turbo
+.turbo/
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# Prisma
+packages/db/prisma/*.db
+packages/db/prisma/migrations/dev/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Python (ML service)
+__pycache__/
+*.pyc
+.venv/
+services/ml/models/*.pkl
+services/ml/models/*.joblib
+
+# Docker
+docker-data/
+
+# Coverage
+coverage/
+.nyc_output/

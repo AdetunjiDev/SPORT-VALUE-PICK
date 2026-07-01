@@ -1,0 +1,90 @@
+# =====================================================
+# Infrastructure for local development.
+#   docker compose up -d postgres redis
+# Postgres = primary datastore, Redis = BullMQ + cache.
+# App services (api/web/ml/crawler) are added under the
+# `full` profile once their Dockerfiles land in later
+# increments:  docker compose --profile full up -d --build
+# =====================================================
+name: sportybet-ai
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sportybet-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sportybet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sportybet_dev_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-sportybet}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sportybet} -d ${POSTGRES_DB:-sportybet}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: sportybet-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Optional DB browser UI at http://localhost:8080
+  adminer:
+    image: adminer:latest
+    container_name: sportybet-adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["tools"]
+
+  # ---- Always-on crawler + live dashboard (http://localhost:4100) ----
+  crawler:
+    build:
+      context: .
+      dockerfile: services/crawler/Dockerfile
+    container_name: sportybet-crawler
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override host-oriented values from .env with in-network service names.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-sportybet}:${POSTGRES_PASSWORD:-sportybet_dev_pw}@postgres:5432/${POSTGRES_DB:-sportybet}?schema=public
+      REDIS_URL: redis://redis:6379
+      CRAWLER_PORT: "4100"
+      DEFAULT_CRAWL_INTERVAL_SEC: "180"
+      TZ: Africa/Lagos
+      # Local dev: owner sees full Premium experience. Production leaves this
+      # unset so real customers get the Free tier + paywall.
+      DEFAULT_TIER: premium
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "4100:4100"
+
+  # ---- Other app services (activated in later increments) ----
+  # api:  build apps/api/Dockerfile  → :4000
+  # web:  build apps/web/Dockerfile  → :3000
+  # ml:   build services/ml/Dockerfile → :8000
+
+volumes:
+  postgres_data:
+  redis_data:

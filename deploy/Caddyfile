@@ -1,0 +1,19 @@
+# Caddy reverse proxy — automatic HTTPS (Let's Encrypt) + password gate.
+# {$DOMAIN}, {$ACME_EMAIL}, {$DASH_BASICAUTH} come from the environment.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode gzip
+
+	# Password-protect the whole dashboard. Generate the hash with:
+	#   docker run --rm caddy:2-alpine caddy hash-password --plaintext 'yourpassword'
+	# Then set DASH_BASICAUTH="admin <that-hash>" in .env
+	basic_auth {
+		{$DASH_BASICAUTH}
+	}
+
+	reverse_proxy crawler:4100
+}

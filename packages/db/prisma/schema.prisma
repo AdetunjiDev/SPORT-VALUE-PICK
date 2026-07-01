@@ -1,0 +1,633 @@
+// =====================================================
+// SPORTYBET AI BOOKING CODE INTELLIGENCE
+// Full ER schema — Postgres via Prisma
+// Domains: Auth/Billing · Crawling/Sources · Human Codes
+//          Football Data · AI Predictions/Slips ·
+//          Engagement · Ops/Admin
+// =====================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================
+// ENUMS
+// =====================================================
+
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum UserStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+enum AuthProvider {
+  LOCAL
+  GOOGLE
+  APPLE
+}
+
+enum SubscriptionPlan {
+  FREE
+  BASIC
+  PRO
+  VIP
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  INCOMPLETE
+  EXPIRED
+}
+
+enum PaymentProvider {
+  STRIPE
+  PAYSTACK
+  FLUTTERWAVE
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+enum SourceType {
+  RSS
+  GOOGLE_NEWS
+  BING_NEWS
+  REDDIT
+  YOUTUBE
+  TELEGRAM
+  WEBSITE
+  API
+}
+
+enum SourceStatus {
+  PENDING
+  ACTIVE
+  DISABLED
+  BLACKLISTED
+}
+
+enum CrawlStatus {
+  RUNNING
+  SUCCESS
+  PARTIAL
+  FAILED
+}
+
+enum CodeType {
+  DAILY
+  WEEKEND
+  WEEKLY
+  MONTHLY
+  VIP
+  SAFE
+  HIGH_ODDS
+  CORRECT_SCORE
+  OVER_UNDER
+  BTTS
+  DOUBLE_CHANCE
+  DRAW_NO_BET
+  COMBO
+  UNKNOWN
+}
+
+enum CodeStatus {
+  UNVERIFIED
+  ACTIVE
+  EXPIRED
+  INVALID
+  DUPLICATE
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum MatchStatus {
+  SCHEDULED
+  LIVE
+  FINISHED
+  POSTPONED
+  CANCELED
+}
+
+enum Side {
+  HOME
+  AWAY
+}
+
+enum BetOutcome {
+  PENDING
+  WON
+  LOST
+  VOID
+  HALF_WON
+  HALF_LOST
+}
+
+enum SlipSource {
+  HUMAN
+  AI
+}
+
+enum NotificationType {
+  NEW_HUMAN_CODE
+  NEW_AI_SLIP
+  HIGH_CONFIDENCE
+  ODDS_CHANGE
+  MATCH_STARTING
+  CODE_EXPIRED
+  SYSTEM
+}
+
+enum AdPlacement {
+  DASHBOARD_TOP
+  SIDEBAR
+  BETWEEN_CARDS
+  FOOTER
+}
+
+// =====================================================
+// AUTH & BILLING
+// =====================================================
+
+model User {
+  id            String       @id @default(cuid())
+  email         String       @unique
+  passwordHash  String?
+  name          String?
+  avatarUrl     String?
+  role          Role         @default(USER)
+  status        UserStatus   @default(ACTIVE)
+  emailVerified Boolean      @default(false)
+  provider      AuthProvider @default(LOCAL)
+  providerId    String?
+  lastLoginAt   DateTime?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  refreshTokens RefreshToken[]
+  subscription  Subscription?
+  payments      Payment[]
+  favorites     Favorite[]
+  notifications Notification[]
+  auditLogs     AuditLog[]     @relation("ActorAudit")
+
+  @@index([provider, providerId])
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  userAgent String?
+  ip        String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model Subscription {
+  id                 String             @id @default(cuid())
+  userId             String             @unique
+  plan               SubscriptionPlan   @default(FREE)
+  status             SubscriptionStatus @default(ACTIVE)
+  provider           PaymentProvider?
+  providerCustomerId String?
+  providerSubId      String?
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean            @default(false)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("subscriptions")
+}
+
+model Payment {
+  id             String          @id @default(cuid())
+  userId         String
+  provider       PaymentProvider
+  providerRef    String          @unique
+  amount         Decimal         @db.Decimal(12, 2)
+  currency       String          @default("NGN")
+  status         PaymentStatus   @default(PENDING)
+  plan           SubscriptionPlan?
+  metadata       Json?
+  createdAt      DateTime        @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("payments")
+}
+
+// =====================================================
+// CRAWLING & SOURCES
+// =====================================================
+
+model Source {
+  id               String       @id @default(cuid())
+  name             String
+  type             SourceType
+  url              String
+  enabled          Boolean      @default(true)
+  status           SourceStatus @default(ACTIVE)
+  trustScore       Float        @default(0.5) // 0..1, drives source reliability
+  crawlIntervalSec Int          @default(180)
+  lastCrawledAt    DateTime?
+  config           Json? // e.g. { subreddit, query, feedUrl }
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  crawlRuns  CrawlRun[]
+  humanCodes HumanCode[]
+
+  @@unique([type, url])
+  @@index([status, enabled])
+  @@map("sources")
+}
+
+model CrawlRun {
+  id           String      @id @default(cuid())
+  sourceId     String
+  status       CrawlStatus @default(RUNNING)
+  itemsFound   Int         @default(0)
+  itemsNew     Int         @default(0)
+  errorMessage String?
+  durationMs   Int?
+  startedAt    DateTime    @default(now())
+  finishedAt   DateTime?
+
+  source Source @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@index([sourceId, startedAt])
+  @@map("crawl_runs")
+}
+
+// =====================================================
+// HUMAN BOOKING CODES
+// =====================================================
+
+model HumanCode {
+  id            String     @id @default(cuid())
+  code          String
+  codeType      CodeType   @default(UNKNOWN)
+  status        CodeStatus @default(UNVERIFIED)
+  sourceId      String?
+  originalUrl   String?
+  author        String?
+  title         String?
+  rawContent    String?
+  league        String?
+  country       String?
+  numberOfGames Int?
+  totalOdds     Float?
+  datePublished DateTime?
+  matchDate     DateTime?
+  contentHash   String     @unique // dedupe key (code + source + day)
+  betType       String? // multiple | system | single (from SportyBet)
+  selections    Json? // [{ eventId, home, away, league, kickoff, market, pick, odds }]
+  foundAt       DateTime   @default(now())
+  verifiedAt    DateTime?
+  expiresAt     DateTime?
+
+  source       Source?            @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  score        CodeScore?
+  verifications CodeVerification[]
+  favorites    Favorite[]
+  results      HistoricalResult[]
+
+  @@index([code])
+  @@index([status, foundAt])
+  @@index([codeType])
+  @@map("human_codes")
+}
+
+model CodeScore {
+  id                    String    @id @default(cuid())
+  humanCodeId           String    @unique
+  stars                 Int       @default(0) // 0..5
+  confidencePct         Float     @default(0)
+  riskLevel             RiskLevel @default(MEDIUM)
+  oddsStability         Float     @default(0) // 0..1
+  sourceReliability     Float     @default(0) // 0..1
+  historicalPerformance Float     @default(0) // 0..1
+  expectedProfitability Float     @default(0) // model estimate, not a guarantee
+  computedAt            DateTime  @default(now())
+
+  humanCode HumanCode @relation(fields: [humanCodeId], references: [id], onDelete: Cascade)
+
+  @@map("code_scores")
+}
+
+model CodeVerification {
+  id          String   @id @default(cuid())
+  humanCodeId String
+  checkType   String // VALIDITY | DUPLICATE | EXPIRATION | MATCH_STATUS | ODDS_CHANGE
+  passed      Boolean
+  detail      String?
+  checkedAt   DateTime @default(now())
+
+  humanCode HumanCode @relation(fields: [humanCodeId], references: [id], onDelete: Cascade)
+
+  @@index([humanCodeId, checkType])
+  @@map("code_verifications")
+}
+
+// =====================================================
+// FOOTBALL DATA
+// =====================================================
+
+model League {
+  id         String  @id @default(cuid())
+  externalId String? @unique
+  name       String
+  country    String?
+  tier       Int?
+  season     String?
+  logoUrl    String?
+
+  teams   Team[]
+  matches Match[]
+
+  @@index([country])
+  @@map("leagues")
+}
+
+model Team {
+  id          String  @id @default(cuid())
+  externalId  String? @unique
+  name        String
+  shortName   String?
+  country     String?
+  leagueId    String?
+  logoUrl     String?
+  eloRating   Float   @default(1500)
+  marketValue Float?
+
+  league     League? @relation(fields: [leagueId], references: [id], onDelete: SetNull)
+  homeMatches Match[] @relation("HomeTeam")
+  awayMatches Match[] @relation("AwayTeam")
+  matchStats  MatchStat[]
+
+  @@index([name])
+  @@map("teams")
+}
+
+model Match {
+  id         String      @id @default(cuid())
+  externalId String?     @unique
+  leagueId   String?
+  homeTeamId String
+  awayTeamId String
+  kickoff    DateTime
+  status     MatchStatus @default(SCHEDULED)
+  homeScore  Int?
+  awayScore  Int?
+  venue      String?
+  referee    String?
+  weather    Json?
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  league     League?        @relation(fields: [leagueId], references: [id], onDelete: SetNull)
+  homeTeam   Team           @relation("HomeTeam", fields: [homeTeamId], references: [id])
+  awayTeam   Team           @relation("AwayTeam", fields: [awayTeamId], references: [id])
+  stats      MatchStat[]
+  oddsSnapshots OddsSnapshot[]
+  predictions Prediction[]
+  selections BetSelection[]
+
+  @@index([kickoff, status])
+  @@index([leagueId])
+  @@map("matches")
+}
+
+model MatchStat {
+  id            String @id @default(cuid())
+  matchId       String
+  teamId        String
+  side          Side
+  xg            Float?
+  xa            Float?
+  shots         Int?
+  shotsOnTarget Int?
+  possession    Float?
+  bigChances    Int?
+  corners       Int?
+  fouls         Int?
+  yellowCards   Int?
+  redCards      Int?
+
+  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  team  Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, teamId])
+  @@map("match_stats")
+}
+
+model OddsSnapshot {
+  id         String   @id @default(cuid())
+  matchId    String
+  bookmaker  String   @default("sportybet")
+  market     String // 1X2 | OU_2_5 | BTTS | DC | DNB | CS ...
+  homeOdds   Float?
+  drawOdds   Float?
+  awayOdds   Float?
+  extra      Json? // arbitrary market lines
+  capturedAt DateTime @default(now())
+
+  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@index([matchId, market, capturedAt])
+  @@map("odds_snapshots")
+}
+
+// =====================================================
+// AI PREDICTIONS & BET SLIPS
+// =====================================================
+
+model Prediction {
+  id                String    @id @default(cuid())
+  matchId           String
+  model             String    @default("poisson-v1") // poisson | xgboost | ensemble
+  market            String    @default("1X2")
+  winProb           Float
+  drawProb          Float
+  awayProb          Float
+  confidence        Float // 0..1
+  riskScore         Float // 0..1
+  expectedValue     Float // EV for recommended market
+  recommendedMarket String
+  reasoning         String?
+  summary           String?
+  altMarkets        Json? // [{ market, selection, prob, ev }]
+  createdAt         DateTime  @default(now())
+
+  match      Match          @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  selections BetSelection[]
+
+  @@index([matchId, model, createdAt])
+  @@map("predictions")
+}
+
+model AiBetSlip {
+  id               String     @id @default(cuid())
+  title            String
+  codeType         CodeType   @default(COMBO)
+  status           CodeStatus @default(ACTIVE)
+  totalOdds        Float      @default(1)
+  confidence       Float      @default(0)
+  riskScore        Float      @default(0)
+  expectedValue    Float      @default(0)
+  kellyStakePct    Float      @default(0) // fraction of bankroll (capped)
+  bookingCode      String? // filled only if SportyBet-compatible & compliant
+  bookingCodeNote  String? // e.g. "manual entry — slip below"
+  reasoning        String? // why the model chose these legs
+  legs             Json? // [{ eventId, home, away, league, kickoff, market, pick, odds, prob, consensus }]
+  createdAt        DateTime   @default(now())
+
+  selections BetSelection[]
+  favorites  Favorite[]
+  results    HistoricalResult[]
+
+  @@index([status, createdAt])
+  @@map("ai_bet_slips")
+}
+
+model BetSelection {
+  id           String   @id @default(cuid())
+  betSlipId    String
+  matchId      String
+  predictionId String?
+  market       String
+  selection    String // e.g. "HOME", "OVER_2_5", "BTTS_YES"
+  odds         Float
+  confidence   Float    @default(0)
+  createdAt    DateTime @default(now())
+
+  betSlip    AiBetSlip   @relation(fields: [betSlipId], references: [id], onDelete: Cascade)
+  match      Match       @relation(fields: [matchId], references: [id])
+  prediction Prediction? @relation(fields: [predictionId], references: [id], onDelete: SetNull)
+
+  @@index([betSlipId])
+  @@map("bet_selections")
+}
+
+// =====================================================
+// ENGAGEMENT
+// =====================================================
+
+model Favorite {
+  id          String   @id @default(cuid())
+  userId      String
+  humanCodeId String?
+  betSlipId   String?
+  createdAt   DateTime @default(now())
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  humanCode HumanCode? @relation(fields: [humanCodeId], references: [id], onDelete: Cascade)
+  betSlip   AiBetSlip? @relation(fields: [betSlipId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, humanCodeId])
+  @@unique([userId, betSlipId])
+  @@map("favorites")
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  type      NotificationType
+  title     String
+  body      String?
+  data      Json?
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read, createdAt])
+  @@map("notifications")
+}
+
+model HistoricalResult {
+  id          String     @id @default(cuid())
+  humanCodeId String?
+  betSlipId   String?
+  slipSource  SlipSource
+  outcome     BetOutcome @default(PENDING)
+  stake       Float?
+  profit      Float? // realized profit/loss for ROI tracking
+  settledAt   DateTime?
+  createdAt   DateTime   @default(now())
+
+  humanCode HumanCode? @relation(fields: [humanCodeId], references: [id], onDelete: SetNull)
+  betSlip   AiBetSlip? @relation(fields: [betSlipId], references: [id], onDelete: SetNull)
+
+  @@index([slipSource, outcome])
+  @@map("historical_results")
+}
+
+// =====================================================
+// OPS / ADMIN
+// =====================================================
+
+model Advertisement {
+  id          String      @id @default(cuid())
+  title       String
+  imageUrl    String?
+  targetUrl   String
+  placement   AdPlacement @default(DASHBOARD_TOP)
+  active      Boolean     @default(true)
+  startsAt    DateTime?
+  endsAt      DateTime?
+  impressions Int         @default(0)
+  clicks      Int         @default(0)
+  createdAt   DateTime    @default(now())
+
+  @@index([active, placement])
+  @@map("advertisements")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?
+  action    String
+  entity    String
+  entityId  String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  actor User? @relation("ActorAudit", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entity, entityId])
+  @@map("audit_logs")
+}
