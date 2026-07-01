@@ -188,6 +188,17 @@ function buildSlip(pool: Leg[], p: Profile, seed: number) {
 
 /** Regenerate the current AI bet slips. Returns how many were created. */
 export async function generateAiSlips(): Promise<number> {
+  const now = Date.now();
+  // Prune STALE slips (any leg already kicked off) so we never show a slip whose
+  // matches have finished — even if the pool is too thin to build a replacement.
+  const existing = await prisma.aiBetSlip.findMany({ select: { id: true, legs: true } });
+  for (const s of existing) {
+    const legs = (s.legs as unknown as { kickoff?: number }[]) ?? [];
+    if (legs.some((l) => l?.kickoff && l.kickoff < now)) {
+      await prisma.aiBetSlip.delete({ where: { id: s.id } });
+    }
+  }
+
   const pool = await candidatePool();
   if (pool.length < 2) return 0;
 

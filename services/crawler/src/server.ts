@@ -190,7 +190,7 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
 
   const body =
     mode === "ai"
-      ? `<div class="cards">${aiCards || '<div class="card empty">No AI slips yet — they generate once enough active codes are collected. Try “Scan now”.</div>'}</div>`
+      ? `<div class="cards">${aiCards || '<div class="card empty">No AI slips right now — not enough upcoming matches (common late at night). Fresh slips generate automatically as new fixtures and codes come in.</div>'}</div>`
       : `<div class="split">
           <div class="col-main">
             ${heroCard}
