@@ -5,10 +5,16 @@ import { config } from "./config.js";
 
 let running = false;
 let timer: NodeJS.Timeout | null = null;
+let cycleCount = 0;
 export let lastRunAt: Date | null = null;
 export let nextRunAt: Date | null = null;
 export let lastSummary = "";
 export const intervalSec = config.defaultIntervalSec;
+
+// Regenerate AI slips (which create booking codes on SportyBet) only every N
+// cycles — this keeps human-code scanning at 3 min while easing our call volume
+// on SportyBet's booking API to avoid rate-limits.
+const AI_EVERY = Math.max(1, Number(process.env.AI_REGEN_EVERY_CYCLES ?? 5));
 
 /** Run one full crawl cycle unless one is already in flight. */
 export async function runCycle(trigger: string): Promise<string> {
@@ -20,12 +26,16 @@ export async function runCycle(trigger: string): Promise<string> {
     const items = results.reduce((a, r) => a + r.itemsFound, 0);
     const codes = results.reduce((a, r) => a + r.codesNew, 0);
     const failed = results.filter((r) => r.error).length;
-    // Verify + enrich codes against SportyBet's official API.
-    const { verified, active } = await verifyPending(30);
-    // Regenerate AI bet slips from the freshly verified selection odds.
-    const aiSlips = await generateAiSlips();
+    // Verify + enrich codes against SportyBet's official API (gentler cap).
+    const { verified, active } = await verifyPending(15);
+    // Regenerate AI bet slips + booking codes only every AI_EVERY cycles, or
+    // immediately on a manual scan / when there are none yet.
+    const regenAi = trigger === "manual" || cycleCount % AI_EVERY === 0;
+    const aiSlips = regenAi ? await generateAiSlips() : -1;
+    cycleCount += 1;
     lastRunAt = new Date();
-    lastSummary = `[${trigger}] ${results.length} sources · ${items} items · ${codes} new · ${verified} verified (${active} active) · ${aiSlips} AI slips · ${failed} failed · ${Date.now() - started}ms`;
+    const aiPart = aiSlips < 0 ? "AI kept" : `${aiSlips} AI slips`;
+    lastSummary = `[${trigger}] ${results.length} sources · ${items} items · ${codes} new · ${verified} verified (${active} active) · ${aiPart} · ${failed} failed · ${Date.now() - started}ms`;
     console.log(lastSummary);
     for (const r of results.filter((x) => x.error)) {
       console.warn(`  ! ${r.sourceName}: ${r.error}`);

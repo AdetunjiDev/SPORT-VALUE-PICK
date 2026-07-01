@@ -274,6 +274,13 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
   .btn.ghost:hover{background:#f4f6fb}
   .btn.sm{padding:6px 12px;font-size:12px}
   .btn.gold{background:linear-gradient(135deg,#e0a531,#f6c453);color:#3a2a06;box-shadow:0 6px 16px rgba(224,165,49,.3)}
+  .btn:disabled{opacity:.7;cursor:default}
+  #toast{position:fixed;right:22px;bottom:22px;z-index:50;max-width:360px;
+    background:#141a2e;color:#fff;padding:13px 18px;border-radius:12px;font-size:13px;font-weight:600;
+    box-shadow:0 10px 30px rgba(16,24,40,.25);opacity:0;transform:translateY(10px);
+    transition:opacity .25s,transform .25s;pointer-events:none}
+  #toast.show{opacity:1;transform:translateY(0)}
+  #toast.ok{background:#123a24}#toast.warn{background:#7a5b12}
   /* Premium gating */
   .tier-badge{padding:6px 12px;border-radius:10px;font-size:12px;font-weight:800}
   .tier-free{background:#f1f5f9;color:#64748b}
@@ -412,7 +419,7 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
             ? `<span class="tier-badge tier-premium">👑 PREMIUM</span>`
             : `<span class="tier-badge tier-free">FREE</span><a class="btn gold" href="/upgrade">⭐ Upgrade</a>`
         }
-        <form method="post" action="/scan?mode=${mode}"><button class="btn" type="submit">⟳ Scan now</button></form>
+        <button class="btn" onclick="doScan(this)">⟳ Scan now</button>
       </div>
     </div>
     <div class="content">
@@ -444,10 +451,32 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
       el.style.display = (!q || f.indexOf(q)>=0) ? '' : 'none';
     });
   }
+  function showToast(msg, kind){
+    var t=document.getElementById('toast');
+    if(!t){ t=document.createElement('div'); t.id='toast'; document.body.appendChild(t); }
+    t.className='toast show '+(kind||''); t.textContent=msg;
+    clearTimeout(window.__tt); window.__tt=setTimeout(function(){ t.className='toast '+(kind||''); }, 4500);
+  }
+  function doScan(btn){
+    var o=btn.textContent; btn.disabled=true; btn.textContent='⟳ Scanning…';
+    showToast('Scanning 15 sources… results in ~20s');
+    fetch('/scan',{method:'POST'}).catch(function(){});
+    setTimeout(function(){ btn.disabled=false; btn.textContent=o; }, 4000);
+  }
+  // friendly one-liner from a raw scan summary
+  function niceSummary(s){
+    try{
+      var m=s.match(/(\\d+) items[\\s\\S]*?(\\d+) new[\\s\\S]*?(\\d+) verified/);
+      if(m){ return 'Scan complete · '+m[2]+' new code'+(m[2]==='1'?'':'s')+' · '+m[1]+' items checked'; }
+    }catch(e){}
+    return 'Scan complete';
+  }
   (function(){
     var NEXT = ${nextMs};
     var LASTRUN = "${lastRunIso}";
     var el = document.getElementById('countdown');
+    // Show a toast for a scan that completed just before this page (re)loaded.
+    try{ var done=sessionStorage.getItem('scanDone'); if(done){ sessionStorage.removeItem('scanDone'); showToast(done,'ok'); } }catch(e){}
     // Countdown display (updates every second).
     function tick(){
       if(!el) return;
@@ -462,8 +491,10 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
       try{
         var h = await (await fetch('/health',{cache:'no-store'})).json();
         if(h.nextRunAt){ NEXT = new Date(h.nextRunAt).getTime(); }
-        if(h.lastRunAt && LASTRUN && h.lastRunAt !== LASTRUN){ location.reload(); }
-        else if(h.lastRunAt && !LASTRUN){ LASTRUN = h.lastRunAt; }
+        if(h.lastRunAt && LASTRUN && h.lastRunAt !== LASTRUN){
+          try{ sessionStorage.setItem('scanDone', niceSummary(h.lastSummary||'')); }catch(e){}
+          location.reload();
+        } else if(h.lastRunAt && !LASTRUN){ LASTRUN = h.lastRunAt; }
       }catch(e){}
     }
     setInterval(poll, 5000);
@@ -553,9 +584,11 @@ export function startServer() {
           : "free";
 
       if (req.method === "POST" && url.pathname === "/scan") {
-        await runCycle("manual");
-        res.writeHead(303, { Location: `/?mode=${mode}` });
-        res.end();
+        // Fire in the background so the button returns instantly; the dashboard
+        // polls /health and refreshes when the scan completes.
+        void runCycle("manual");
+        res.writeHead(202, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, started: true }));
         return;
       }
       if (url.pathname === "/upgrade") {
