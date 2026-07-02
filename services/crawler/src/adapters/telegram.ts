@@ -22,19 +22,36 @@ export async function fetchTelegram(source: SourceLike): Promise<RawItem[]> {
   for (let i = 1; i < chunks.length; i++) {
     const chunk = chunks[i];
     const post = chunk.match(/data-post="([^"]+)"/)?.[1]; // e.g. Channel/1234
-    const textMatch = chunk.match(/tgme_widget_message_text[^>]*>([\s\S]*?)<\/div>/);
-    if (!textMatch) continue; // media-only message
-    const text = stripHtml(textMatch[1]);
-    if (!text) continue;
     const datetime = chunk.match(/<time[^>]*datetime="([^"]+)"/)?.[1];
+    const link = post ? `https://t.me/${post}` : url;
+    const publishedAt = datetime ? new Date(datetime).toISOString() : undefined;
 
-    items.push({
-      title: text.slice(0, 120),
-      content: text,
-      url: post ? `https://t.me/${post}` : url,
-      author: `@${channel}`,
-      publishedAt: datetime ? new Date(datetime).toISOString() : undefined,
-    });
+    const textMatch = chunk.match(/tgme_widget_message_text[^>]*>([\s\S]*?)<\/div>/);
+    const text = textMatch ? stripHtml(textMatch[1]) : "";
+
+    if (text) {
+      items.push({
+        title: text.slice(0, 120),
+        content: text,
+        url: link,
+        author: `@${channel}`,
+        publishedAt,
+      });
+    }
+
+    // Image messages: many channels post codes as screenshots. Capture the
+    // photo URL so the crawler can OCR it. (Handles text+image posts too.)
+    const photo = chunk.match(/tgme_widget_message_photo_wrap[^>]*background-image:url\('([^']+)'\)/);
+    if (photo) {
+      items.push({
+        title: "image",
+        content: "",
+        url: link,
+        author: `@${channel}`,
+        publishedAt,
+        imageUrl: photo[1],
+      });
+    }
   }
 
   return items;

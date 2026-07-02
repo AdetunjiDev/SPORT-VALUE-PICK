@@ -1,6 +1,7 @@
 import { prisma } from "@sportybet/db";
 import { fetchSource } from "./adapters/index.js";
 import { extract, contentHash } from "./extractor.js";
+import { ocrImage } from "./ocr.js";
 
 export interface CrawlResult {
   sourceId: string;
@@ -46,7 +47,17 @@ export async function crawlSource(source: {
     result.itemsFound = items.length;
     const aggressive = source.type === "TELEGRAM";
 
+    // OCR image messages (bounded per source per cycle; cached across cycles).
+    let ocrBudget = 4;
     for (const item of items) {
+      if (item.imageUrl && !item.content && ocrBudget > 0) {
+        ocrBudget -= 1;
+        item.content = await ocrImage(item.imageUrl);
+      }
+    }
+
+    for (const item of items) {
+      if (!item.content) continue; // skip images that OCR'd to nothing
       const info = extract(item.content, { aggressive });
       result.codesFound += info.codes.length;
 

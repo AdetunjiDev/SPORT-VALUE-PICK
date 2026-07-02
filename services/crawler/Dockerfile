@@ -2,8 +2,10 @@
 # Built from the monorepo root (context: .).
 FROM node:20-slim
 
-# Prisma needs openssl at runtime.
-RUN apt-get update -y && apt-get install -y openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+# Prisma needs openssl; tesseract-ocr powers the image-code OCR pipeline.
+RUN apt-get update -y \
+  && apt-get install -y openssl ca-certificates tesseract-ocr \
+  && rm -rf /var/lib/apt/lists/*
 RUN corepack enable
 
 WORKDIR /app

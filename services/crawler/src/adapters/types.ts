@@ -5,6 +5,7 @@ export interface RawItem {
   url?: string;
   author?: string;
   publishedAt?: string; // ISO
+  imageUrl?: string; // set for image messages; OCR'd into `content` by the crawler
 }
 
 export interface SourceLike {

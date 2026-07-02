@@ -3,6 +3,7 @@ import { prisma } from "@sportybet/db";
 import { RESPONSIBLE_GAMBLING_DISCLAIMER } from "@sportybet/shared";
 import { config } from "./config.js";
 import { runCycle, lastRunAt, nextRunAt, lastSummary, intervalSec } from "./scheduler.js";
+import { getPredictions } from "./predictions.js";
 
 function esc(s: unknown): string {
   return String(s ?? "")
@@ -17,24 +18,50 @@ function stars(n: number): string {
   return "★".repeat(v) + "☆".repeat(5 - v);
 }
 
-type Mode = "human" | "ai";
+type Mode = "human" | "ai" | "pred";
 type Tier = "free" | "premium";
 
-async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promise<string> {
+async function renderDashboard(
+  mode: Mode = "human",
+  tier: Tier = "free",
+  dateStr = "",
+): Promise<string> {
+  const preds = mode === "pred" ? await getPredictions() : [];
   const isPremium = tier === "premium";
   const freshCut = Date.now() - config.freeDelayMin * 60_000;
-  const [codes, totalCodes, sourceCount, lastRuns, aiSlips, activeCount] = await Promise.all([
-    prisma.humanCode.findMany({
-      orderBy: { foundAt: "desc" },
-      take: 60,
-      include: { source: true, score: true },
-    }),
-    prisma.humanCode.count(),
-    prisma.source.count({ where: { enabled: true } }),
-    prisma.crawlRun.findMany({ orderBy: { startedAt: "desc" }, take: 8, include: { source: true } }),
-    prisma.aiBetSlip.findMany({ orderBy: { totalOdds: "asc" } }),
-    prisma.humanCode.count({ where: { status: "ACTIVE" } }),
-  ]);
+
+  // Date filter. Default view = TODAY (current codes); "all" shows everything;
+  // a YYYY-MM-DD shows that WAT calendar day.
+  const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: "Africa/Lagos" }); // YYYY-MM-DD
+  const showAll = dateStr === "all";
+  const day = showAll ? "" : /^\d{4}-\d{2}-\d{2}$/.test(dateStr) ? dateStr : todayStr;
+  const dateOk = day !== ""; // a specific day is being shown
+  const codeWhere = day
+    ? {
+        foundAt: {
+          gte: new Date(`${day}T00:00:00+01:00`),
+          lte: new Date(`${day}T23:59:59.999+01:00`),
+        },
+      }
+    : {};
+
+  const [codes, totalCodes, sourceCount, lastRuns, aiSlips, activeCount, dateRows] =
+    await Promise.all([
+      prisma.humanCode.findMany({
+        where: codeWhere,
+        orderBy: { foundAt: "desc" },
+        take: 150,
+        include: { source: true, score: true },
+      }),
+      prisma.humanCode.count(),
+      prisma.source.count({ where: { enabled: true } }),
+      prisma.crawlRun.findMany({ orderBy: { startedAt: "desc" }, take: 8, include: { source: true } }),
+      prisma.aiBetSlip.findMany({ orderBy: { totalOdds: "asc" } }),
+      prisma.humanCode.count({ where: { status: "ACTIVE" } }),
+      prisma.$queryRaw<{ d: string; n: number }[]>`
+        SELECT to_char("foundAt" AT TIME ZONE 'Africa/Lagos', 'YYYY-MM-DD') AS d, count(*)::int AS n
+        FROM human_codes GROUP BY 1 ORDER BY 1 DESC LIMIT 14`,
+    ]);
 
   const latest = codes[0];
   const nextMs = nextRunAt ? new Date(nextRunAt).getTime() : 0;
@@ -88,7 +115,8 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
         <td class="num">${esc(c.totalOdds ?? "—")}</td>
         <td class="num">${esc(c.numberOfGames ?? "—")}</td>
         <td class="muted">${esc(c.league ?? "—")}</td>
-        <td class="muted">${c.expiresAt ? new Date(c.expiresAt).toLocaleString() : "—"}</td>
+        <td class="muted">${new Date(c.foundAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</td>
+        <td class="muted">${c.expiresAt ? new Date(c.expiresAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—"}</td>
         <td class="muted">${esc(c.source?.name ?? "—")}</td>
         <td><span class="pill status s-${esc(c.status)}">${esc(c.status)}</span></td>
       </tr>`;
@@ -171,38 +199,116 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
     })
     .join("");
 
+  // ---- Prediction cards (scraped tips from footballpredictions.com) ----
+  const predCards = preds
+    .map((p) => {
+      const kick = p.kickoff
+        ? new Date(p.kickoff).toLocaleString([], {
+            month: "short",
+            day: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+          })
+        : "—";
+      return `
+      <div class="slip" data-f="${esc(`${p.home} ${p.away} ${p.league ?? ""} ${p.tip ?? ""}`.toLowerCase())}">
+        <div class="slip-head">
+          <span class="tag indigo">${esc(p.league ?? "Football")}</span>
+          <b class="slip-title">${esc(p.home)} <span class="muted">v</span> ${esc(p.away)}</b>
+        </div>
+        <div class="pred-tip">🎯 ${esc(p.tip ?? "—")}</div>
+        <div class="metrics">
+          <div><b>${esc(p.odds ?? "—")}</b><small>Odds</small></div>
+          <div><b>${esc(p.probability ?? "—")}</b><small>Probability</small></div>
+          <div><b>${esc(kick)}</b><small>Kick-off</small></div>
+        </div>
+        ${p.url ? `<a class="btn ghost sm" href="${esc(p.url)}" target="_blank" rel="noopener">Full analysis ↗</a>` : ""}
+      </div>`;
+    })
+    .join("");
+
   const nav = (m: Mode, icon: string, label: string, active: boolean) =>
     `<a class="nav-item${active ? " on" : ""}" href="/?mode=${m}"><span class="ni">${icon}</span>${label}</a>`;
 
+  // ---- Date selector (browse codes by the day they were found) ----
+  const dayLabel = (d: string) =>
+    d === todayStr
+      ? "Today"
+      : new Date(`${d}T12:00:00`).toLocaleDateString([], { month: "short", day: "numeric" });
+  // Always offer a "Today" card even before any codes come in today.
+  const dates = dateRows.some((r) => r.d === todayStr)
+    ? dateRows
+    : [{ d: todayStr, n: 0 }, ...dateRows];
+  const dayCard = (d: string, n: number) => {
+    const dt = new Date(`${d}T12:00:00`);
+    const isToday = d === todayStr;
+    const top = isToday ? "TODAY" : dt.toLocaleDateString("en", { weekday: "short" }).toUpperCase();
+    const mon = dt.toLocaleDateString("en", { month: "short" });
+    return `<a class="day-card${day === d ? " on" : ""}" href="/?mode=human&date=${d}">
+      <span class="dc-top">${top}</span>
+      <span class="dc-day">${d.slice(8, 10)}</span>
+      <span class="dc-mon">${mon}</span>
+      <span class="dc-count">${n}</span>
+    </a>`;
+  };
+  const dateBar = `
+    <div class="date-nav">
+      <div class="date-nav-head">Browse codes by date</div>
+      <div class="date-strip">
+        <a class="day-card all${showAll ? " on" : ""}" href="/?mode=human&date=all">
+          <span class="dc-top">ALL</span><span class="dc-day">∑</span>
+          <span class="dc-mon">codes</span><span class="dc-count">${totalCodes}</span>
+        </a>
+        ${dates.map((r) => dayCard(r.d, r.n)).join("")}
+        <label class="day-card pick" title="Pick any date">
+          <span class="dc-top">PICK</span><span class="dc-day">📅</span><span class="dc-mon">a date</span>
+          <input type="date" class="dc-input" value="${dateOk ? day : ""}" max="${todayStr}"
+            onchange="if(this.value)location.href='/?mode=human&date='+this.value"/>
+        </label>
+      </div>
+    </div>`;
+
   // ---- KPI cards (mode-aware) ----
   const kpis =
-    mode === "ai"
+    mode === "pred"
       ? `
+      ${kpi("📈", preds.length, "match predictions", "indigo")}
+      ${kpi("⚽", new Set(preds.map((p) => p.league)).size, "leagues", "orange")}
+      ${kpi("🔗", 1, "source (footballpredictions)", "blue")}
+      ${kpi("🤖", aiSlips.length, "AI slips", "green")}`
+      : mode === "ai"
+        ? `
       ${kpi("🤖", aiSlips.length, "AI slips ready", "indigo")}
       ${kpi("🎟️", aiSlips.filter((s) => s.bookingCode).length, "with booking codes", "orange")}
       ${kpi("✅", activeCount, "active codes analysed", "green")}
       ${kpi("📡", sourceCount, "live sources", "blue")}`
-      : `
+        : `
       ${kpi("✅", activeCount, "active codes", "green")}
       ${kpi("🗂️", totalCodes, "total discovered", "indigo")}
       ${kpi("📡", sourceCount, "active sources", "blue")}
       ${kpi("🤖", aiSlips.length, "AI slips", "orange")}`;
 
   const body =
-    mode === "ai"
-      ? `<div class="cards">${aiCards || '<div class="card empty">No AI slips right now — not enough upcoming matches (common late at night). Fresh slips generate automatically as new fixtures and codes come in.</div>'}</div>`
-      : `<div class="split">
+    mode === "pred"
+      ? `<div class="cards">${predCards || '<div class="card empty">No predictions available right now — the source may be updating. Check back shortly.</div>'}</div>`
+      : mode === "ai"
+        ? `<div class="cards">${aiCards || '<div class="card empty">No AI slips right now — not enough upcoming matches (common late at night). Fresh slips generate automatically as new fixtures and codes come in.</div>'}</div>`
+        : `<div class="split">
           <div class="col-main">
             ${heroCard}
             <div class="card">
-              <div class="card-head"><h3>Discovered booking codes</h3><span class="muted">${codes.length} shown</span></div>
+              <div class="card-head">
+                <h3>${showAll ? "All discovered codes" : `Codes found ${dayLabel(day)}`}</h3>
+                <span class="muted">${codes.length} shown</span>
+              </div>
+              ${dateBar}
               <div class="table-wrap">
                 <table class="grid-table">
                   <thead><tr>
                     <th>Code</th><th>Type</th><th>Score</th><th>Odds</th><th>Games</th>
-                    <th>League</th><th>Expires</th><th>Source</th><th>Status</th>
+                    <th>League</th><th>Found</th><th>Expires</th><th>Source</th><th>Status</th>
                   </tr></thead>
-                  <tbody id="rows">${rows || `<tr><td colspan="9" class="muted" style="text-align:center;padding:24px">No codes yet — click “Scan now”.</td></tr>`}</tbody>
+                  <tbody id="rows">${rows || `<tr><td colspan="10" class="muted" style="text-align:center;padding:24px">No codes for ${showAll ? "any date yet" : dayLabel(day) + " yet"} — new codes appear as channels post them. Try “ALL” or an earlier date above.</td></tr>`}</tbody>
                 </table>
               </div>
             </div>
@@ -323,6 +429,29 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
     padding:18px;margin-bottom:18px}
   .card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
   .card-head h3{margin:0;font-size:15px}
+  .date-nav{margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+  .date-nav-head{font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.6px;margin-bottom:10px}
+  .date-strip{display:flex;gap:10px;overflow-x:auto;padding:2px 2px 8px}
+  .date-strip::-webkit-scrollbar{height:6px}
+  .date-strip::-webkit-scrollbar-thumb{background:#d7dce8;border-radius:3px}
+  .day-card{position:relative;flex:0 0 auto;width:68px;display:flex;flex-direction:column;
+    align-items:center;gap:1px;padding:11px 6px 9px;border:1px solid var(--line);border-radius:16px;
+    background:#fff;text-decoration:none;color:var(--ink);
+    transition:transform .12s ease,box-shadow .12s ease,border-color .12s ease}
+  .day-card:hover{transform:translateY(-2px);box-shadow:0 8px 18px rgba(16,24,40,.09);border-color:#cfd6e6}
+  .dc-top{font-size:10px;font-weight:800;color:var(--muted);letter-spacing:.5px}
+  .dc-day{font-size:23px;font-weight:800;line-height:1.05}
+  .dc-mon{font-size:10px;color:var(--muted);margin-bottom:5px}
+  .dc-count{font-size:10px;font-weight:700;background:#eef1f8;color:#59617a;border-radius:999px;
+    padding:1px 9px;min-width:22px;text-align:center}
+  .day-card.on{background:linear-gradient(150deg,var(--primary),#f7864f);border-color:transparent;
+    color:#fff;box-shadow:0 8px 20px rgba(242,104,60,.32)}
+  .day-card.on .dc-top,.day-card.on .dc-mon{color:rgba(255,255,255,.9)}
+  .day-card.on .dc-count{background:rgba(255,255,255,.28);color:#fff}
+  .day-card.all .dc-day{color:var(--indigo)} .day-card.all.on .dc-day{color:#fff}
+  .day-card.pick{border-style:dashed;cursor:pointer;justify-content:center}
+  .dc-input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
   .split{display:grid;grid-template-columns:1fr 320px;gap:18px;align-items:start}
   .col-side .card{position:sticky;top:90px}
   /* Hero */
@@ -384,6 +513,8 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
   table.legs td{padding:7px 4px;border-bottom:1px solid var(--line)}
   table.legs tr:last-child td{border-bottom:0}
   .reason{color:#6b7594;font-size:12px;margin-top:10px;line-height:1.5}
+  .pred-tip{background:#eeecfb;color:var(--indigo);font-weight:800;font-size:15px;
+    border-radius:10px;padding:10px 14px;margin:10px 0}
   .empty{grid-column:1/-1;text-align:center;color:var(--muted);padding:30px}
   .disclaimer{color:var(--muted);font-size:12px;margin-top:6px;text-align:center;padding:8px}
   @media(max-width:1000px){ .kpis{grid-template-columns:repeat(2,1fr)} .split{grid-template-columns:1fr} .col-side .card{position:static} }
@@ -396,6 +527,7 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
     <div class="nav-label">Main</div>
     ${nav("human", "📊", "Dashboard", mode === "human")}
     ${nav("ai", "🤖", "AI Codes", mode === "ai")}
+    ${nav("pred", "📈", "Predictions", mode === "pred")}
     <div class="nav-label">Data</div>
     <a class="nav-item" href="/api/codes" target="_blank"><span class="ni">🔗</span>Codes API</a>
     <a class="nav-item" href="/api/ai-slips" target="_blank"><span class="ni">🧠</span>AI Slips API</a>
@@ -408,8 +540,8 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
   <div class="app">
     <div class="topbar">
       <div>
-        <h1>${mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
-        <div class="sub">${mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
+        <h1>${mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
+        <div class="sub">${mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
       </div>
       <div class="search"><input id="search" placeholder="Search codes, leagues, sources…" oninput="flt(this.value)"/></div>
       <div class="top-right">
@@ -431,9 +563,11 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
       <div class="kpis">${kpis}</div>
       ${body}
       <div class="disclaimer">⚠️ ${esc(RESPONSIBLE_GAMBLING_DISCLAIMER)} ${
-        mode === "ai"
-          ? "AI slips are model estimates — booking codes save selections only; review & stake yourself."
-          : "Codes verified against SportyBet's official API."
+        mode === "pred"
+          ? "Predictions sourced from footballpredictions.com — third-party statistical tips, not affiliated with SportyBet."
+          : mode === "ai"
+            ? "AI slips are model estimates — booking codes save selections only; review & stake yourself."
+            : "Codes verified against SportyBet's official API."
       }</div>
     </div>
   </div>
@@ -466,10 +600,12 @@ async function renderDashboard(mode: Mode = "human", tier: Tier = "free"): Promi
   // friendly one-liner from a raw scan summary
   function niceSummary(s){
     try{
-      var m=s.match(/(\\d+) items[\\s\\S]*?(\\d+) new[\\s\\S]*?(\\d+) verified/);
-      if(m){ return 'Scan complete · '+m[2]+' new code'+(m[2]==='1'?'':'s')+' · '+m[1]+' items checked'; }
+      var items=(s.match(/(\\d+) items/)||[])[1]||'?';
+      var nw=(s.match(/(\\d+) new/)||[])[1];
+      if(nw && nw!=='0'){ return '🎉 Scan complete · '+nw+' NEW code'+(nw==='1'?'':'s')+' found!'; }
+      return '✓ Scan complete · '+items+' items checked · no new codes posted yet';
     }catch(e){}
-    return 'Scan complete';
+    return '✓ Scan complete';
   }
   (function(){
     var NEXT = ${nextMs};
@@ -576,7 +712,8 @@ export function startServer() {
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
-      const mode: Mode = url.searchParams.get("mode") === "ai" ? "ai" : "human";
+      const modeParam = url.searchParams.get("mode");
+      const mode: Mode = modeParam === "ai" ? "ai" : modeParam === "pred" ? "pred" : "human";
       const tier: Tier =
         config.defaultTier === "premium" ||
         /(?:^|;\s*)tier=premium(?:;|$)/.test(req.headers.cookie ?? "")
@@ -649,7 +786,14 @@ export function startServer() {
         res.end(JSON.stringify({ data, meta: { total: data.length } }));
         return;
       }
-      const html = await renderDashboard(mode, tier);
+      if (url.pathname === "/api/predictions") {
+        const data = await getPredictions();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ data, meta: { total: data.length } }));
+        return;
+      }
+      const dateStr = url.searchParams.get("date") ?? "";
+      const html = await renderDashboard(mode, tier, dateStr);
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(html);
     } catch (err: any) {
