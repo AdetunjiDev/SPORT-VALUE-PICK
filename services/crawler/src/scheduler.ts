@@ -1,6 +1,7 @@
 import { crawlAll } from "./crawler.js";
 import { verifyPending } from "./verifier.js";
 import { generateAiSlips } from "./ai.js";
+import { getPredictions } from "./predictions.js";
 import { config } from "./config.js";
 
 let running = false;
@@ -32,10 +33,18 @@ export async function runCycle(trigger: string): Promise<string> {
     // immediately on a manual scan / when there are none yet.
     const regenAi = trigger === "manual" || cycleCount % AI_EVERY === 0;
     const aiSlips = regenAi ? await generateAiSlips() : -1;
+    // Refresh the manual-prediction feed every cycle (cached ~2.5 min; a failed
+    // fetch keeps the last data). Never let it break the crawl cycle.
+    let predCount = -1;
+    try {
+      predCount = (await getPredictions()).length;
+    } catch {
+      /* keep going */
+    }
     cycleCount += 1;
     lastRunAt = new Date();
     const aiPart = aiSlips < 0 ? "AI kept" : `${aiSlips} AI slips`;
-    lastSummary = `[${trigger}] ${results.length} sources · ${items} items · ${codes} new · ${verified} verified (${active} active) · ${aiPart} · ${failed} failed · ${Date.now() - started}ms`;
+    lastSummary = `[${trigger}] ${results.length} sources · ${items} items · ${codes} new · ${verified} verified (${active} active) · ${aiPart} · ${predCount} predictions · ${failed} failed · ${Date.now() - started}ms`;
     console.log(lastSummary);
     for (const r of results.filter((x) => x.error)) {
       console.warn(`  ! ${r.sourceName}: ${r.error}`);

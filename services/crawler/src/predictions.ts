@@ -1,28 +1,60 @@
 import { fetchText, stripHtml } from "./adapters/http.js";
 
 /**
- * Manual-prediction feed: scrapes match tips (teams, league, kick-off, tip,
- * odds, probability) from footballpredictions.com. These are third-party
- * statistical PREDICTIONS — not SportyBet booking codes — shown in their own
- * tab with clear attribution. Cached in memory (predictions change slowly).
+ * Manual-prediction feed, merged from two kinds of source:
+ *   1. footballpredictions.com — structured tips (tip / odds / probability) for
+ *      featured matches, plus every upcoming match from its league pages.
+ *   2. Telegram analysis channels (@betmines, @eaglepredict) — daily prediction
+ *      posts with written analysis (free-form). Shown as analysis cards with a
+ *      "View on Telegram" link and a source badge.
+ * Merged, upcoming-first, cached in memory.
  */
 
 export interface ExtPrediction {
-  home: string;
-  away: string;
+  source: string; // "footballpredictions.com" | "@betmines" …
+  home?: string;
+  away?: string;
+  title?: string; // headline for free-form posts
   league?: string;
   kickoff?: string; // ISO
   tip?: string;
   odds?: string;
   probability?: string;
+  analysis?: string; // free-form written analysis
   url?: string;
 }
 
-const SRC = "https://footballpredictions.com/";
-const TTL_MS = 10 * 60 * 1000;
+const BASE = "https://footballpredictions.com";
+// Just under the 3-min scan interval so each scheduler cycle pulls fresh data.
+const TTL_MS = 150 * 1000;
+
+const LEAGUE_PAGES: { name: string; slug: string }[] = [
+  { name: "World Cup", slug: "world-cup-predictions" },
+  { name: "Premier League", slug: "premierleaguepredictions" },
+  { name: "Championship", slug: "championshippredictions" },
+  { name: "La Liga", slug: "primeradivisionpredictions" },
+  { name: "Serie A", slug: "serieapredictions" },
+  { name: "Bundesliga", slug: "bundesligapredictions" },
+  { name: "Ligue 1", slug: "ligue-1-predictions" },
+];
+
+// Telegram channels that post daily prediction ANALYSIS (not booking codes).
+const TG_PRED_CHANNELS = ["betminesfootballpredictions", "eaglepredict"];
+
 let cache: { at: number; data: ExtPrediction[] } | null = null;
 
-function parse(html: string): ExtPrediction[] {
+const keyOf = (p: ExtPrediction) =>
+  p.home && p.away ? `${p.home}|${p.away}`.toLowerCase() : `${p.source}|${p.title}`.toLowerCase();
+
+async function safeFetch(url: string): Promise<string> {
+  try {
+    return await fetchText(url, "text/html");
+  } catch {
+    return "";
+  }
+}
+
+function parseHomepageTips(html: string): ExtPrediction[] {
   const start = html.indexOf("betting-tips-alt");
   const region = start >= 0 ? html.slice(start) : html;
   const cardRe = /<a href="([^"]+)"\s+class="pred-card">([\s\S]*?)<\/a>/g;
@@ -41,6 +73,7 @@ function parse(html: string): ExtPrediction[] {
     const tipsTable = (c.match(/pred-card-tips">([\s\S]*?)<\/table>/) || [])[1] || "";
     const cells = [...tipsTable.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)].map((x) => stripHtml(x[1]));
     out.push({
+      source: "footballpredictions.com",
       home: names[0],
       away: names[1],
       league: league || undefined,
@@ -54,11 +87,124 @@ function parse(html: string): ExtPrediction[] {
   return out;
 }
 
+function parseLeaguePage(html: string, league: string): ExtPrediction[] {
+  const now = Date.now();
+  const blocks = html.split('<div class="prediction"').slice(1);
+  const out: ExtPrediction[] = [];
+  for (const b of blocks) {
+    const clubs = [...b.matchAll(/class="clublink"[^>]*>([^<]+)</g)].map((x) => x[1].trim());
+    const dt = (b.match(/data-datetime="([^"]+)"/) || [])[1];
+    if (clubs.length < 2 || !dt) continue;
+    if (new Date(dt).getTime() < now) continue;
+    const href = (b.match(/href="(https:\/\/footballpredictions\.com\/[^"]*-vs-[^"]*)"/) || [])[1];
+    const txtM = b.match(/predictiontxt[^>]*>([\s\S]*?)<\/p>/);
+    const analysis = txtM ? stripHtml(txtM[1].replace(/<!--[\s\S]*?-->/g, "")).slice(0, 160) : undefined;
+    out.push({
+      source: "footballpredictions.com",
+      home: clubs[0],
+      away: clubs[1],
+      league,
+      kickoff: dt,
+      analysis,
+      url: href,
+    });
+  }
+  return out;
+}
+
+const PROMO_RE =
+  /(VIP MEMBER|GRAB|JOIN (?:NOW|OUR)|SUBSCRIBE|LINK IN BIO|DM (?:ME|US)|CONGRATULAT|WON ?✅|bit\.ly|t\.me\/\+|PASSWORD|SIGN ?UP|REGISTER|GIVEAWAY|BATTLE|WIN A |USD ?\d|PRIZE|WINNING STREAK|NEARLY PERFECT|PERFECT DAY|ENJOYING OUR|ARE YOU ENJOYING)/i;
+// Must look like an actual prediction to be included.
+const PRED_RE =
+  /(prediction|\btip\b|expected to|over \d|under \d|both teams|\bbtts\b|correct score|to win|double chance|\bvs\b|\bv\.?\b|match:)/i;
+
+function tgText(chunk: string): string {
+  const m = chunk.match(/tgme_widget_message_text[^>]*>([\s\S]*?)<\/div>/);
+  if (!m) return "";
+  return m[1]
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&#\d+;/g, "")
+    .replace(/&[a-z]+;/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{2,}/g, "\n")
+    .normalize("NFKC") // flatten fancy unicode (𝐄𝐧𝐠𝐥𝐚𝐧𝐝 → England)
+    .trim();
+}
+
+async function telegramPredictions(): Promise<ExtPrediction[]> {
+  const out: ExtPrediction[] = [];
+  const htmls = await Promise.all(
+    TG_PRED_CHANNELS.map((ch) => safeFetch(`https://t.me/s/${ch}`)),
+  );
+  htmls.forEach((html, idx) => {
+    if (!html) return;
+    const ch = TG_PRED_CHANNELS[idx];
+    const chunks = html.split('class="tgme_widget_message ').slice(1);
+    for (const c of chunks) {
+      const text = tgText(c);
+      if (text.length < 40 || PROMO_RE.test(text) || !PRED_RE.test(text)) continue;
+      const dt = (c.match(/datetime="([^"]+)"/) || [])[1];
+      if (dt && Date.now() - new Date(dt).getTime() > 36 * 3.6e6) continue; // last 36h
+      const post = (c.match(/data-post="([^"]+)"/) || [])[1];
+      const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+
+      // Structured posts (e.g. @eaglepredict) label their fields — parse them.
+      const matchLine = text.match(/Match:\s*([^\n]+)/i)?.[1]?.trim();
+      const predLine = text.match(/Prediction:\s*([^\n]+)/i)?.[1]?.trim();
+      const leagueLine = text.match(/League:\s*([^\n]+)/i)?.[1]?.trim();
+      // Detect a "TeamA vs TeamB" from the Match: line or the body.
+      const vs = (matchLine ?? text).match(
+        /([A-Z][A-Za-z .'&-]{2,24})\s+(?:vs?|v|-|—)\s+([A-Z][A-Za-z .'&-]{2,24})/,
+      );
+
+      out.push({
+        source: `@${ch}`,
+        home: vs?.[1]?.trim(),
+        away: vs?.[2]?.trim(),
+        title: matchLine ?? lines[0]?.slice(0, 90),
+        league: leagueLine,
+        tip: predLine, // shown as the tip when present (these channels give no odds)
+        analysis: text.slice(0, 400),
+        kickoff: dt || undefined,
+        url: post ? `https://t.me/${post}` : undefined,
+      });
+    }
+  });
+  return out;
+}
+
 export async function getPredictions(): Promise<ExtPrediction[]> {
   if (cache && Date.now() - cache.at < TTL_MS) return cache.data;
   try {
-    const html = await fetchText(SRC, "text/html");
-    const data = parse(html);
+    const [homeHtml, tg, ...leagueHtmls] = await Promise.all([
+      safeFetch(`${BASE}/`),
+      telegramPredictions(),
+      ...LEAGUE_PAGES.map((l) => safeFetch(`${BASE}/footballpredictions/${l.slug}/`)),
+    ]);
+
+    const byKey = new Map<string, ExtPrediction>();
+    leagueHtmls.forEach((html, i) => {
+      if (html) for (const p of parseLeaguePage(html, LEAGUE_PAGES[i].name)) byKey.set(keyOf(p), p);
+    });
+    for (const p of parseHomepageTips(homeHtml)) {
+      const ex = byKey.get(keyOf(p));
+      byKey.set(keyOf(p), ex ? { ...ex, ...p } : p);
+    }
+    for (const p of tg) if (!byKey.has(keyOf(p))) byKey.set(keyOf(p), p);
+
+    const list = [...byKey.values()];
+    // Structured tips (with odds) first, then everything by soonest/most-recent.
+    const t = (p: ExtPrediction) => (p.kickoff ? new Date(p.kickoff).getTime() : 0);
+    const data = list
+      .sort((a, b) => {
+        const ao = a.odds ? 1 : 0;
+        const bo = b.odds ? 1 : 0;
+        if (ao !== bo) return bo - ao;
+        return t(a) - t(b);
+      })
+      .slice(0, 90);
+
     if (data.length) cache = { at: Date.now(), data };
     return data.length ? data : (cache?.data ?? []);
   } catch {

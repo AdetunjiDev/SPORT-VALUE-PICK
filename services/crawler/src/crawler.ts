@@ -45,7 +45,6 @@ export async function crawlSource(source: {
   try {
     const items = await fetchSource(source);
     result.itemsFound = items.length;
-    const aggressive = source.type === "TELEGRAM";
 
     // OCR image messages (bounded per source per cycle; cached across cycles).
     let ocrBudget = 4;
@@ -58,6 +57,10 @@ export async function crawlSource(source: {
 
     for (const item of items) {
       if (!item.content) continue; // skip images that OCR'd to nothing
+      // Bare-token (aggressive) extraction only for clean TEXT posts. OCR'd
+      // image text is noisy, so require code CONTEXT there to avoid garbage
+      // like "OVER2" (from "OVER 2.5") or misread tokens.
+      const aggressive = source.type === "TELEGRAM" && !item.imageUrl;
       const info = extract(item.content, { aggressive });
       result.codesFound += info.codes.length;
 

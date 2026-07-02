@@ -41,6 +41,13 @@ const STOPWORDS = new Set([
   "ACCUMULATOR",
   "CONVERSION",
   "BETSLIP",
+  // Common OCR'd betting terms that look code-ish
+  "OVER2",
+  "UNDER2",
+  "OVER25",
+  "UNDER25",
+  "GOALS",
+  "TOTAL",
   // Bookmaker names (contain digits/letters but are not codes)
   "BET9JA",
   "BETWAY",

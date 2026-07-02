@@ -45,25 +45,29 @@ async function renderDashboard(
       }
     : {};
 
+  // Hide INVALID codes everywhere — they're confirmed junk (wrong bookmaker,
+  // promos, or expired), so users only ever see real, usable codes.
+  const notInvalid = { status: { not: "INVALID" as const } };
   const [codes, totalCodes, sourceCount, lastRuns, aiSlips, activeCount, dateRows] =
     await Promise.all([
       prisma.humanCode.findMany({
-        where: codeWhere,
+        where: { ...codeWhere, ...notInvalid },
         orderBy: { foundAt: "desc" },
         take: 150,
         include: { source: true, score: true },
       }),
-      prisma.humanCode.count(),
+      prisma.humanCode.count({ where: notInvalid }),
       prisma.source.count({ where: { enabled: true } }),
       prisma.crawlRun.findMany({ orderBy: { startedAt: "desc" }, take: 8, include: { source: true } }),
       prisma.aiBetSlip.findMany({ orderBy: { totalOdds: "asc" } }),
       prisma.humanCode.count({ where: { status: "ACTIVE" } }),
       prisma.$queryRaw<{ d: string; n: number }[]>`
         SELECT to_char("foundAt" AT TIME ZONE 'Africa/Lagos', 'YYYY-MM-DD') AS d, count(*)::int AS n
-        FROM human_codes GROUP BY 1 ORDER BY 1 DESC LIMIT 14`,
+        FROM human_codes WHERE status <> 'INVALID' GROUP BY 1 ORDER BY 1 DESC LIMIT 14`,
     ]);
 
-  const latest = codes[0];
+  // Feature the latest ACTIVE code in the hero — never an INVALID/expired one.
+  const latest = codes.find((c) => c.status === "ACTIVE") ?? codes[0];
   const nextMs = nextRunAt ? new Date(nextRunAt).getTime() : 0;
   const lastUpd = lastRunAt ? new Date(lastRunAt).toLocaleTimeString() : "—";
   const lastRunIso = lastRunAt ? new Date(lastRunAt).toISOString() : "";
@@ -199,7 +203,7 @@ async function renderDashboard(
     })
     .join("");
 
-  // ---- Prediction cards (scraped tips from footballpredictions.com) ----
+  // ---- Prediction cards (footballpredictions.com tips + Telegram analysis) ----
   const predCards = preds
     .map((p) => {
       const kick = p.kickoff
@@ -210,19 +214,35 @@ async function renderDashboard(
             minute: "2-digit",
           })
         : "—";
+      const isTg = p.source.startsWith("@");
+      const matchup =
+        p.home && p.away
+          ? `${esc(p.home)} <span class="muted">v</span> ${esc(p.away)}`
+          : esc(p.title ?? "Prediction");
+      const badge = isTg ? p.source : (p.league ?? "Football");
+      const hasTip = !!p.tip;
+      const hasOdds = !!p.odds;
+      const linkLabel = isTg ? "View on Telegram ↗" : "Full analysis ↗";
+      const metrics = hasOdds
+        ? `<div><b>${esc(p.odds)}</b><small>Odds</small></div>
+           <div><b>${esc(p.probability ?? "—")}</b><small>Probability</small></div>
+           <div><b>${esc(kick)}</b><small>Kick-off</small></div>`
+        : `<div><b>${esc(kick)}</b><small>${isTg ? "Posted" : "Kick-off"}</small></div>
+           <div><b>${esc(p.league ?? (isTg ? "Analyst tip" : "—"))}</b><small>${isTg ? "Source" : "Competition"}</small></div>`;
       return `
-      <div class="slip" data-f="${esc(`${p.home} ${p.away} ${p.league ?? ""} ${p.tip ?? ""}`.toLowerCase())}">
+      <div class="slip" data-f="${esc(`${p.home ?? ""} ${p.away ?? ""} ${p.title ?? ""} ${p.league ?? ""} ${p.tip ?? ""}`.toLowerCase())}">
         <div class="slip-head">
-          <span class="tag indigo">${esc(p.league ?? "Football")}</span>
-          <b class="slip-title">${esc(p.home)} <span class="muted">v</span> ${esc(p.away)}</b>
+          <span class="tag ${isTg ? "orange" : "indigo"}">${esc(badge)}</span>
+          <b class="slip-title">${matchup}</b>
         </div>
-        <div class="pred-tip">🎯 ${esc(p.tip ?? "—")}</div>
-        <div class="metrics">
-          <div><b>${esc(p.odds ?? "—")}</b><small>Odds</small></div>
-          <div><b>${esc(p.probability ?? "—")}</b><small>Probability</small></div>
-          <div><b>${esc(kick)}</b><small>Kick-off</small></div>
-        </div>
-        ${p.url ? `<a class="btn ghost sm" href="${esc(p.url)}" target="_blank" rel="noopener">Full analysis ↗</a>` : ""}
+        ${
+          hasTip
+            ? `<div class="pred-tip">🎯 ${esc(p.tip ?? "—")}</div>
+        <div class="metrics">${metrics}</div>`
+            : `<div class="pred-preview">${esc(p.analysis ?? "Prediction preview")}…</div>
+        <div class="metrics">${metrics}</div>`
+        }
+        ${p.url ? `<a class="btn ghost sm" href="${esc(p.url)}" target="_blank" rel="noopener">${linkLabel}</a>` : ""}
       </div>`;
     })
     .join("");
@@ -272,9 +292,9 @@ async function renderDashboard(
   const kpis =
     mode === "pred"
       ? `
-      ${kpi("📈", preds.length, "match predictions", "indigo")}
-      ${kpi("⚽", new Set(preds.map((p) => p.league)).size, "leagues", "orange")}
-      ${kpi("🔗", 1, "source (footballpredictions)", "blue")}
+      ${kpi("📈", preds.length, "predictions", "indigo")}
+      ${kpi("🎯", preds.filter((p) => p.odds).length, "with tip + odds", "orange")}
+      ${kpi("🔗", new Set(preds.map((p) => p.source)).size, "sources", "blue")}
       ${kpi("🤖", aiSlips.length, "AI slips", "green")}`
       : mode === "ai"
         ? `
@@ -515,6 +535,7 @@ async function renderDashboard(
   .reason{color:#6b7594;font-size:12px;margin-top:10px;line-height:1.5}
   .pred-tip{background:#eeecfb;color:var(--indigo);font-weight:800;font-size:15px;
     border-radius:10px;padding:10px 14px;margin:10px 0}
+  .pred-preview{color:#6b7594;font-size:13px;line-height:1.5;margin:10px 0;font-style:italic}
   .empty{grid-column:1/-1;text-align:center;color:var(--muted);padding:30px}
   .disclaimer{color:var(--muted);font-size:12px;margin-top:6px;text-align:center;padding:8px}
   @media(max-width:1000px){ .kpis{grid-template-columns:repeat(2,1fr)} .split{grid-template-columns:1fr} .col-side .card{position:static} }
@@ -564,7 +585,7 @@ async function renderDashboard(
       ${body}
       <div class="disclaimer">⚠️ ${esc(RESPONSIBLE_GAMBLING_DISCLAIMER)} ${
         mode === "pred"
-          ? "Predictions sourced from footballpredictions.com — third-party statistical tips, not affiliated with SportyBet."
+          ? "Predictions from footballpredictions.com + Telegram analysts (@betmines, @eaglepredict) — third-party tips, not affiliated with SportyBet."
           : mode === "ai"
             ? "AI slips are model estimates — booking codes save selections only; review & stake yourself."
             : "Codes verified against SportyBet's official API."
