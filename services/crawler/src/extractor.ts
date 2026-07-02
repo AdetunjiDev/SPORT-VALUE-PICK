@@ -48,6 +48,43 @@ const STOPWORDS = new Set([
   "UNDER25",
   "GOALS",
   "TOTAL",
+  // All-caps words channels post as standalone lines (now that all-letter
+  // codes are accepted, these must be excluded explicitly)
+  "THANKS",
+  "WELCOME",
+  "LOADED",
+  "WINNER",
+  "WINNERS",
+  "CONGRATS",
+  "BALANCE",
+  "DEPOSIT",
+  "WITHDRAW",
+  "BONUS",
+  "PROMO",
+  "VERIFY",
+  "UPDATE",
+  "UPDATED",
+  "PENDING",
+  "SUCCESS",
+  "JACKPOT",
+  "MORNING",
+  "EVENING",
+  "TONIGHT",
+  "LOADING",
+  "BANKER",
+  "BANKERS",
+  "ROLLOVER",
+  "DOUBLE",
+  "SINGLE",
+  "COMBO",
+  "SPORTS",
+  "TENNIS",
+  "SOCCER",
+  "VIRTUAL",
+  "PLEASE",
+  "FOLLOW",
+  "SHARE",
+  "DAILY",
   // Bookmaker names (contain digits/letters but are not codes)
   "BET9JA",
   "BETWAY",
@@ -69,15 +106,22 @@ export interface ExtractedInfo {
   numberOfGames?: number;
 }
 
-function looksLikeCode(token: string): boolean {
+function looksLikeCode(token: string, opts: { allowAllLetters?: boolean } = {}): boolean {
   const t = token.toUpperCase();
   if (STOPWORDS.has(t)) return false;
   if (/^(19|20)\d{2}$/.test(t)) return false; // reject 4-digit years
-  // SportyBet booking codes are alphanumeric MIXES — require both a letter and
-  // a digit. This is the single biggest precision win against headline noise.
   const hasLetter = /[A-Z]/.test(t);
   const hasDigit = /\d/.test(t);
-  return hasLetter && hasDigit;
+  // Letter+digit mixes are always accepted — the biggest precision win
+  // against headline noise.
+  if (hasLetter && hasDigit) return true;
+  // All-letter codes (e.g. @betfuse's "XAFRPT") are real SportyBet codes too,
+  // but only trusted in high-confidence contexts: explicit "code:" phrasing or
+  // a message that is just the code itself. Length-capped to avoid words.
+  if (opts.allowAllLetters && hasLetter && !hasDigit && t.length >= 5 && t.length <= 8) {
+    return true;
+  }
+  return false;
 }
 
 export function classifyCodeType(text: string): CodeType {
@@ -133,7 +177,8 @@ export function extract(text: string, opts: ExtractOptions = {}): ExtractedInfo 
     let match: RegExpExecArray | null;
     while ((match = re.exec(text)) !== null) {
       const token = match[1]?.toUpperCase();
-      if (token && looksLikeCode(token)) found.add(token);
+      // Explicit "code:" context — safe to accept all-letter codes here.
+      if (token && looksLikeCode(token, { allowAllLetters: true })) found.add(token);
     }
   }
 
@@ -144,6 +189,14 @@ export function extract(text: string, opts: ExtractOptions = {}): ExtractedInfo 
     while ((m = BARE_TOKEN.exec(upper)) !== null) {
       const token = m[1];
       if (looksLikeCode(token)) found.add(token);
+    }
+    // All-letter codes posted as a standalone line (@betfuse style: the whole
+    // message IS the code). A lone uppercase token on its own line is a code.
+    for (const line of text.split("\n")) {
+      const t = line.trim().toUpperCase();
+      if (/^[A-Z]{5,8}$/.test(t) && looksLikeCode(t, { allowAllLetters: true })) {
+        found.add(t);
+      }
     }
   }
 
