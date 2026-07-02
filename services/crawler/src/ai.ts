@@ -1,5 +1,6 @@
 import { prisma, Prisma } from "@sportybet/db";
 import { createBookingCode } from "./booker.js";
+import { forebetLegs } from "./forebet-ai.js";
 
 /**
  * AI recommendation engine (v1).
@@ -17,7 +18,7 @@ import { createBookingCode } from "./booker.js";
  *  - Kelly fraction         = (b·p - q) / b, quarter-Kelly capped for safety
  */
 
-interface Leg {
+export interface Leg {
   eventId: string;
   home?: string;
   away?: string;
@@ -200,7 +201,31 @@ export async function generateAiSlips(): Promise<number> {
   }
 
   const pool = await candidatePool();
-  if (pool.length < 2) return 0;
+
+  // Forebet model tips matched to live SportyBet fixtures — never let a
+  // Forebet/SportyBet hiccup break the main AI generation.
+  let fbPool: Leg[] = [];
+  try {
+    fbPool = await forebetLegs();
+  } catch {
+    /* keep going */
+  }
+  // Merge Forebet legs into the shared pool (dedupe: same event+market+pick
+  // from a human code counts as extra consensus, not a duplicate entry).
+  const poolKeys = new Set(pool.map((l) => `${l.eventId}|${l.market}|${l.pick}`));
+  for (const l of fbPool) {
+    const key = `${l.eventId}|${l.market}|${l.pick}`;
+    if (poolKeys.has(key)) {
+      const ex = pool.find((p) => `${p.eventId}|${p.market}|${p.pick}` === key)!;
+      ex.consensus += 1;
+      ex.prob = Math.min(0.95, Math.max(ex.prob, l.prob));
+    } else {
+      pool.push(l);
+      poolKeys.add(key);
+    }
+  }
+
+  if (pool.length < 2 && fbPool.length < 2) return 0;
 
   const profiles: Profile[] = [
     {
@@ -236,6 +261,28 @@ export async function generateAiSlips(): Promise<number> {
   const slips = profiles.map((p) => buildSlip(pool, p, generation)).filter(Boolean) as NonNullable<
     ReturnType<typeof buildSlip>
   >[];
+
+  // Dedicated Forebet slip: built purely from Forebet's model predictions
+  // matched to live SportyBet 1X2 prices.
+  if (fbPool.length >= 2) {
+    const fbSlip = buildSlip(
+      fbPool,
+      {
+        title: "AI Forebet Slip",
+        codeType: "COMBO",
+        minOdds: 1.15,
+        maxOdds: 8,
+        legs: 4,
+        sort: (a, b) => b.prob - a.prob || b.odds - a.odds,
+      },
+      generation,
+    );
+    if (fbSlip) {
+      fbSlip.reasoning += " Legs sourced from Forebet's 1X2 statistical model.";
+      slips.push(fbSlip);
+    }
+  }
+
   if (!slips.length) return 0;
 
   // Replace the current auto-generated set.

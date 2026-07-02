@@ -11,7 +11,7 @@ import { fetchText, stripHtml } from "./adapters/http.js";
  */
 
 export interface ExtPrediction {
-  source: string; // "footballpredictions.com" | "@betmines" …
+  source: string; // "footballpredictions.com" | "forebet.com" | "@betmines" …
   home?: string;
   away?: string;
   title?: string; // headline for free-form posts
@@ -22,6 +22,9 @@ export interface ExtPrediction {
   probability?: string;
   analysis?: string; // free-form written analysis
   url?: string;
+  // Structured Forebet fields — used by the AI engine to book real slips.
+  predCode?: "1" | "X" | "2";
+  probs?: [number, number, number]; // home / draw / away %
 }
 
 const BASE = "https://footballpredictions.com";
@@ -202,8 +205,9 @@ async function forebetPredictions(): Promise<ExtPrediction[]> {
     const leagueM = b.match(/getstag\(this,\d+,'[^']*','([^']+)'/);
     const league = leagueM ? leagueM[1].replace(/-/g, " ") : undefined;
     // Forebet's suggested prediction: 1, X or 2
-    const predCode = (b.match(/class="forepr"><span>([^<]+)<\/span>/) ?? [])[1]?.trim();
-    const tip = predCode ? forebetTip(predCode, home, away) : undefined;
+    const rawPred = (b.match(/class="forepr"><span>([^<]+)<\/span>/) ?? [])[1]?.trim();
+    const predCode = rawPred === "1" || rawPred === "X" || rawPred === "2" ? rawPred : undefined;
+    const tip = rawPred ? forebetTip(rawPred, home, away) : undefined;
     // Predicted score e.g. "1 - 3"
     const scoreM = b.match(/class="scrmobpred[^"]*">([^<]+)<span/);
     const score = scoreM ? scoreM[1].replace(/-/g, "–").trim() : undefined;
@@ -213,6 +217,9 @@ async function forebetPredictions(): Promise<ExtPrediction[]> {
     // 1/X/2 probabilities from fprc
     const probM = b.match(/class='fprc'><span>(\d+)<\/span><span>(\d+)<\/span><span[^>]*>(\d+)<\/span>/);
     const prob = probM ? `${probM[1]}% / ${probM[2]}% / ${probM[3]}%` : undefined;
+    const probs = probM
+      ? ([Number(probM[1]), Number(probM[2]), Number(probM[3])] as [number, number, number])
+      : undefined;
     const analysis = [
       score ? `Predicted score: ${score}` : null,
       prob ? `1X2 probability: ${prob}` : null,
@@ -227,9 +234,22 @@ async function forebetPredictions(): Promise<ExtPrediction[]> {
       odds,
       analysis,
       url: url ? `${FOREBET}${url}` : undefined,
+      predCode,
+      probs,
     });
   }
   return out;
+}
+
+// Separate cache so the AI engine can pull Forebet tips without re-fetching.
+let fbCache: { at: number; data: ExtPrediction[] } | null = null;
+
+/** Cached Forebet tips — used by both getPredictions() and the AI engine. */
+export async function getForebetTips(): Promise<ExtPrediction[]> {
+  if (fbCache && Date.now() - fbCache.at < TTL_MS) return fbCache.data;
+  const data = await forebetPredictions();
+  if (data.length) fbCache = { at: Date.now(), data };
+  return data.length ? data : (fbCache?.data ?? []);
 }
 
 export async function getPredictions(): Promise<ExtPrediction[]> {
@@ -238,7 +258,7 @@ export async function getPredictions(): Promise<ExtPrediction[]> {
     const [homeHtml, tg, forebet, ...leagueHtmls] = await Promise.all([
       safeFetch(`${BASE}/`),
       telegramPredictions(),
-      forebetPredictions(),
+      getForebetTips(),
       ...LEAGUE_PAGES.map((l) => safeFetch(`${BASE}/footballpredictions/${l.slug}/`)),
     ]);
 
