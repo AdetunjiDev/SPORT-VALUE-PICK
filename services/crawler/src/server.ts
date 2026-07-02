@@ -215,11 +215,12 @@ async function renderDashboard(
           })
         : "—";
       const isTg = p.source.startsWith("@");
+      const isForebet = p.source === "forebet.com";
       const matchup =
         p.home && p.away
           ? `${esc(p.home)} <span class="muted">v</span> ${esc(p.away)}`
           : esc(p.title ?? "Prediction");
-      const badge = isTg ? p.source : (p.league ?? "Football");
+      const badge = isTg ? p.source : isForebet ? "Forebet" : (p.league ?? "Football");
       const hasTip = !!p.tip;
       const hasOdds = !!p.odds;
       const linkLabel = isTg ? "View on Telegram ↗" : "Full analysis ↗";
@@ -229,10 +230,11 @@ async function renderDashboard(
            <div><b>${esc(kick)}</b><small>Kick-off</small></div>`
         : `<div><b>${esc(kick)}</b><small>${isTg ? "Posted" : "Kick-off"}</small></div>
            <div><b>${esc(p.league ?? (isTg ? "Analyst tip" : "—"))}</b><small>${isTg ? "Source" : "Competition"}</small></div>`;
+      const badgeColor = isTg ? "orange" : isForebet ? "green" : "indigo";
       return `
       <div class="slip" data-f="${esc(`${p.home ?? ""} ${p.away ?? ""} ${p.title ?? ""} ${p.league ?? ""} ${p.tip ?? ""}`.toLowerCase())}">
         <div class="slip-head">
-          <span class="tag ${isTg ? "orange" : "indigo"}">${esc(badge)}</span>
+          <span class="tag ${badgeColor}">${esc(badge)}</span>
           <b class="slip-title">${matchup}</b>
         </div>
         ${
@@ -585,7 +587,7 @@ async function renderDashboard(
       ${body}
       <div class="disclaimer">⚠️ ${esc(RESPONSIBLE_GAMBLING_DISCLAIMER)} ${
         mode === "pred"
-          ? "Predictions from footballpredictions.com + Telegram analysts (@betmines, @eaglepredict) — third-party tips, not affiliated with SportyBet."
+          ? "Predictions from footballpredictions.com, forebet.com + Telegram analysts (@betmines, @eaglepredict) — third-party tips, not affiliated with SportyBet."
           : mode === "ai"
             ? "AI slips are model estimates — booking codes save selections only; review & stake yourself."
             : "Codes verified against SportyBet's official API."

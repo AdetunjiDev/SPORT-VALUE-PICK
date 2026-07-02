@@ -25,6 +25,7 @@ export interface ExtPrediction {
 }
 
 const BASE = "https://footballpredictions.com";
+const FOREBET = "https://www.forebet.com";
 // Just under the 3-min scan interval so each scheduler cycle pulls fresh data.
 const TTL_MS = 150 * 1000;
 
@@ -174,12 +175,70 @@ async function telegramPredictions(): Promise<ExtPrediction[]> {
   return out;
 }
 
+// Map Forebet's 1/X/2 code to a readable tip label.
+function forebetTip(code: string, home: string, away: string): string {
+  if (code === "1") return `${home} to Win`;
+  if (code === "X") return "Draw";
+  if (code === "2") return `${away} to Win`;
+  return code;
+}
+
+async function forebetPredictions(): Promise<ExtPrediction[]> {
+  const html = await safeFetch(
+    `${FOREBET}/en/football-tips-and-predictions-for-today/predictions-1x2`,
+  );
+  if (!html) return [];
+  const out: ExtPrediction[] = [];
+  // Each match row is wrapped in class='rcnt …'
+  const blocks = html.match(/class='rcnt [^']*'>([\s\S]*?)(?=class='rcnt |class='datepred|<\/div>\s*<\/div>\s*<\/div>\s*<\/section)/g) ?? [];
+  for (const b of blocks) {
+    const home = (b.match(/itemprop="homeTeam"[^>]*>[\s\S]*?itemprop="name">([^<]+)</) ?? [])[1]?.trim();
+    const away = (b.match(/itemprop="awayTeam"[^>]*>[\s\S]*?itemprop="name">([^<]+)</) ?? [])[1]?.trim();
+    if (!home || !away) continue;
+    const url = (b.match(/href="(\/en\/football\/matches\/[^"]+)"/) ?? [])[1];
+    const kickoff = (b.match(/datetime="([^"]+)"/) ?? [])[1];
+    const dateBah = (b.match(/class="date_bah">([\d/: ]+)</) ?? [])[1]?.trim();
+    // League name is the 4th argument in the getstag() onclick call
+    const leagueM = b.match(/getstag\(this,\d+,'[^']*','([^']+)'/);
+    const league = leagueM ? leagueM[1].replace(/-/g, " ") : undefined;
+    // Forebet's suggested prediction: 1, X or 2
+    const predCode = (b.match(/class="forepr"><span>([^<]+)<\/span>/) ?? [])[1]?.trim();
+    const tip = predCode ? forebetTip(predCode, home, away) : undefined;
+    // Predicted score e.g. "1 - 3"
+    const scoreM = b.match(/class="scrmobpred[^"]*">([^<]+)<span/);
+    const score = scoreM ? scoreM[1].replace(/-/g, "–").trim() : undefined;
+    // Average odds
+    const oddsM = b.match(/class="avg_sc[^"]*"[^>]*>([0-9.]+)<\//);
+    const odds = oddsM ? oddsM[1] : undefined;
+    // 1/X/2 probabilities from fprc
+    const probM = b.match(/class='fprc'><span>(\d+)<\/span><span>(\d+)<\/span><span[^>]*>(\d+)<\/span>/);
+    const prob = probM ? `${probM[1]}% / ${probM[2]}% / ${probM[3]}%` : undefined;
+    const analysis = [
+      score ? `Predicted score: ${score}` : null,
+      prob ? `1X2 probability: ${prob}` : null,
+    ].filter(Boolean).join(" · ") || undefined;
+    out.push({
+      source: "forebet.com",
+      home,
+      away,
+      league,
+      kickoff: kickoff || dateBah,
+      tip,
+      odds,
+      analysis,
+      url: url ? `${FOREBET}${url}` : undefined,
+    });
+  }
+  return out;
+}
+
 export async function getPredictions(): Promise<ExtPrediction[]> {
   if (cache && Date.now() - cache.at < TTL_MS) return cache.data;
   try {
-    const [homeHtml, tg, ...leagueHtmls] = await Promise.all([
+    const [homeHtml, tg, forebet, ...leagueHtmls] = await Promise.all([
       safeFetch(`${BASE}/`),
       telegramPredictions(),
+      forebetPredictions(),
       ...LEAGUE_PAGES.map((l) => safeFetch(`${BASE}/footballpredictions/${l.slug}/`)),
     ]);
 
@@ -190,6 +249,11 @@ export async function getPredictions(): Promise<ExtPrediction[]> {
     for (const p of parseHomepageTips(homeHtml)) {
       const ex = byKey.get(keyOf(p));
       byKey.set(keyOf(p), ex ? { ...ex, ...p } : p);
+    }
+    // Merge Forebet: enrich existing entries (add tip/score) or add new ones
+    for (const p of forebet) {
+      const ex = byKey.get(keyOf(p));
+      byKey.set(keyOf(p), ex ? { ...ex, tip: ex.tip ?? p.tip, odds: ex.odds ?? p.odds, analysis: ex.analysis ?? p.analysis } : p);
     }
     for (const p of tg) if (!byKey.has(keyOf(p))) byKey.set(keyOf(p), p);
 
@@ -203,7 +267,7 @@ export async function getPredictions(): Promise<ExtPrediction[]> {
         if (ao !== bo) return bo - ao;
         return t(a) - t(b);
       })
-      .slice(0, 90);
+      .slice(0, 120);
 
     if (data.length) cache = { at: Date.now(), data };
     return data.length ? data : (cache?.data ?? []);

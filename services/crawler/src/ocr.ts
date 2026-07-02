@@ -15,6 +15,15 @@ const OPTS = {
   psm: 6, // assume a uniform block of text
 };
 
+/** OCR an uploaded image buffer (bet-slip screenshots). */
+export async function ocrBuffer(buf: Buffer): Promise<string> {
+  try {
+    return (await tesseract.recognize(buf, OPTS)).trim();
+  } catch {
+    return "";
+  }
+}
+
 export async function ocrImage(url: string): Promise<string> {
   const hit = cache.get(url);
   if (hit !== undefined) return hit;
