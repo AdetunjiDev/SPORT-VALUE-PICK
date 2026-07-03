@@ -1,5 +1,5 @@
 import type { Leg } from "./ai.js";
-import { getForebetTips } from "./predictions.js";
+import { getForebetTips, type ExtPrediction } from "./predictions.js";
 import { config } from "./config.js";
 
 /**
@@ -109,11 +109,12 @@ function teamsMatch(a: string, b: string): boolean {
 const round = (n: number, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
 
 /**
- * Forebet tips matched to live SportyBet fixtures as bookable AI-engine legs.
- * Only future matches with an active 1X2 price for the predicted outcome.
+ * Match any set of predictions (with home/away + predCode) to live SportyBet
+ * fixtures as bookable legs. Only future matches with an active 1X2 price for
+ * the predicted outcome. Used by the AI engine AND the user slip-builder.
  */
-export async function forebetLegs(): Promise<Leg[]> {
-  const [tips, events] = await Promise.all([getForebetTips(), sportyEvents()]);
+export async function legsForTips(tips: ExtPrediction[]): Promise<Leg[]> {
+  const events = await sportyEvents();
   if (!tips.length || !events.length) return [];
   const now = Date.now();
   const legs: Leg[] = [];
@@ -155,4 +156,9 @@ export async function forebetLegs(): Promise<Leg[]> {
     });
   }
   return legs;
+}
+
+/** Forebet's full daily tip list as bookable legs (for the AI engine). */
+export async function forebetLegs(): Promise<Leg[]> {
+  return legsForTips(await getForebetTips());
 }

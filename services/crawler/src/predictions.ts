@@ -270,10 +270,23 @@ export async function getPredictions(): Promise<ExtPrediction[]> {
       const ex = byKey.get(keyOf(p));
       byKey.set(keyOf(p), ex ? { ...ex, ...p } : p);
     }
-    // Merge Forebet: enrich existing entries (add tip/score) or add new ones
+    // Merge Forebet: enrich existing entries (add tip/score) or add new ones.
+    // predCode/probs always carry over so merged cards stay bookable.
     for (const p of forebet) {
       const ex = byKey.get(keyOf(p));
-      byKey.set(keyOf(p), ex ? { ...ex, tip: ex.tip ?? p.tip, odds: ex.odds ?? p.odds, analysis: ex.analysis ?? p.analysis } : p);
+      byKey.set(
+        keyOf(p),
+        ex
+          ? {
+              ...ex,
+              tip: ex.tip ?? p.tip,
+              odds: ex.odds ?? p.odds,
+              analysis: ex.analysis ?? p.analysis,
+              predCode: ex.predCode ?? p.predCode,
+              probs: ex.probs ?? p.probs,
+            }
+          : p,
+      );
     }
     for (const p of tg) if (!byKey.has(keyOf(p))) byKey.set(keyOf(p), p);
 

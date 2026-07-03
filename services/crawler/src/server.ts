@@ -4,6 +4,30 @@ import { RESPONSIBLE_GAMBLING_DISCLAIMER } from "@sportybet/shared";
 import { config } from "./config.js";
 import { runCycle, lastRunAt, nextRunAt, lastSummary, intervalSec } from "./scheduler.js";
 import { getPredictions } from "./predictions.js";
+import { legsForTips } from "./forebet-ai.js";
+import { createBookingCode } from "./booker.js";
+import { ocrBuffer } from "./ocr.js";
+import { extract } from "./extractor.js";
+import { verifyCode } from "./verifier.js";
+
+/** Read a request body with a hard size cap (default 10 MB for images). */
+function readBody(req: http.IncomingMessage, maxBytes = 10 * 1024 * 1024): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => {
+      size += c.length;
+      if (size > maxBytes) {
+        reject(new Error("payload too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
 
 function esc(s: unknown): string {
   return String(s ?? "")
@@ -231,11 +255,15 @@ async function renderDashboard(
         : `<div><b>${esc(kick)}</b><small>${isTg ? "Posted" : "Kick-off"}</small></div>
            <div><b>${esc(p.league ?? (isTg ? "Analyst tip" : "—"))}</b><small>${isTg ? "Source" : "Competition"}</small></div>`;
       const badgeColor = isTg ? "orange" : isForebet ? "green" : "indigo";
+      // Bookable = we can map this tip to a live SportyBet 1X2 selection.
+      const bookable = !!(p.predCode && p.home && p.away);
+      const selKey = bookable ? `${p.home}|${p.away}`.toLowerCase() : "";
       return `
       <div class="slip" data-f="${esc(`${p.home ?? ""} ${p.away ?? ""} ${p.title ?? ""} ${p.league ?? ""} ${p.tip ?? ""}`.toLowerCase())}">
         <div class="slip-head">
           <span class="tag ${badgeColor}">${esc(badge)}</span>
           <b class="slip-title">${matchup}</b>
+          ${bookable ? `<label class="selbox" title="Add this match to your slip"><input type="checkbox" data-key="${esc(selKey)}" onchange="selTog(this)"/><span>➕ Add to slip</span></label>` : ""}
         </div>
         ${
           hasTip
@@ -310,9 +338,18 @@ async function renderDashboard(
       ${kpi("📡", sourceCount, "active sources", "blue")}
       ${kpi("🤖", aiSlips.length, "AI slips", "orange")}`;
 
+  const slipBar = `
+    <div id="slipbar" class="slipbar" hidden>
+      <span class="sb-info">🎟️ <b id="slipcount">0</b> selected</span>
+      <button class="btn" id="genbtn" onclick="genCode(this)">⚡ Generate SportyBet Code</button>
+      <span id="slipres"></span>
+      <button class="btn ghost sm" onclick="clearSel()">Clear</button>
+    </div>`;
+
   const body =
     mode === "pred"
-      ? `<div class="cards">${predCards || '<div class="card empty">No predictions available right now — the source may be updating. Check back shortly.</div>'}</div>`
+      ? `<div class="pred-hint card">✨ <b>Build your own code:</b> tick <i>“➕ Add to slip”</i> on any predictions below (2+), then hit <b>Generate SportyBet Code</b> — you get a real booking code to copy, just like the human ones.</div>
+        <div class="cards">${predCards || '<div class="card empty">No predictions available right now — the source may be updating. Check back shortly.</div>'}</div>${slipBar}`
       : mode === "ai"
         ? `<div class="cards">${aiCards || '<div class="card empty">No AI slips right now — not enough upcoming matches (common late at night). Fresh slips generate automatically as new fixtures and codes come in.</div>'}</div>`
         : `<div class="split">
@@ -403,6 +440,27 @@ async function renderDashboard(
   .btn.sm{padding:6px 12px;font-size:12px}
   .btn.gold{background:linear-gradient(135deg,#e0a531,#f6c453);color:#3a2a06;box-shadow:0 6px 16px rgba(224,165,49,.3)}
   .btn:disabled{opacity:.7;cursor:default}
+  /* Prediction slip builder */
+  .pred-hint{padding:14px 18px;margin-bottom:16px;font-size:13px;background:linear-gradient(120deg,#eafaf1,#eeecfb);border:1px solid #d5eee0}
+  .selbox{margin-left:auto;display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;
+    color:var(--green);cursor:pointer;padding:4px 10px;border:1px dashed #bfe7d2;border-radius:8px;white-space:nowrap}
+  .selbox:hover{background:#eafaf1}
+  .selbox input{accent-color:var(--green);cursor:pointer}
+  .slip.picked{border:2px solid var(--green);box-shadow:0 8px 24px rgba(22,168,107,.18)}
+  .slipbar{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:40;
+    display:flex;align-items:center;gap:12px;flex-wrap:wrap;max-width:92vw;
+    background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 18px;
+    box-shadow:0 12px 36px rgba(16,24,40,.18)}
+  .sb-info{font-size:13px;font-weight:600;color:#475069}
+  .slipcode{display:inline-block;background:#141a2e;color:#7df0b8;font-family:ui-monospace,Consolas,monospace;
+    font-size:16px;font-weight:800;letter-spacing:2px;padding:7px 14px;border-radius:9px;cursor:pointer}
+  .slipcode:hover{filter:brightness(1.2)}
+  /* OCR modal */
+  #ocrmodal{position:fixed;inset:0;z-index:60;background:rgba(16,24,40,.45);display:grid;place-items:center;padding:20px}
+  .ocr-box{background:var(--card);border-radius:16px;padding:20px 22px;max-width:520px;width:100%;
+    box-shadow:0 20px 60px rgba(16,24,40,.3)}
+  .ocr-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+  .ocr-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px 0;border-bottom:1px solid var(--line)}
   #toast{position:fixed;right:22px;bottom:22px;z-index:50;max-width:360px;
     background:#141a2e;color:#fff;padding:13px 18px;border-radius:12px;font-size:13px;font-weight:600;
     box-shadow:0 10px 30px rgba(16,24,40,.25);opacity:0;transform:translateY(10px);
@@ -574,6 +632,7 @@ async function renderDashboard(
             ? `<span class="tier-badge tier-premium">👑 PREMIUM</span>`
             : `<span class="tier-badge tier-free">FREE</span><a class="btn gold" href="/upgrade">⭐ Upgrade</a>`
         }
+        <label class="btn ghost" style="cursor:pointer" title="Upload a bet-slip screenshot — we'll read the booking code out of it">📷 Scan slip image<input type="file" accept="image/*" style="display:none" onchange="ocrUp(this)"/></label>
         <button class="btn" onclick="doScan(this)">⟳ Scan now</button>
       </div>
     </div>
@@ -619,6 +678,86 @@ async function renderDashboard(
     showToast('Scanning 15 sources… results in ~20s');
     fetch('/scan',{method:'POST'}).catch(function(){});
     setTimeout(function(){ btn.disabled=false; btn.textContent=o; }, 4000);
+  }
+  /* ---- Prediction slip builder ---- */
+  var SEL = {};
+  function selTog(cb){
+    var k = cb.getAttribute('data-key');
+    if(cb.checked) SEL[k]=1; else delete SEL[k];
+    cb.closest('.slip').classList.toggle('picked', cb.checked);
+    updBar();
+  }
+  function updBar(){
+    var n = Object.keys(SEL).length;
+    var bar = document.getElementById('slipbar'); if(!bar) return;
+    bar.hidden = n === 0;
+    document.getElementById('slipcount').textContent = n;
+  }
+  function clearSel(){
+    SEL = {};
+    document.querySelectorAll('.selbox input').forEach(function(c){ c.checked=false; });
+    document.querySelectorAll('.slip.picked').forEach(function(s){ s.classList.remove('picked'); });
+    var r = document.getElementById('slipres'); if(r) r.innerHTML='';
+    updBar();
+  }
+  async function genCode(btn){
+    var keys = Object.keys(SEL);
+    if(keys.length < 2){ showToast('Pick at least 2 matches first','warn'); return; }
+    btn.disabled = true; var o = btn.textContent; btn.textContent = '⚡ Booking on SportyBet…';
+    try{
+      var r = await fetch('/api/predictions/book',{method:'POST',
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify({keys:keys})});
+      var j = await r.json();
+      if(j.code){
+        document.getElementById('slipres').innerHTML =
+          '<span class="slipcode ccopy" title="Click to copy" onclick="cp(this,\''+j.code+'\')">'+j.code+'</span>'+
+          '<a class="btn ghost sm" target="_blank" rel="noopener" href="https://www.sportybet.com/ng/?shareCode='+j.code+'">Open ↗</a>';
+        var drop = j.requested > j.matched ? ' ('+(j.requested-j.matched)+' match(es) unavailable, skipped)' : '';
+        showToast('✅ Code '+j.code+' created — '+j.matched+' games, '+(j.totalOdds||'—')+' odds'+drop+'. Click it to copy.','ok');
+      } else {
+        showToast(j.error || 'Booking failed — try again shortly','warn');
+      }
+    }catch(e){ showToast('Booking failed — network error','warn'); }
+    btn.disabled = false; btn.textContent = o;
+  }
+  /* ---- Bet-slip image scanner (OCR) ---- */
+  function ocrUp(inp){
+    var f = inp.files && inp.files[0]; if(!f) return;
+    if(f.size > 7*1024*1024){ showToast('Image too large — max 7MB','warn'); inp.value=''; return; }
+    showToast('🔍 Reading your slip image… takes ~10s');
+    var rd = new FileReader();
+    rd.onload = async function(){
+      try{
+        var r = await fetch('/api/ocr',{method:'POST',
+          headers:{'Content-Type':'application/json'}, body: JSON.stringify({image: rd.result})});
+        var j = await r.json();
+        if(j.error){ showToast(j.error,'warn'); } else { showOcr(j); }
+      }catch(e){ showToast('Could not read the image — try a sharper screenshot','warn'); }
+      inp.value='';
+    };
+    rd.readAsDataURL(f);
+  }
+  function showOcr(j){
+    var codes = (j && j.codes) || [];
+    var rows = codes.length
+      ? codes.map(function(c){
+          return '<div class="ocr-row">'+
+            '<span class="slipcode ccopy" title="Click to copy" onclick="cp(this,\''+c.code+'\')">'+c.code+'</span>'+
+            '<span class="pill status s-'+c.status+'">'+c.status+'</span>'+
+            (c.totalOdds ? '<span class="muted">'+c.totalOdds+' odds</span>' : '')+
+            (c.games ? '<span class="muted">'+c.games+' games</span>' : '')+
+            '<a class="btn ghost sm" target="_blank" rel="noopener" href="https://www.sportybet.com/ng/?shareCode='+c.code+'">Open ↗</a>'+
+          '</div>';
+        }).join('')
+      : '<div class="muted" style="padding:8px 0">No booking code found in this image. Make sure the code text is visible, sharp, and not cut off.</div>';
+    var m = document.getElementById('ocrmodal');
+    if(!m){ m = document.createElement('div'); m.id='ocrmodal'; document.body.appendChild(m); }
+    m.innerHTML = '<div class="ocr-box">'+
+      '<div class="ocr-head"><b>📷 Codes found in your image</b>'+
+      '<button class="btn ghost sm" onclick="document.getElementById(\'ocrmodal\').remove()">✕ Close</button></div>'+
+      rows+
+      '<div class="muted small" style="margin-top:10px">Click a code to copy · status checked live against SportyBet</div>'+
+    '</div>';
   }
   // friendly one-liner from a raw scan summary
   function niceSummary(s){
@@ -814,6 +953,94 @@ export function startServer() {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ data, meta: { total: data.length } }));
         return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/predictions/book") {
+        // Book the user's selected predictions into a REAL SportyBet code.
+        // A booking code saves selections only — no bet is placed, no money moves.
+        const json = (s: number, o: unknown) => {
+          res.writeHead(s, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(o));
+        };
+        let keys: string[] = [];
+        try {
+          const body = JSON.parse((await readBody(req, 64 * 1024)) || "{}");
+          keys = Array.isArray(body.keys) ? body.keys.map((k: unknown) => String(k)) : [];
+        } catch {
+          return json(400, { error: "Bad request body." });
+        }
+        if (keys.length < 2) return json(400, { error: "Select at least 2 matches." });
+        const preds = await getPredictions();
+        const wanted = preds.filter(
+          (p) =>
+            p.home && p.away && p.predCode && keys.includes(`${p.home}|${p.away}`.toLowerCase()),
+        );
+        if (wanted.length < 2)
+          return json(422, { error: "Selected matches are no longer bookable — refresh and retry." });
+        const legs = await legsForTips(wanted);
+        if (legs.length < 2)
+          return json(422, {
+            error:
+              "SportyBet doesn't currently offer enough of those matches (may have kicked off).",
+          });
+        const booking = await createBookingCode(
+          legs.map((l) => ({
+            eventId: l.eventId,
+            marketId: l.marketId,
+            specifier: l.specifier,
+            outcomeId: l.outcomeId,
+          })),
+        );
+        if (!booking.code)
+          return json(502, { error: "SportyBet booking failed — try again in a minute." });
+        const totalOdds = Math.round(legs.reduce((a, l) => a * l.odds, 1) * 100) / 100;
+        return json(200, {
+          code: booking.code,
+          url: booking.url,
+          games: booking.games ?? legs.length,
+          requested: wanted.length,
+          matched: legs.length,
+          totalOdds,
+        });
+      }
+      if (req.method === "POST" && url.pathname === "/api/ocr") {
+        // Bet-slip image scanner: OCR the uploaded image, extract code-shaped
+        // tokens, and verify each against SportyBet's official API.
+        const json = (s: number, o: unknown) => {
+          res.writeHead(s, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(o));
+        };
+        let b64 = "";
+        try {
+          const body = JSON.parse((await readBody(req)) || "{}");
+          b64 = String(body.image ?? "").replace(/^data:image\/[a-z+.-]+;base64,/i, "");
+        } catch (e: any) {
+          return json(400, { error: e?.message === "payload too large" ? "Image too large (max ~7MB)." : "Bad request body." });
+        }
+        if (!b64) return json(400, { error: "No image provided." });
+        const buf = Buffer.from(b64, "base64");
+        if (buf.length < 100) return json(400, { error: "Image could not be decoded." });
+        const text = await ocrBuffer(buf);
+        if (!text) return json(200, { text: "", codes: [] });
+        const { codes } = extract(text, { aggressive: true });
+        const results: {
+          code: string;
+          status: string;
+          totalOdds?: number;
+          games?: number;
+        }[] = [];
+        for (const code of codes.slice(0, 6)) {
+          const e = await verifyCode(code);
+          results.push({
+            code,
+            status: e.transientError ? "UNVERIFIED" : e.status,
+            totalOdds: e.totalOdds,
+            games: e.numberOfGames,
+          });
+        }
+        // Real codes first: ACTIVE, then UNVERIFIED/EXPIRED, junk INVALID last.
+        const rank = (s: string) => (s === "ACTIVE" ? 0 : s === "INVALID" ? 2 : 1);
+        results.sort((a, b) => rank(a.status) - rank(b.status));
+        return json(200, { text: text.slice(0, 400), codes: results });
       }
       const dateStr = url.searchParams.get("date") ?? "";
       const html = await renderDashboard(mode, tier, dateStr);
