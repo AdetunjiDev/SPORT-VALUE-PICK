@@ -1,4 +1,5 @@
 import { fetchText, stripHtml } from "./adapters/http.js";
+import { getApiFootballPredictions } from "./apifootball.js";
 
 /**
  * Manual-prediction feed, merged from two kinds of source:
@@ -275,10 +276,11 @@ export async function getForebetTips(): Promise<ExtPrediction[]> {
 export async function getPredictions(): Promise<ExtPrediction[]> {
   if (cache && Date.now() - cache.at < TTL_MS) return cache.data;
   try {
-    const [homeHtml, tg, forebet, ...leagueHtmls] = await Promise.all([
+    const [homeHtml, tg, forebet, apiFootball, ...leagueHtmls] = await Promise.all([
       safeFetch(`${BASE}/`),
       telegramPredictions(),
       getForebetTips(),
+      getApiFootballPredictions().catch(() => [] as ExtPrediction[]),
       ...LEAGUE_PAGES.map((l) => safeFetch(`${BASE}/footballpredictions/${l.slug}/`)),
     ]);
 
@@ -304,6 +306,28 @@ export async function getPredictions(): Promise<ExtPrediction[]> {
               analysis: ex.analysis ?? p.analysis,
               predCode: ex.predCode ?? p.predCode,
               probs: ex.probs ?? p.probs,
+            }
+          : p,
+      );
+    }
+    // API-Football (premium): enrich or add. It carries exact ISO kick-off
+    // times, so let it supply the kickoff when another source only had a date.
+    for (const p of apiFootball) {
+      const ex = byKey.get(keyOf(p));
+      const betterKickoff =
+        p.kickoff && p.kickoff.length > 10 && !(ex?.kickoff && ex.kickoff.length > 10);
+      byKey.set(
+        keyOf(p),
+        ex
+          ? {
+              ...ex,
+              tip: ex.tip ?? p.tip,
+              probability: ex.probability ?? p.probability,
+              analysis: ex.analysis ?? p.analysis,
+              predCode: ex.predCode ?? p.predCode,
+              probs: ex.probs ?? p.probs,
+              league: ex.league ?? p.league,
+              kickoff: betterKickoff ? p.kickoff : ex.kickoff,
             }
           : p,
       );

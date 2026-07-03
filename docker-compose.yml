@@ -72,6 +72,12 @@ services:
       # Local dev: owner sees full Premium experience. Production leaves this
       # unset so real customers get the Free tier + paywall.
       DEFAULT_TIER: premium
+      # API-Football (api-sports.io) premium feed — inherited from .env if set.
+      # Leave APIFOOTBALL_KEY empty and the adapter stays off (no cost, app runs).
+      APIFOOTBALL_KEY: ${APIFOOTBALL_KEY:-}
+      APIFOOTBALL_PROVIDER: ${APIFOOTBALL_PROVIDER:-apisports}
+      APIFOOTBALL_DAILY_BUDGET: ${APIFOOTBALL_DAILY_BUDGET:-80}
+      APIFOOTBALL_PREDS_PER_CYCLE: ${APIFOOTBALL_PREDS_PER_CYCLE:-6}
     depends_on:
       postgres:
         condition: service_healthy

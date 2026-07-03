@@ -258,7 +258,12 @@ async function renderDashboard(
 
   const predCard = (p: (typeof preds)[number]) => {
     const isTg = p.source.startsWith("@");
-    const brand = p.source === "forebet.com" ? "Forebet" : undefined;
+    const brand =
+      p.source === "forebet.com"
+        ? "Forebet"
+        : p.source === "api-football.com"
+          ? "API-Football ⭐"
+          : undefined;
     const time = koTime(p.kickoff);
     const kick = isTg
       ? p.kickoff

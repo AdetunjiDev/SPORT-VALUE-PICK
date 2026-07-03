@@ -13,4 +13,16 @@ export const config = {
   // Default tier when no premium cookie is present. Set to "premium" locally so
   // the owner isn't paywalled while developing; leave unset (→ free) in prod.
   defaultTier: process.env.DEFAULT_TIER === "premium" ? "premium" : "free",
+  // --- API-Football (api-sports.io) premium data feed ---
+  // Empty key ⇒ adapter is a no-op, so the app runs fine without paying. Add a
+  // key from your api-sports.io (or RapidAPI) dashboard to switch it on.
+  apiFootball: {
+    key: process.env.APIFOOTBALL_KEY ?? "",
+    // "apisports" (direct, header x-apisports-key) or "rapidapi" (header x-rapidapi-key).
+    provider: process.env.APIFOOTBALL_PROVIDER === "rapidapi" ? "rapidapi" : "apisports",
+    // Stay under the free-tier daily cap (100/day). Leave headroom for retries.
+    dailyBudget: Number(process.env.APIFOOTBALL_DAILY_BUDGET ?? 80),
+    // How many prediction lookups to spend per refresh (each is 1 request).
+    predsPerCycle: Number(process.env.APIFOOTBALL_PREDS_PER_CYCLE ?? 6),
+  },
 };
