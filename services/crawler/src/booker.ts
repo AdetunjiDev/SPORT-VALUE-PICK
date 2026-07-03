@@ -33,8 +33,9 @@ export async function createBookingCode(legs: BookableLeg[]): Promise<BookingRes
       marketId: l.marketId,
       specifier: l.specifier ?? "",
       outcomeId: l.outcomeId,
-    }));
-  if (selections.length < 2) return { error: "not enough bookable selections" };
+    }))
+    .slice(0, 50); // SportyBet slip cap
+  if (selections.length < 1) return { error: "no bookable selections" };
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.fetchTimeoutMs);

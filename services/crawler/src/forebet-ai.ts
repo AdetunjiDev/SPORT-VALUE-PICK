@@ -108,16 +108,19 @@ function teamsMatch(a: string, b: string): boolean {
 
 const round = (n: number, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
 
-/**
- * Match any set of predictions (with home/away + predCode) to live SportyBet
- * fixtures as bookable legs. Only future matches with an active 1X2 price for
- * the predicted outcome. Used by the AI engine AND the user slip-builder.
- */
-export async function legsForTips(tips: ExtPrediction[]): Promise<Leg[]> {
+interface TipMatch {
+  tip: ExtPrediction;
+  ev: SbEvent;
+  outcomeId: string;
+  odds: number;
+}
+
+/** Match predictions (home/away + predCode) to live SportyBet fixtures. */
+async function matchTips(tips: ExtPrediction[]): Promise<TipMatch[]> {
   const events = await sportyEvents();
   if (!tips.length || !events.length) return [];
   const now = Date.now();
-  const legs: Leg[] = [];
+  const out: TipMatch[] = [];
   const used = new Set<string>();
   for (const tip of tips) {
     if (!tip.home || !tip.away || !tip.predCode) continue;
@@ -133,12 +136,25 @@ export async function legsForTips(tips: ExtPrediction[]): Promise<Leg[]> {
     const odds = ev.outcomes[outcomeId];
     if (!odds) continue;
     used.add(ev.eventId);
+    out.push({ tip, ev, outcomeId, odds });
+  }
+  return out;
+}
+
+/**
+ * Predictions matched to SportyBet as bookable AI-engine legs. Only future
+ * matches with an active 1X2 price for the predicted outcome. Used by the AI
+ * engine AND the user slip-builder.
+ */
+export async function legsForTips(tips: ExtPrediction[]): Promise<Leg[]> {
+  const now = Date.now();
+  return (await matchTips(tips)).map(({ tip, ev, outcomeId, odds }) => {
     // Model probability: Forebet's own % when present, else implied from odds.
     const probIdx = tip.predCode === "1" ? 0 : tip.predCode === "X" ? 1 : 2;
     const fbProb = tip.probs?.[probIdx];
     const prob = Math.min(0.95, fbProb ? fbProb / 100 : 1 / odds + 0.02);
     const pick = tip.predCode === "1" ? "Home" : tip.predCode === "X" ? "Draw" : "Away";
-    legs.push({
+    return {
       eventId: ev.eventId,
       home: ev.home,
       away: ev.away,
@@ -153,9 +169,19 @@ export async function legsForTips(tips: ExtPrediction[]): Promise<Leg[]> {
       marketId: "1",
       specifier: "",
       outcomeId,
-    });
-  }
-  return legs;
+    };
+  });
+}
+
+/**
+ * Which of these predictions can ACTUALLY be booked on SportyBet right now.
+ * Returns the slip-builder keys (home|away lowercased) that matched — the
+ * dashboard only shows "Add to slip" on these, so the Generate button never
+ * fails on matches SportyBet doesn't offer.
+ */
+export async function bookableTipKeys(tips: ExtPrediction[]): Promise<Set<string>> {
+  const matches = await matchTips(tips);
+  return new Set(matches.map((m) => `${m.tip.home}|${m.tip.away}`.toLowerCase()));
 }
 
 /** Forebet's full daily tip list as bookable legs (for the AI engine). */

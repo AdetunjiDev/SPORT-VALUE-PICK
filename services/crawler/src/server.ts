@@ -4,7 +4,7 @@ import { RESPONSIBLE_GAMBLING_DISCLAIMER } from "@sportybet/shared";
 import { config } from "./config.js";
 import { runCycle, lastRunAt, nextRunAt, lastSummary, intervalSec } from "./scheduler.js";
 import { getPredictions } from "./predictions.js";
-import { legsForTips } from "./forebet-ai.js";
+import { legsForTips, bookableTipKeys } from "./forebet-ai.js";
 import { createBookingCode } from "./booker.js";
 import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
@@ -51,6 +51,17 @@ async function renderDashboard(
   dateStr = "",
 ): Promise<string> {
   const preds = mode === "pred" ? await getPredictions() : [];
+  // Which predictions can ACTUALLY be booked on SportyBet right now — only
+  // these get an "Add to slip" checkbox, so Generate never fails on matches
+  // SportyBet doesn't offer. Never let this check break the page.
+  let bookableKeys = new Set<string>();
+  if (mode === "pred" && preds.length) {
+    try {
+      bookableKeys = await bookableTipKeys(preds);
+    } catch {
+      /* no checkboxes this render */
+    }
+  }
   const isPremium = tier === "premium";
   const freshCut = Date.now() - config.freeDelayMin * 60_000;
 
@@ -285,9 +296,9 @@ async function renderDashboard(
       : `<div><b>${esc(kick)}</b><small>${isTg ? "Posted" : "Kick-off (WAT)"}</small></div>
          <div><b>${esc(p.league ?? (isTg ? "Analyst tip" : "—"))}</b><small>${isTg ? "Source" : "Competition"}</small></div>`;
     const badgeColor = isTg ? "orange" : isForebet ? "green" : "indigo";
-    // Bookable = we can map this tip to a live SportyBet 1X2 selection.
-    const bookable = !!(p.predCode && p.home && p.away);
-    const selKey = bookable ? `${p.home}|${p.away}`.toLowerCase() : "";
+    // Bookable = confirmed live on SportyBet with a 1X2 price (checked above).
+    const selKey = p.home && p.away ? `${p.home}|${p.away}`.toLowerCase() : "";
+    const bookable = !!selKey && bookableKeys.has(selKey);
     return `
     <div class="slip" data-f="${esc(`${p.home ?? ""} ${p.away ?? ""} ${p.title ?? ""} ${p.league ?? ""} ${p.tip ?? ""}`.toLowerCase())}">
       <div class="slip-head">
@@ -482,7 +493,7 @@ async function renderDashboard(
 
   const body =
     mode === "pred"
-      ? `<div class="pred-hint card">✨ <b>Build your own code:</b> tick <i>“➕ Add to slip”</i> on any predictions below (2+), then hit <b>Generate SportyBet Code</b> — you get a real booking code to copy, just like the human ones.</div>
+      ? `<div class="pred-hint card">✨ <b>Build your own code:</b> tick <i>“➕ Add to slip”</i> on any predictions below (pick 1 to 50), then hit <b>Generate SportyBet Code</b> — you get a real booking code to copy, just like the human ones. Only matches live on SportyBet show the checkbox.</div>
         ${predDateBar}
         ${dayGroupsHtml || analystHtml ? dayGroupsHtml + analystHtml : '<div class="card empty">No predictions available right now — the source may be updating. Check back shortly.</div>'}${slipBar}`
       : mode === "ai"
@@ -890,7 +901,8 @@ async function renderDashboard(
   }
   async function genCode(btn){
     var keys = Object.keys(SEL);
-    if(keys.length < 2){ showToast('Pick at least 2 matches first','warn'); return; }
+    if(keys.length < 1){ showToast('Pick at least 1 match first','warn'); return; }
+    if(keys.length > 50){ showToast('Maximum 50 matches per code — remove some','warn'); return; }
     btn.disabled = true; var o = btn.textContent; btn.textContent = '⚡ Booking on SportyBet…';
     try{
       var r = await fetch('/api/predictions/book',{method:'POST',
@@ -1201,19 +1213,19 @@ export function startServer() {
         } catch {
           return json(400, { error: "Bad request body." });
         }
-        if (keys.length < 2) return json(400, { error: "Select at least 2 matches." });
+        if (keys.length < 1) return json(400, { error: "Select at least 1 match." });
+        if (keys.length > 50) return json(400, { error: "Maximum 50 matches per booking code." });
         const preds = await getPredictions();
         const wanted = preds.filter(
           (p) =>
             p.home && p.away && p.predCode && keys.includes(`${p.home}|${p.away}`.toLowerCase()),
         );
-        if (wanted.length < 2)
+        if (!wanted.length)
           return json(422, { error: "Selected matches are no longer bookable — refresh and retry." });
         const legs = await legsForTips(wanted);
-        if (legs.length < 2)
+        if (!legs.length)
           return json(422, {
-            error:
-              "SportyBet doesn't currently offer enough of those matches (may have kicked off).",
+            error: "Those matches aren't on SportyBet right now (may have kicked off) — refresh and pick again.",
           });
         const booking = await createBookingCode(
           legs.map((l) => ({
