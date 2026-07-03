@@ -455,6 +455,14 @@ async function renderDashboard(
   .slipcode{display:inline-block;background:#141a2e;color:#7df0b8;font-family:ui-monospace,Consolas,monospace;
     font-size:16px;font-weight:800;letter-spacing:2px;padding:7px 14px;border-radius:9px;cursor:pointer}
   .slipcode:hover{filter:brightness(1.2)}
+  /* Drag-and-drop overlay */
+  #dropzone{position:fixed;inset:0;z-index:70;background:rgba(20,26,46,.55);display:grid;place-items:center;
+    opacity:0;pointer-events:none;transition:opacity .15s}
+  #dropzone.show{opacity:1}
+  .dz-inner{background:var(--card);border:3px dashed var(--primary);border-radius:20px;
+    padding:44px 64px;text-align:center;font-size:20px;font-weight:800;line-height:1.6;
+    box-shadow:0 20px 60px rgba(16,24,40,.35)}
+  .dz-inner small{font-size:13px;color:var(--muted);font-weight:500}
   /* OCR modal */
   #ocrmodal{position:fixed;inset:0;z-index:60;background:rgba(16,24,40,.45);display:grid;place-items:center;padding:20px}
   .ocr-box{background:var(--card);border-radius:16px;padding:20px 22px;max-width:520px;width:100%;
@@ -720,10 +728,17 @@ async function renderDashboard(
     }catch(e){ showToast('Booking failed — network error','warn'); }
     btn.disabled = false; btn.textContent = o;
   }
-  /* ---- Bet-slip image scanner (OCR) ---- */
+  /* ---- Bet-slip image scanner (OCR) ----
+     One shared path for the 📷 button, drag-and-drop anywhere, and Ctrl+V. */
   function ocrUp(inp){
-    var f = inp.files && inp.files[0]; if(!f) return;
-    if(f.size > 7*1024*1024){ showToast('Image too large — max 7MB','warn'); inp.value=''; return; }
+    var f = inp.files && inp.files[0];
+    if(f) ocrFile(f);
+    inp.value = '';
+  }
+  function ocrFile(f){
+    if(!f) return;
+    if(f.type && f.type.indexOf('image') !== 0){ showToast('That file is not an image — drop a screenshot of a bet slip','warn'); return; }
+    if(f.size > 7*1024*1024){ showToast('Image too large — max 7MB','warn'); return; }
     showToast('🔍 Reading your slip image… takes ~10s');
     var rd = new FileReader();
     rd.onload = async function(){
@@ -733,10 +748,48 @@ async function renderDashboard(
         var j = await r.json();
         if(j.error){ showToast(j.error,'warn'); } else { showOcr(j); }
       }catch(e){ showToast('Could not read the image — try a sharper screenshot','warn'); }
-      inp.value='';
     };
     rd.readAsDataURL(f);
   }
+  /* Drag a screenshot anywhere onto the page → overlay appears → drop = scan.
+     Ctrl+V with a screenshot in the clipboard scans too. */
+  (function(){
+    var ov = null, hideTimer = null;
+    function overlay(){
+      if(!ov){
+        ov = document.createElement('div');
+        ov.id = 'dropzone';
+        ov.innerHTML = '<div class="dz-inner">📷<br/>Drop your bet-slip image<br/><small>we will read the booking code out of it automatically</small></div>';
+        document.body.appendChild(ov);
+      }
+      return ov;
+    }
+    document.addEventListener('dragover', function(e){
+      var types = (e.dataTransfer && e.dataTransfer.types) || [];
+      var hasFile = false;
+      for(var i=0;i<types.length;i++){ if(types[i]==='Files'){ hasFile=true; break; } }
+      if(!hasFile) return;
+      e.preventDefault();
+      overlay().classList.add('show');
+      clearTimeout(hideTimer);
+      hideTimer = setTimeout(function(){ overlay().classList.remove('show'); }, 300);
+    });
+    document.addEventListener('drop', function(e){
+      e.preventDefault();
+      overlay().classList.remove('show');
+      var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if(f) ocrFile(f);
+    });
+    document.addEventListener('paste', function(e){
+      var items = (e.clipboardData && e.clipboardData.items) || [];
+      for(var i=0;i<items.length;i++){
+        if(items[i].type && items[i].type.indexOf('image') === 0){
+          var f = items[i].getAsFile();
+          if(f){ e.preventDefault(); ocrFile(f); break; }
+        }
+      }
+    });
+  })();
   function showOcr(j){
     var codes = (j && j.codes) || [];
     var rows = codes.length
