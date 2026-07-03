@@ -234,7 +234,8 @@ async function renderDashboard(
   const watDayOf = (iso?: string) =>
     iso ? new Date(iso).toLocaleDateString("en-CA", { timeZone: "Africa/Lagos" }) : "";
   const koTime = (iso?: string) =>
-    iso
+    // Date-only kickoffs (PredictZ/WinDrawWin give no time) get no time chip.
+    iso && iso.length > 10
       ? new Date(iso).toLocaleTimeString("en-GB", {
           hour: "2-digit",
           minute: "2-digit",
@@ -257,7 +258,7 @@ async function renderDashboard(
 
   const predCard = (p: (typeof preds)[number]) => {
     const isTg = p.source.startsWith("@");
-    const isForebet = p.source === "forebet.com";
+    const brand = p.source === "forebet.com" ? "Forebet" : undefined;
     const time = koTime(p.kickoff);
     const kick = isTg
       ? p.kickoff
@@ -274,7 +275,7 @@ async function renderDashboard(
       p.home && p.away
         ? `${esc(p.home)} <span class="muted">v</span> ${esc(p.away)}`
         : esc(p.title ?? "Prediction");
-    const badge = isTg ? p.source : isForebet ? "Forebet" : (p.league ?? "Football");
+    const badge = isTg ? p.source : (brand ?? p.league ?? "Football");
     const hasTip = !!p.tip;
     const hasOdds = !!p.odds;
     const linkLabel = isTg ? "View on Telegram ↗" : "Full analysis ↗";
@@ -284,7 +285,7 @@ async function renderDashboard(
          <div><b>${esc(kick)}</b><small>${isTg ? "Posted" : "Kick-off (WAT)"}</small></div>`
       : `<div><b>${esc(kick)}</b><small>${isTg ? "Posted" : "Kick-off (WAT)"}</small></div>
          <div><b>${esc(p.league ?? (isTg ? "Analyst tip" : "—"))}</b><small>${isTg ? "Source" : "Competition"}</small></div>`;
-    const badgeColor = isTg ? "orange" : isForebet ? "green" : "indigo";
+    const badgeColor = isTg ? "orange" : brand ? "green" : "indigo";
     // Every fixture card joins the slip builder; unmatched picks are skipped
     // at booking time and reported in the toast.
     const selKey = p.home && p.away ? `${p.home}|${p.away}`.toLowerCase() : "";
@@ -828,7 +829,7 @@ async function renderDashboard(
       ${body}
       <div class="disclaimer">⚠️ ${esc(RESPONSIBLE_GAMBLING_DISCLAIMER)} ${
         mode === "pred"
-          ? "Predictions from footballpredictions.com, forebet.com + Telegram analysts (@betmines, @eaglepredict) — third-party tips, not affiliated with SportyBet."
+          ? "Predictions from footballpredictions.com, forebet.com + Telegram analysts (@betmines, @eaglepredict) — third-party tips, not affiliated with SportyBet. No prediction is ever guaranteed."
           : mode === "ai"
             ? "AI slips are model estimates — booking codes save selections only; review & stake yourself."
             : "Codes verified against SportyBet's official API."
