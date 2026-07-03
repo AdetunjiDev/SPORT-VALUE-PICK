@@ -13,7 +13,23 @@ import { config } from "./config.js";
  */
 
 const EVENTS_API =
-  "https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents?sportId=sr%3Asport%3A1&marketId=1&pageSize=100&option=1&pageNum=";
+  "https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents?sportId=sr%3Asport%3A1&marketId=1%2C18&pageSize=100&option=1&pageNum=";
+
+/** How each pick code books on SportyBet (market/specifier/outcome + label). */
+const PICKS: Record<
+  string,
+  { marketId: string; specifier: string; outcomeId: string; label: string; market: string }
+> = {
+  "1": { marketId: "1", specifier: "", outcomeId: "1", label: "Home", market: "1X2" },
+  X: { marketId: "1", specifier: "", outcomeId: "2", label: "Draw", market: "1X2" },
+  "2": { marketId: "1", specifier: "", outcomeId: "3", label: "Away", market: "1X2" },
+  O15: { marketId: "18", specifier: "total=1.5", outcomeId: "12", label: "Over 1.5", market: "Over/Under" },
+  O25: { marketId: "18", specifier: "total=2.5", outcomeId: "12", label: "Over 2.5", market: "Over/Under" },
+  O35: { marketId: "18", specifier: "total=3.5", outcomeId: "12", label: "Over 3.5", market: "Over/Under" },
+  U15: { marketId: "18", specifier: "total=1.5", outcomeId: "13", label: "Under 1.5", market: "Over/Under" },
+  U25: { marketId: "18", specifier: "total=2.5", outcomeId: "13", label: "Under 2.5", market: "Over/Under" },
+  U35: { marketId: "18", specifier: "total=3.5", outcomeId: "13", label: "Under 3.5", market: "Over/Under" },
+};
 
 interface SbEvent {
   eventId: string;
@@ -21,7 +37,7 @@ interface SbEvent {
   away: string;
   league?: string;
   kickoff: number;
-  // 1X2 outcomes keyed by outcome id: "1"=home, "2"=draw, "3"=away
+  // Live odds keyed by pick code ("1"/"X"/"2"/"O25"/…)
   outcomes: Record<string, number>;
 }
 
@@ -57,13 +73,18 @@ async function sportyEvents(): Promise<SbEvent[]> {
       let added = 0;
       for (const t of tours) {
         for (const e of t.events ?? []) {
-          const m = (e.markets ?? []).find((mk: any) => String(mk.id) === "1");
-          if (!m || !e.eventId || !e.homeTeamName || !e.awayTeamName) continue;
+          if (!e.eventId || !e.homeTeamName || !e.awayTeamName) continue;
           const outcomes: Record<string, number> = {};
-          for (const o of m.outcomes ?? []) {
-            const odds = Number(o.odds);
-            if (odds > 1) outcomes[String(o.id)] = odds;
+          for (const m of e.markets ?? []) {
+            for (const [code, meta] of Object.entries(PICKS)) {
+              if (String(m.id) !== meta.marketId) continue;
+              if (meta.specifier && (m.specifier ?? "") !== meta.specifier) continue;
+              const o = (m.outcomes ?? []).find((x: any) => String(x.id) === meta.outcomeId);
+              const odds = o ? Number(o.odds) : NaN;
+              if (Number.isFinite(odds) && odds > 1) outcomes[code] = odds;
+            }
           }
+          if (!Object.keys(outcomes).length) continue;
           out.push({
             eventId: String(e.eventId),
             home: String(e.homeTeamName),
@@ -111,7 +132,7 @@ const round = (n: number, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
 interface TipMatch {
   tip: ExtPrediction;
   ev: SbEvent;
-  outcomeId: string;
+  code: string; // pick code into PICKS
   odds: number;
 }
 
@@ -132,11 +153,10 @@ async function matchTips(tips: ExtPrediction[]): Promise<TipMatch[]> {
         teamsMatch(e.away, tip.away!),
     );
     if (!ev) continue;
-    const outcomeId = tip.predCode === "1" ? "1" : tip.predCode === "X" ? "2" : "3";
-    const odds = ev.outcomes[outcomeId];
-    if (!odds) continue;
+    const odds = ev.outcomes[tip.predCode];
+    if (!odds || !PICKS[tip.predCode]) continue;
     used.add(ev.eventId);
-    out.push({ tip, ev, outcomeId, odds });
+    out.push({ tip, ev, code: tip.predCode, odds });
   }
   return out;
 }
@@ -148,27 +168,33 @@ async function matchTips(tips: ExtPrediction[]): Promise<TipMatch[]> {
  */
 export async function legsForTips(tips: ExtPrediction[]): Promise<Leg[]> {
   const now = Date.now();
-  return (await matchTips(tips)).map(({ tip, ev, outcomeId, odds }) => {
-    // Model probability: Forebet's own % when present, else implied from odds.
-    const probIdx = tip.predCode === "1" ? 0 : tip.predCode === "X" ? 1 : 2;
-    const fbProb = tip.probs?.[probIdx];
+  return (await matchTips(tips)).map(({ tip, ev, code, odds }) => {
+    const meta = PICKS[code];
+    // Model probability: Forebet's own 1X2 % when present, else implied odds.
+    const fbProb =
+      code === "1"
+        ? tip.probs?.[0]
+        : code === "X"
+          ? tip.probs?.[1]
+          : code === "2"
+            ? tip.probs?.[2]
+            : undefined;
     const prob = Math.min(0.95, fbProb ? fbProb / 100 : 1 / odds + 0.02);
-    const pick = tip.predCode === "1" ? "Home" : tip.predCode === "X" ? "Draw" : "Away";
     return {
       eventId: ev.eventId,
       home: ev.home,
       away: ev.away,
       league: ev.league ?? tip.league,
       kickoff: ev.kickoff,
-      market: "1X2",
-      pick,
+      market: meta.market,
+      pick: meta.label,
       odds: round(odds, 2),
       prob: round(prob),
       consensus: 1,
       foundAt: now,
-      marketId: "1",
-      specifier: "",
-      outcomeId,
+      marketId: meta.marketId,
+      specifier: meta.specifier,
+      outcomeId: meta.outcomeId,
     };
   });
 }

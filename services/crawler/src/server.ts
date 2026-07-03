@@ -4,7 +4,7 @@ import { RESPONSIBLE_GAMBLING_DISCLAIMER } from "@sportybet/shared";
 import { config } from "./config.js";
 import { runCycle, lastRunAt, nextRunAt, lastSummary, intervalSec } from "./scheduler.js";
 import { getPredictions } from "./predictions.js";
-import { legsForTips, bookableTipKeys } from "./forebet-ai.js";
+import { legsForTips } from "./forebet-ai.js";
 import { createBookingCode } from "./booker.js";
 import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
@@ -51,17 +51,6 @@ async function renderDashboard(
   dateStr = "",
 ): Promise<string> {
   const preds = mode === "pred" ? await getPredictions() : [];
-  // Which predictions can ACTUALLY be booked on SportyBet right now — only
-  // these get an "Add to slip" checkbox, so Generate never fails on matches
-  // SportyBet doesn't offer. Never let this check break the page.
-  let bookableKeys = new Set<string>();
-  if (mode === "pred" && preds.length) {
-    try {
-      bookableKeys = await bookableTipKeys(preds);
-    } catch {
-      /* no checkboxes this render */
-    }
-  }
   const isPremium = tier === "premium";
   const freshCut = Date.now() - config.freeDelayMin * 60_000;
 
@@ -296,9 +285,10 @@ async function renderDashboard(
       : `<div><b>${esc(kick)}</b><small>${isTg ? "Posted" : "Kick-off (WAT)"}</small></div>
          <div><b>${esc(p.league ?? (isTg ? "Analyst tip" : "—"))}</b><small>${isTg ? "Source" : "Competition"}</small></div>`;
     const badgeColor = isTg ? "orange" : isForebet ? "green" : "indigo";
-    // Bookable = confirmed live on SportyBet with a 1X2 price (checked above).
+    // Every fixture card joins the slip builder; unmatched picks are skipped
+    // at booking time and reported in the toast.
     const selKey = p.home && p.away ? `${p.home}|${p.away}`.toLowerCase() : "";
-    const bookable = !!selKey && bookableKeys.has(selKey);
+    const bookable = !!selKey;
     return `
     <div class="slip" data-f="${esc(`${p.home ?? ""} ${p.away ?? ""} ${p.title ?? ""} ${p.league ?? ""} ${p.tip ?? ""}`.toLowerCase())}">
       <div class="slip-head">
@@ -493,7 +483,7 @@ async function renderDashboard(
 
   const body =
     mode === "pred"
-      ? `<div class="pred-hint card">✨ <b>Build your own code:</b> tick <i>“➕ Add to slip”</i> on any predictions below (pick 1 to 50), then hit <b>Generate SportyBet Code</b> — you get a real booking code to copy, just like the human ones. Only matches live on SportyBet show the checkbox.</div>
+      ? `<div class="pred-hint card">✨ <b>Build your own code:</b> tick <i>“➕ Add to slip”</i> on any predictions below (pick 1 to 50), then hit <b>Generate SportyBet Code</b> — you get a real booking code to copy, just like the human ones. Matches SportyBet doesn't offer are skipped automatically.</div>
         ${predDateBar}
         ${dayGroupsHtml || analystHtml ? dayGroupsHtml + analystHtml : '<div class="card empty">No predictions available right now — the source may be updating. Check back shortly.</div>'}${slipBar}`
       : mode === "ai"
@@ -1217,15 +1207,14 @@ export function startServer() {
         if (keys.length > 50) return json(400, { error: "Maximum 50 matches per booking code." });
         const preds = await getPredictions();
         const wanted = preds.filter(
-          (p) =>
-            p.home && p.away && p.predCode && keys.includes(`${p.home}|${p.away}`.toLowerCase()),
+          (p) => p.home && p.away && keys.includes(`${p.home}|${p.away}`.toLowerCase()),
         );
         if (!wanted.length)
           return json(422, { error: "Selected matches are no longer bookable — refresh and retry." });
         const legs = await legsForTips(wanted);
         if (!legs.length)
           return json(422, {
-            error: "Those matches aren't on SportyBet right now (may have kicked off) — refresh and pick again.",
+            error: "None of those matches are on SportyBet right now (kicked off, or not offered) — try other matches.",
           });
         const booking = await createBookingCode(
           legs.map((l) => ({
@@ -1242,7 +1231,7 @@ export function startServer() {
           code: booking.code,
           url: booking.url,
           games: booking.games ?? legs.length,
-          requested: wanted.length,
+          requested: keys.length,
           matched: legs.length,
           totalOdds,
         });

@@ -22,9 +22,29 @@ export interface ExtPrediction {
   probability?: string;
   analysis?: string; // free-form written analysis
   url?: string;
-  // Structured Forebet fields — used by the AI engine to book real slips.
-  predCode?: "1" | "X" | "2";
+  // Structured pick — used to book real SportyBet slips. 1/X/2 = match result;
+  // O/U codes = Over/Under goals lines (e.g. O25 = Over 2.5).
+  predCode?: "1" | "X" | "2" | "O15" | "O25" | "O35" | "U15" | "U25" | "U35";
   probs?: [number, number, number]; // home / draw / away %
+}
+
+/**
+ * Derive a bookable pick from free-text tips ("Chelsea to Win", "Draw",
+ * "Over 2.5 Goals") so every prediction card can join the slip builder —
+ * not just Forebet's structured 1X2 rows.
+ */
+export function derivePredCode(p: ExtPrediction): ExtPrediction["predCode"] {
+  if (p.predCode) return p.predCode;
+  const tip = (p.tip ?? "").toLowerCase();
+  if (!tip) return undefined;
+  const ou = tip.match(/\b(over|under)\s*([123])[.,]5\b/);
+  if (ou) return `${ou[1] === "over" ? "O" : "U"}${ou[2]}5` as ExtPrediction["predCode"];
+  if (/\bdraw\b/.test(tip)) return "X";
+  if (p.home && tip.includes(p.home.toLowerCase())) return "1";
+  if (p.away && tip.includes(p.away.toLowerCase())) return "2";
+  if (/\bhome\s*(team\s*)?(to\s*)?win\b/.test(tip)) return "1";
+  if (/\baway\s*(team\s*)?(to\s*)?win\b/.test(tip)) return "2";
+  return undefined;
 }
 
 const BASE = "https://footballpredictions.com";
@@ -291,6 +311,8 @@ export async function getPredictions(): Promise<ExtPrediction[]> {
     for (const p of tg) if (!byKey.has(keyOf(p))) byKey.set(keyOf(p), p);
 
     const list = [...byKey.values()];
+    // Fill in bookable picks derived from tip text where possible.
+    for (const p of list) p.predCode = derivePredCode(p);
     // Structured tips (with odds) first, then everything by soonest/most-recent.
     const t = (p: ExtPrediction) => (p.kickoff ? new Date(p.kickoff).getTime() : 0);
     const data = list
