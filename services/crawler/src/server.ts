@@ -227,55 +227,189 @@ async function renderDashboard(
     })
     .join("");
 
-  // ---- Prediction cards (footballpredictions.com tips + Telegram analysis) ----
-  const predCards = preds
-    .map((p) => {
-      const kick = p.kickoff
-        ? new Date(p.kickoff).toLocaleString([], {
+  // ---- Predictions, organised as a MATCH CALENDAR ----
+  // Fixture predictions are grouped by their WAT kick-off day (Today, Tomorrow,
+  // later) and sorted by kick-off time inside each day. Telegram analyst posts
+  // (post time, not kick-off) live in their own rail at the end.
+  const watDayOf = (iso?: string) =>
+    iso ? new Date(iso).toLocaleDateString("en-CA", { timeZone: "Africa/Lagos" }) : "";
+  const koTime = (iso?: string) =>
+    iso
+      ? new Date(iso).toLocaleTimeString("en-GB", {
+          hour: "2-digit",
+          minute: "2-digit",
+          timeZone: "Africa/Lagos",
+        })
+      : "";
+  const tomorrowStr = new Date(Date.now() + 86_400_000).toLocaleDateString("en-CA", {
+    timeZone: "Africa/Lagos",
+  });
+  const dayTitle = (d: string) =>
+    d === todayStr
+      ? "Today"
+      : d === tomorrowStr
+        ? "Tomorrow"
+        : new Date(`${d}T12:00:00`).toLocaleDateString("en", {
+            weekday: "long",
+            month: "short",
+            day: "numeric",
+          });
+
+  const predCard = (p: (typeof preds)[number]) => {
+    const isTg = p.source.startsWith("@");
+    const isForebet = p.source === "forebet.com";
+    const time = koTime(p.kickoff);
+    const kick = isTg
+      ? p.kickoff
+        ? new Date(p.kickoff).toLocaleString("en", {
             month: "short",
             day: "numeric",
             hour: "2-digit",
             minute: "2-digit",
+            timeZone: "Africa/Lagos",
           })
-        : "—";
-      const isTg = p.source.startsWith("@");
-      const isForebet = p.source === "forebet.com";
-      const matchup =
-        p.home && p.away
-          ? `${esc(p.home)} <span class="muted">v</span> ${esc(p.away)}`
-          : esc(p.title ?? "Prediction");
-      const badge = isTg ? p.source : isForebet ? "Forebet" : (p.league ?? "Football");
-      const hasTip = !!p.tip;
-      const hasOdds = !!p.odds;
-      const linkLabel = isTg ? "View on Telegram ↗" : "Full analysis ↗";
-      const metrics = hasOdds
-        ? `<div><b>${esc(p.odds)}</b><small>Odds</small></div>
-           <div><b>${esc(p.probability ?? "—")}</b><small>Probability</small></div>
-           <div><b>${esc(kick)}</b><small>Kick-off</small></div>`
-        : `<div><b>${esc(kick)}</b><small>${isTg ? "Posted" : "Kick-off"}</small></div>
-           <div><b>${esc(p.league ?? (isTg ? "Analyst tip" : "—"))}</b><small>${isTg ? "Source" : "Competition"}</small></div>`;
-      const badgeColor = isTg ? "orange" : isForebet ? "green" : "indigo";
-      // Bookable = we can map this tip to a live SportyBet 1X2 selection.
-      const bookable = !!(p.predCode && p.home && p.away);
-      const selKey = bookable ? `${p.home}|${p.away}`.toLowerCase() : "";
+        : "—"
+      : time || "—";
+    const matchup =
+      p.home && p.away
+        ? `${esc(p.home)} <span class="muted">v</span> ${esc(p.away)}`
+        : esc(p.title ?? "Prediction");
+    const badge = isTg ? p.source : isForebet ? "Forebet" : (p.league ?? "Football");
+    const hasTip = !!p.tip;
+    const hasOdds = !!p.odds;
+    const linkLabel = isTg ? "View on Telegram ↗" : "Full analysis ↗";
+    const metrics = hasOdds
+      ? `<div><b>${esc(p.odds)}</b><small>Odds</small></div>
+         <div><b>${esc(p.probability ?? "—")}</b><small>Probability</small></div>
+         <div><b>${esc(kick)}</b><small>${isTg ? "Posted" : "Kick-off (WAT)"}</small></div>`
+      : `<div><b>${esc(kick)}</b><small>${isTg ? "Posted" : "Kick-off (WAT)"}</small></div>
+         <div><b>${esc(p.league ?? (isTg ? "Analyst tip" : "—"))}</b><small>${isTg ? "Source" : "Competition"}</small></div>`;
+    const badgeColor = isTg ? "orange" : isForebet ? "green" : "indigo";
+    // Bookable = we can map this tip to a live SportyBet 1X2 selection.
+    const bookable = !!(p.predCode && p.home && p.away);
+    const selKey = bookable ? `${p.home}|${p.away}`.toLowerCase() : "";
+    return `
+    <div class="slip" data-f="${esc(`${p.home ?? ""} ${p.away ?? ""} ${p.title ?? ""} ${p.league ?? ""} ${p.tip ?? ""}`.toLowerCase())}">
+      <div class="slip-head">
+        <span class="tag ${badgeColor}">${esc(badge)}</span>
+        <b class="slip-title">${matchup}</b>
+        ${time && !isTg ? `<span class="ko-chip" title="Kick-off, West Africa Time">⏰ ${time}</span>` : ""}
+      </div>
+      ${
+        hasTip
+          ? `<div class="pred-tip">🎯 ${esc(p.tip ?? "—")}</div>
+      <div class="metrics">${metrics}</div>`
+          : `<div class="pred-preview">${esc(p.analysis ?? "Prediction preview")}…</div>
+      <div class="metrics">${metrics}</div>`
+      }
+      <div class="slip-foot">
+        ${p.url ? `<a class="btn ghost sm" href="${esc(p.url)}" target="_blank" rel="noopener">${linkLabel}</a>` : "<span></span>"}
+        ${bookable ? `<label class="selbox" title="Add this match to your slip"><input type="checkbox" data-key="${esc(selKey)}" onchange="selTog(this)"/><span>➕ Add to slip</span></label>` : ""}
+      </div>
+    </div>`;
+  };
+
+  // Group fixtures by WAT day; analyst posts go to their own rail.
+  const dayGroups = new Map<string, typeof preds>();
+  const analystPosts: typeof preds = [];
+  for (const p of preds) {
+    const d = watDayOf(p.kickoff);
+    if (!d || p.source.startsWith("@")) {
+      analystPosts.push(p);
+      continue;
+    }
+    if (!dayGroups.has(d)) dayGroups.set(d, []);
+    dayGroups.get(d)!.push(p);
+  }
+  const sortedDays = [...dayGroups.keys()].sort();
+  for (const d of sortedDays) {
+    dayGroups
+      .get(d)!
+      .sort(
+        (a, b) =>
+          new Date(a.kickoff ?? 0).getTime() - new Date(b.kickoff ?? 0).getTime(),
+      );
+  }
+
+  const dgHeader = (d: string, n: number) => {
+    const dt = new Date(`${d}T12:00:00`);
+    const dow = dt.toLocaleDateString("en", { weekday: "short" }).toUpperCase();
+    const mon = dt.toLocaleDateString("en", { month: "short" });
+    return `
+    <header class="dg-head">
+      <div class="dg-cal${d === todayStr ? " today" : ""}">
+        <span class="dg-dow">${d === todayStr ? "TODAY" : dow}</span>
+        <span class="dg-num">${d.slice(8, 10)}</span>
+        <span class="dg-mon">${mon}</span>
+      </div>
+      <div class="dg-title">
+        <b>${dayTitle(d)}</b>
+        <span>${dt.toLocaleDateString("en", { weekday: "long", day: "numeric", month: "long", year: "numeric" })} · kick-off times in WAT</span>
+      </div>
+      <span class="dg-count">${n} match${n === 1 ? "" : "es"}</span>
+    </header>`;
+  };
+
+  const dayGroupsHtml = sortedDays
+    .map((d) => {
+      const grp = dayGroups.get(d)!;
       return `
-      <div class="slip" data-f="${esc(`${p.home ?? ""} ${p.away ?? ""} ${p.title ?? ""} ${p.league ?? ""} ${p.tip ?? ""}`.toLowerCase())}">
-        <div class="slip-head">
-          <span class="tag ${badgeColor}">${esc(badge)}</span>
-          <b class="slip-title">${matchup}</b>
-          ${bookable ? `<label class="selbox" title="Add this match to your slip"><input type="checkbox" data-key="${esc(selKey)}" onchange="selTog(this)"/><span>➕ Add to slip</span></label>` : ""}
-        </div>
-        ${
-          hasTip
-            ? `<div class="pred-tip">🎯 ${esc(p.tip ?? "—")}</div>
-        <div class="metrics">${metrics}</div>`
-            : `<div class="pred-preview">${esc(p.analysis ?? "Prediction preview")}…</div>
-        <div class="metrics">${metrics}</div>`
-        }
-        ${p.url ? `<a class="btn ghost sm" href="${esc(p.url)}" target="_blank" rel="noopener">${linkLabel}</a>` : ""}
-      </div>`;
+      <section class="day-group" data-day="${d}">
+        ${dgHeader(d, grp.length)}
+        <div class="cards">${grp.map(predCard).join("")}</div>
+      </section>`;
     })
     .join("");
+
+  const analystHtml = analystPosts.length
+    ? `
+    <section class="day-group" data-day="analysis">
+      <header class="dg-head">
+        <div class="dg-cal analyst"><span class="dg-dow">LIVE</span><span class="dg-num">📣</span><span class="dg-mon">feed</span></div>
+        <div class="dg-title"><b>Analyst posts</b><span>Latest written analysis from Telegram prediction channels</span></div>
+        <span class="dg-count">${analystPosts.length} post${analystPosts.length === 1 ? "" : "s"}</span>
+      </header>
+      <div class="cards">${analystPosts.map(predCard).join("")}</div>
+    </section>`
+    : "";
+
+  // Calendar strip: jump/filter between match days.
+  const pdChip = (d: string, top: string, mid: string, mon: string, n: number, on = false) => `
+    <button class="pd-chip${on ? " on" : ""}" data-day="${d}" onclick="predDay('${d}',this)">
+      <span class="pdc-top">${top}</span>
+      <span class="pdc-day">${mid}</span>
+      <span class="pdc-mon">${mon}</span>
+      <span class="pdc-count">${n}</span>
+    </button>`;
+  const predDateBar =
+    sortedDays.length || analystPosts.length
+      ? `
+    <div class="card pred-datebar">
+      <div class="date-nav-head">📅 Match calendar — browse predictions by day</div>
+      <div class="date-strip">
+        ${pdChip("all", "ALL", "∑", "days", preds.length, true)}
+        ${sortedDays
+          .map((d) => {
+            const dt = new Date(`${d}T12:00:00`);
+            const top =
+              d === todayStr
+                ? "TODAY"
+                : d === tomorrowStr
+                  ? "TMRW"
+                  : dt.toLocaleDateString("en", { weekday: "short" }).toUpperCase();
+            return pdChip(
+              d,
+              top,
+              d.slice(8, 10),
+              dt.toLocaleDateString("en", { month: "short" }),
+              dayGroups.get(d)!.length,
+            );
+          })
+          .join("")}
+        ${analystPosts.length ? pdChip("analysis", "LIVE", "📣", "analysts", analystPosts.length) : ""}
+      </div>
+    </div>`
+      : "";
 
   const nav = (m: Mode, icon: string, label: string, active: boolean) =>
     `<a class="nav-item${active ? " on" : ""}" href="/?mode=${m}"><span class="ni">${icon}</span>${label}</a>`;
@@ -349,7 +483,8 @@ async function renderDashboard(
   const body =
     mode === "pred"
       ? `<div class="pred-hint card">✨ <b>Build your own code:</b> tick <i>“➕ Add to slip”</i> on any predictions below (2+), then hit <b>Generate SportyBet Code</b> — you get a real booking code to copy, just like the human ones.</div>
-        <div class="cards">${predCards || '<div class="card empty">No predictions available right now — the source may be updating. Check back shortly.</div>'}</div>${slipBar}`
+        ${predDateBar}
+        ${dayGroupsHtml || analystHtml ? dayGroupsHtml + analystHtml : '<div class="card empty">No predictions available right now — the source may be updating. Check back shortly.</div>'}${slipBar}`
       : mode === "ai"
         ? `<div class="cards">${aiCards || '<div class="card empty">No AI slips right now — not enough upcoming matches (common late at night). Fresh slips generate automatically as new fixtures and codes come in.</div>'}</div>`
         : `<div class="split">
@@ -440,6 +575,42 @@ async function renderDashboard(
   .btn.sm{padding:6px 12px;font-size:12px}
   .btn.gold{background:linear-gradient(135deg,#e0a531,#f6c453);color:#3a2a06;box-shadow:0 6px 16px rgba(224,165,49,.3)}
   .btn:disabled{opacity:.7;cursor:default}
+  /* Prediction match calendar */
+  .pred-datebar{padding:16px 18px 8px;margin-bottom:18px}
+  .pd-chip{position:relative;flex:0 0 auto;width:68px;display:flex;flex-direction:column;
+    align-items:center;gap:1px;padding:10px 6px 8px;border-radius:14px;border:1px solid var(--line);
+    background:#fff;cursor:pointer;font-family:inherit;transition:transform .12s, box-shadow .12s}
+  .pd-chip:hover{transform:translateY(-2px);box-shadow:0 8px 18px rgba(16,24,40,.09);border-color:#cfd6e6}
+  .pdc-top{font-size:10px;font-weight:800;color:var(--muted);letter-spacing:.5px}
+  .pdc-day{font-size:23px;font-weight:800;line-height:1.05;color:var(--ink)}
+  .pdc-mon{font-size:10px;color:var(--muted);font-weight:600}
+  .pdc-count{margin-top:4px;font-size:10px;font-weight:800;background:#eef1f8;color:#59617a;
+    padding:1px 8px;border-radius:999px}
+  .pd-chip.on{background:linear-gradient(150deg,var(--indigo),#7b6ce8);border-color:transparent;
+    box-shadow:0 8px 20px rgba(91,75,214,.3)}
+  .pd-chip.on .pdc-top,.pd-chip.on .pdc-mon{color:rgba(255,255,255,.9)}
+  .pd-chip.on .pdc-day{color:#fff}
+  .pd-chip.on .pdc-count{background:rgba(255,255,255,.28);color:#fff}
+  /* Day groups */
+  .day-group{margin-bottom:26px}
+  .dg-head{display:flex;align-items:center;gap:14px;margin-bottom:14px;background:var(--card);
+    border:1px solid var(--line);border-radius:14px;padding:12px 16px;box-shadow:var(--shadow)}
+  .dg-cal{width:58px;flex-shrink:0;display:flex;flex-direction:column;align-items:center;
+    background:#f4f6fb;border:1px solid var(--line);border-radius:12px;padding:7px 4px}
+  .dg-cal.today{background:linear-gradient(150deg,var(--primary),#f7864f);border-color:transparent}
+  .dg-cal.today .dg-dow,.dg-cal.today .dg-num,.dg-cal.today .dg-mon{color:#fff}
+  .dg-cal.analyst{background:linear-gradient(150deg,#e0a531,#f6c453);border-color:transparent}
+  .dg-dow{font-size:9px;font-weight:800;color:var(--muted);letter-spacing:.6px}
+  .dg-num{font-size:21px;font-weight:800;line-height:1.1}
+  .dg-mon{font-size:10px;color:var(--muted);font-weight:600}
+  .dg-title b{display:block;font-size:16px}
+  .dg-title span{font-size:12px;color:var(--muted)}
+  .dg-count{margin-left:auto;font-size:12px;font-weight:800;background:#eeecfb;color:var(--indigo);
+    padding:5px 12px;border-radius:999px;white-space:nowrap}
+  .ko-chip{margin-left:auto;flex-shrink:0;font-size:12px;font-weight:800;color:var(--indigo);
+    background:#eeecfb;padding:4px 10px;border-radius:999px;white-space:nowrap}
+  .slip-head .ko-chip + .selbox, .slip-head .selbox{margin-left:10px}
+  .slip-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:2px}
   /* Prediction slip builder */
   .pred-hint{padding:14px 18px;margin-bottom:16px;font-size:13px;background:linear-gradient(120deg,#eafaf1,#eeecfb);border:1px solid #d5eee0}
   .selbox{margin-left:auto;display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;
@@ -686,6 +857,15 @@ async function renderDashboard(
     showToast('Scanning 15 sources… results in ~20s');
     fetch('/scan',{method:'POST'}).catch(function(){});
     setTimeout(function(){ btn.disabled=false; btn.textContent=o; }, 4000);
+  }
+  /* ---- Prediction match calendar: filter day groups ---- */
+  function predDay(d, el){
+    document.querySelectorAll('.pd-chip').forEach(function(c){ c.classList.remove('on'); });
+    if(el) el.classList.add('on');
+    document.querySelectorAll('.day-group').forEach(function(g){
+      g.style.display = (d === 'all' || g.getAttribute('data-day') === d) ? '' : 'none';
+    });
+    window.scrollTo({top: 0, behavior: 'smooth'});
   }
   /* ---- Prediction slip builder ---- */
   var SEL = {};
