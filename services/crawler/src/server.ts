@@ -710,7 +710,7 @@ async function renderDashboard(
       var j = await r.json();
       if(j.code){
         document.getElementById('slipres').innerHTML =
-          '<span class="slipcode ccopy" title="Click to copy" onclick="cp(this,\''+j.code+'\')">'+j.code+'</span>'+
+          '<span class="slipcode ccopy" title="Click to copy" onclick="cp(this,\\''+j.code+'\\')">'+j.code+'</span>'+
           '<a class="btn ghost sm" target="_blank" rel="noopener" href="https://www.sportybet.com/ng/?shareCode='+j.code+'">Open ↗</a>';
         var drop = j.requested > j.matched ? ' ('+(j.requested-j.matched)+' match(es) unavailable, skipped)' : '';
         showToast('✅ Code '+j.code+' created — '+j.matched+' games, '+(j.totalOdds||'—')+' odds'+drop+'. Click it to copy.','ok');
@@ -742,7 +742,7 @@ async function renderDashboard(
     var rows = codes.length
       ? codes.map(function(c){
           return '<div class="ocr-row">'+
-            '<span class="slipcode ccopy" title="Click to copy" onclick="cp(this,\''+c.code+'\')">'+c.code+'</span>'+
+            '<span class="slipcode ccopy" title="Click to copy" onclick="cp(this,\\''+c.code+'\\')">'+c.code+'</span>'+
             '<span class="pill status s-'+c.status+'">'+c.status+'</span>'+
             (c.totalOdds ? '<span class="muted">'+c.totalOdds+' odds</span>' : '')+
             (c.games ? '<span class="muted">'+c.games+' games</span>' : '')+
@@ -754,7 +754,7 @@ async function renderDashboard(
     if(!m){ m = document.createElement('div'); m.id='ocrmodal'; document.body.appendChild(m); }
     m.innerHTML = '<div class="ocr-box">'+
       '<div class="ocr-head"><b>📷 Codes found in your image</b>'+
-      '<button class="btn ghost sm" onclick="document.getElementById(\'ocrmodal\').remove()">✕ Close</button></div>'+
+      '<button class="btn ghost sm" onclick="document.getElementById(\\'ocrmodal\\').remove()">✕ Close</button></div>'+
       rows+
       '<div class="muted small" style="margin-top:10px">Click a code to copy · status checked live against SportyBet</div>'+
     '</div>';
