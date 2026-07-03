@@ -780,7 +780,26 @@ async function renderDashboard(
     border-radius:10px;padding:10px 14px;margin:10px 0}
   .pred-preview{color:#6b7594;font-size:13px;line-height:1.5;margin:10px 0;font-style:italic}
   .empty{grid-column:1/-1;text-align:center;color:var(--muted);padding:30px}
-  .disclaimer{color:var(--muted);font-size:12px;margin-top:6px;text-align:center;padding:8px}
+  .disclaimer{color:var(--muted);font-size:12px;margin-top:6px;text-align:center;padding:8px;line-height:1.6}
+  .disclaimer a{color:var(--bad);font-weight:700}
+  /* Prominent risk banner */
+  .risk-banner{display:flex;align-items:center;gap:14px;background:#fff4f2;border:1.5px solid #f4b9ad;
+    border-left:5px solid var(--bad);border-radius:12px;padding:12px 16px;margin-bottom:16px;
+    box-shadow:0 4px 16px rgba(229,72,77,.08)}
+  .rb-icon{font-size:24px;flex-shrink:0}
+  .rb-text{font-size:13px;line-height:1.5;color:#7a1d1d}
+  .rb-text b{color:#c0341a}
+  .rb-text u{text-underline-offset:2px}
+  .rb-link{display:inline-block;margin-left:6px;color:var(--bad);font-weight:700;text-decoration:underline;cursor:pointer}
+  .rb-close{flex-shrink:0;align-self:flex-start;background:#fff;border:1px solid #f0c4bb;color:#a5352a;
+    border-radius:9px;padding:7px 12px;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap}
+  .rb-close:hover{background:#fdece8}
+  .risk-detail{background:#fff;border:1px solid var(--line);border-left:5px solid var(--bad);border-radius:12px;
+    padding:14px 20px;margin-bottom:16px;font-size:13px;color:#475069}
+  .risk-detail ul{margin:10px 0 2px;padding-left:20px}
+  .risk-detail li{padding:4px 0}
+  .risk-detail a{color:var(--bad);font-weight:700}
+  @media(max-width:640px){ .risk-banner{flex-direction:column;align-items:flex-start} }
   @media(max-width:1000px){ .kpis{grid-template-columns:repeat(2,1fr)} .split{grid-template-columns:1fr} .col-side .card{position:static} }
   @media(max-width:760px){ .sidebar{display:none} .search{display:none} }
 </style></head>
@@ -820,6 +839,25 @@ async function renderDashboard(
       </div>
     </div>
     <div class="content">
+      <div class="risk-banner" id="riskBanner">
+        <span class="rb-icon">⚠️</span>
+        <div class="rb-text">
+          <b>High-risk gambling — you can lose your money.</b>
+          These booking codes, AI slips and predictions are statistical estimates, <u>never guarantees</u>. No code is "sure". Anyone promising guaranteed wins is scamming you. Only stake what you can afford to lose entirely. 18+ only.
+          <a href="#" onclick="rbMore(event)" class="rb-link">Read full risk warning</a>
+        </div>
+        <button class="rb-close" onclick="rbClose()" title="I understand the risks">I understand ✕</button>
+      </div>
+      <div class="risk-detail" id="riskDetail" hidden>
+        <b>Full risk warning</b>
+        <ul>
+          <li><b>Nothing here is a guaranteed win.</b> Booking codes found from public channels, AI-generated slips, and third-party predictions are all estimates. Even the best tipsters lose bets regularly.</li>
+          <li><b>We never place bets or move your money.</b> A booking code only saves a selection you must review and stake yourself on SportyBet.</li>
+          <li><b>Avoid "fixed match" and "100% sure" scams.</b> No one can guarantee outcomes. Never pay for "VIP sure odds".</li>
+          <li><b>Gambling is addictive and can cause serious financial harm.</b> Only bet what you can afford to lose. If it stops being fun, stop. Help: <a href="https://www.begambleaware.org" target="_blank" rel="noopener">BeGambleAware.org</a>.</li>
+          <li><b>18+ only.</b> You are responsible for complying with the gambling laws in your location.</li>
+        </ul>
+      </div>
       ${
         isPremium
           ? ""
@@ -827,13 +865,13 @@ async function renderDashboard(
       }
       <div class="kpis">${kpis}</div>
       ${body}
-      <div class="disclaimer">⚠️ ${esc(RESPONSIBLE_GAMBLING_DISCLAIMER)} ${
+      <div class="disclaimer"><b>⚠️ Gambling involves real risk of loss — never bet more than you can afford to lose.</b><br/>${esc(RESPONSIBLE_GAMBLING_DISCLAIMER)} ${
         mode === "pred"
           ? "Predictions from footballpredictions.com, forebet.com + Telegram analysts (@betmines, @eaglepredict) — third-party tips, not affiliated with SportyBet. No prediction is ever guaranteed."
           : mode === "ai"
             ? "AI slips are model estimates — booking codes save selections only; review & stake yourself."
-            : "Codes verified against SportyBet's official API."
-      }</div>
+            : "Codes are verified against SportyBet's official API for validity only — validity is not a prediction of winning."
+      } 18+ only · <a href="https://www.begambleaware.org" target="_blank" rel="noopener">Get help: BeGambleAware.org</a></div>
     </div>
   </div>
 </div>
@@ -843,6 +881,19 @@ async function renderDashboard(
     var o = el.textContent; el.textContent = 'Copied!';
     setTimeout(function(){ el.textContent = o; }, 1200);
   }
+  /* Risk banner: dismissable per browser session — always shown again on a new visit. */
+  function rbClose(){
+    var b = document.getElementById('riskBanner'); if(b) b.style.display='none';
+    var d = document.getElementById('riskDetail'); if(d) d.hidden = true;
+    try{ sessionStorage.setItem('riskAck','1'); }catch(e){}
+  }
+  function rbMore(e){
+    if(e) e.preventDefault();
+    var d = document.getElementById('riskDetail'); if(d) d.hidden = !d.hidden;
+  }
+  (function(){
+    try{ if(sessionStorage.getItem('riskAck')){ var b=document.getElementById('riskBanner'); if(b) b.style.display='none'; } }catch(e){}
+  })();
   function flt(q){
     q = (q||'').toLowerCase().trim();
     document.querySelectorAll('.frow,.slip').forEach(function(el){
