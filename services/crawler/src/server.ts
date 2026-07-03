@@ -4,7 +4,7 @@ import { RESPONSIBLE_GAMBLING_DISCLAIMER } from "@sportybet/shared";
 import { config } from "./config.js";
 import { runCycle, lastRunAt, nextRunAt, lastSummary, intervalSec } from "./scheduler.js";
 import { getPredictions } from "./predictions.js";
-import { legsForTips } from "./forebet-ai.js";
+import { planForTips } from "./forebet-ai.js";
 import { createBookingCode } from "./booker.js";
 import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
@@ -624,6 +624,8 @@ async function renderDashboard(
     background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 18px;
     box-shadow:0 12px 36px rgba(16,24,40,.18)}
   .sb-info{font-size:13px;font-weight:600;color:#475069}
+  .sb-note{font-size:12px;font-weight:600;color:#0f8a52;max-width:420px}
+  .sb-note.warn{color:#b7791f}
   .slipcode{display:inline-block;background:#141a2e;color:#7df0b8;font-family:ui-monospace,Consolas,monospace;
     font-size:16px;font-weight:800;letter-spacing:2px;padding:7px 14px;border-radius:9px;cursor:pointer}
   .slipcode:hover{filter:brightness(1.2)}
@@ -899,11 +901,15 @@ async function renderDashboard(
         headers:{'Content-Type':'application/json'}, body: JSON.stringify({keys:keys})});
       var j = await r.json();
       if(j.code){
+        var skipped = j.skipped || [];
+        var note = j.matched + ' of ' + j.requested + ' games booked';
         document.getElementById('slipres').innerHTML =
           '<span class="slipcode ccopy" title="Click to copy" onclick="cp(this,\\''+j.code+'\\')">'+j.code+'</span>'+
-          '<a class="btn ghost sm" target="_blank" rel="noopener" href="https://www.sportybet.com/ng/?shareCode='+j.code+'">Open ↗</a>';
-        var drop = j.requested > j.matched ? ' ('+(j.requested-j.matched)+' match(es) unavailable, skipped)' : '';
-        showToast('✅ Code '+j.code+' created — '+j.matched+' games, '+(j.totalOdds||'—')+' odds'+drop+'. Click it to copy.','ok');
+          '<a class="btn ghost sm" target="_blank" rel="noopener" href="https://www.sportybet.com/ng/?shareCode='+j.code+'">Open ↗</a>'+
+          '<span class="sb-note'+(skipped.length?' warn':'')+'" title="'+skipped.join(' · ')+'">'+note+
+          (skipped.length?' — skipped (not on SportyBet): '+skipped.join(', '):'')+'</span>';
+        showToast('✅ Code '+j.code+' — '+j.matched+' games, '+(j.totalOdds||'—')+' odds'+
+          (skipped.length?' · '+skipped.length+' skipped':'')+'. Click it to copy.','ok');
       } else {
         showToast(j.error || 'Booking failed — try again shortly','warn');
       }
@@ -1211,7 +1217,11 @@ export function startServer() {
         );
         if (!wanted.length)
           return json(422, { error: "Selected matches are no longer bookable — refresh and retry." });
-        const legs = await legsForTips(wanted);
+        const { legs, matchedKeys } = await planForTips(wanted);
+        const matchedSet = new Set(matchedKeys);
+        const skipped = wanted
+          .filter((p) => !matchedSet.has(`${p.home}|${p.away}`.toLowerCase()))
+          .map((p) => `${p.home} v ${p.away}`);
         if (!legs.length)
           return json(422, {
             error: "None of those matches are on SportyBet right now (kicked off, or not offered) — try other matches.",
@@ -1233,6 +1243,7 @@ export function startServer() {
           games: booking.games ?? legs.length,
           requested: keys.length,
           matched: legs.length,
+          skipped,
           totalOdds,
         });
       }

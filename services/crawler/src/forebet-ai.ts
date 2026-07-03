@@ -67,7 +67,8 @@ async function sportyEvents(): Promise<SbEvent[]> {
   if (evCache && Date.now() - evCache.at < EV_TTL_MS) return evCache.data;
   const out: SbEvent[] = [];
   try {
-    for (let page = 1; page <= 3; page++) {
+    // 10 pages ≈ 700+ fixtures; cached 10 min so this is ~1 req/min average.
+    for (let page = 1; page <= 10; page++) {
       const json = await fetchJson(EVENTS_API + page).catch(() => null);
       const tours: any[] = json?.data?.tournaments ?? [];
       let added = 0;
@@ -166,9 +167,9 @@ async function matchTips(tips: ExtPrediction[]): Promise<TipMatch[]> {
  * matches with an active 1X2 price for the predicted outcome. Used by the AI
  * engine AND the user slip-builder.
  */
-export async function legsForTips(tips: ExtPrediction[]): Promise<Leg[]> {
+function buildLegs(matches: TipMatch[]): Leg[] {
   const now = Date.now();
-  return (await matchTips(tips)).map(({ tip, ev, code, odds }) => {
+  return matches.map(({ tip, ev, code, odds }) => {
     const meta = PICKS[code];
     // Model probability: Forebet's own 1X2 % when present, else implied odds.
     const fbProb =
@@ -197,6 +198,24 @@ export async function legsForTips(tips: ExtPrediction[]): Promise<Leg[]> {
       outcomeId: meta.outcomeId,
     };
   });
+}
+
+export async function legsForTips(tips: ExtPrediction[]): Promise<Leg[]> {
+  return buildLegs(await matchTips(tips));
+}
+
+/**
+ * Booking plan for the slip builder: legs to book PLUS which tip keys matched,
+ * so the caller can tell the user exactly which selections were skipped.
+ */
+export async function planForTips(
+  tips: ExtPrediction[],
+): Promise<{ legs: Leg[]; matchedKeys: string[] }> {
+  const matches = await matchTips(tips);
+  return {
+    legs: buildLegs(matches),
+    matchedKeys: matches.map((m) => `${m.tip.home}|${m.tip.away}`.toLowerCase()),
+  };
 }
 
 /**
