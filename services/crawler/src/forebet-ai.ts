@@ -130,6 +130,74 @@ function teamsMatch(a: string, b: string): boolean {
 
 const round = (n: number, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
 
+// ---- Shared "which SportyBet pick is best for this fixture" logic ----
+// Used by BOTH Expert Picks (ranking/display) and its booking path, so what
+// gets booked always matches what was shown — never independently re-derived.
+export const RESULT_CODES = ["1", "X", "2"] as const;
+export const GOALS_CODES = ["O15", "U15", "O25", "U25", "O35", "U35"] as const;
+export type GameType = "result" | "goals" | "both";
+export const CODE_SETS: Record<GameType, readonly string[]> = {
+  result: RESULT_CODES,
+  goals: GOALS_CODES,
+  both: [...RESULT_CODES, ...GOALS_CODES],
+};
+// Each pick's market group — needed to remove the bookmaker's margin (see
+// devig() below): 1X2 is a 3-way group, each Over/Under LINE is its own 2-way
+// group (O2.5 devigs against U2.5, not against O1.5).
+const MARKET_GROUP: Record<string, readonly string[]> = {
+  "1": RESULT_CODES,
+  X: RESULT_CODES,
+  "2": RESULT_CODES,
+  O15: ["O15", "U15"],
+  U15: ["O15", "U15"],
+  O25: ["O25", "U25"],
+  U25: ["O25", "U25"],
+  O35: ["O35", "U35"],
+  U35: ["O35", "U35"],
+};
+
+/**
+ * De-vigged probability for one outcome: raw bookmaker odds always sum to
+ * MORE than 100% across a market (their margin/"overround") — e.g. Home 75% +
+ * Draw 28% + Away 12% = 115%. Dividing the raw implied probability by that
+ * total removes the margin, giving a fairer read on the actual chance rather
+ * than a number inflated by the bookmaker's edge. Falls back to the raw
+ * (undivided) figure if a sibling price is missing and a fair split can't be
+ * computed.
+ */
+export function devig(outcomes: Record<string, number>, code: string): number {
+  const odds = outcomes[code];
+  if (!odds || odds <= 1) return 0;
+  const raw = 1 / odds;
+  const group = MARKET_GROUP[code] ?? [code];
+  let overround = 0;
+  let complete = true;
+  for (const c of group) {
+    const o = outcomes[c];
+    if (!o || o <= 1) {
+      complete = false;
+      break;
+    }
+    overround += 1 / o;
+  }
+  return complete && overround > 0 ? raw / overround : raw;
+}
+
+/** Best (highest fair-probability) outcome among the given codes, for a fixture. */
+export function bestOutcome(
+  ev: SbEvent,
+  codes: readonly string[],
+): { code: string; odds: number; implied: number } | null {
+  let best: { code: string; odds: number; implied: number } | null = null;
+  for (const code of codes) {
+    const odds = ev.outcomes[code];
+    if (!odds || odds <= 1) continue;
+    const implied = devig(ev.outcomes, code);
+    if (!best || implied > best.implied) best = { code, odds, implied };
+  }
+  return best;
+}
+
 interface TipMatch {
   tip: ExtPrediction;
   ev: SbEvent;
@@ -244,18 +312,22 @@ export const getSportyFixtures = sportyEvents;
 export const fuzzyTeamsMatch = teamsMatch;
 
 /**
- * Book directly against SportyBet's own market favourite (shortest-price 1X2
- * outcome) for arbitrary "home|away" keys. Used for Expert Picks selections,
- * which are sourced straight from SportyBet's fixture list rather than an
- * external tip — so, unlike planForTips(), there's no ExtPrediction/predCode
- * to look up. Resolves each key against the SAME live fixture list and picks
- * the SAME favourite Expert Picks displayed, so the booked code always
- * matches what the user saw.
+ * Book directly against SportyBet's own best (de-vigged) outcome for
+ * arbitrary "home|away" keys, restricted to the SAME game-type code set
+ * Expert Picks was displaying (result/goals/both) when the user selected
+ * them. Used for Expert Picks selections, which are sourced straight from
+ * SportyBet's fixture list rather than an external tip — so, unlike
+ * planForTips(), there's no ExtPrediction/predCode to look up. Resolves each
+ * key against the SAME live fixture list with the SAME bestOutcome() logic
+ * used for display, so the booked code always matches what the user saw
+ * (barring odds moving between page-load and booking).
  */
 export async function legsForFixtureKeys(
   keys: string[],
+  gameType: GameType = "result",
 ): Promise<{ legs: Leg[]; matchedKeys: string[] }> {
   if (!keys.length) return { legs: [], matchedKeys: [] };
+  const codes = CODE_SETS[gameType] ?? CODE_SETS.result;
   const events = await sportyEvents();
   const now = Date.now();
   const legs: Leg[] = [];
@@ -268,17 +340,9 @@ export async function legsForFixtureKeys(
       (e) => e.kickoff > now && !used.has(e.eventId) && teamsMatch(e.home, h) && teamsMatch(e.away, a),
     );
     if (!ev) continue;
-    let bestCode: string | null = null;
-    let bestOdds = 0;
-    for (const code of ["1", "X", "2"]) {
-      const odds = ev.outcomes[code];
-      if (odds && odds > 1 && (!bestCode || 1 / odds > 1 / bestOdds)) {
-        bestCode = code;
-        bestOdds = odds;
-      }
-    }
-    if (!bestCode) continue;
-    const meta = PICKS[bestCode];
+    const fav = bestOutcome(ev, codes);
+    if (!fav) continue;
+    const meta = PICKS[fav.code];
     used.add(ev.eventId);
     legs.push({
       eventId: ev.eventId,
@@ -288,8 +352,8 @@ export async function legsForFixtureKeys(
       kickoff: ev.kickoff,
       market: meta.market,
       pick: meta.label,
-      odds: round(bestOdds, 2),
-      prob: round(Math.min(0.95, 1 / bestOdds)),
+      odds: round(fav.odds, 2),
+      prob: round(Math.min(0.95, fav.implied)),
       consensus: 1,
       foundAt: now,
       marketId: meta.marketId,

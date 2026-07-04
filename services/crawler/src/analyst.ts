@@ -1,5 +1,13 @@
 import { getPredictions, type ExtPrediction } from "./predictions.js";
-import { getSportyFixtures, fuzzyTeamsMatch, type SbEvent } from "./forebet-ai.js";
+import {
+  getSportyFixtures,
+  fuzzyTeamsMatch,
+  bestOutcome,
+  CODE_SETS,
+  type SbEvent,
+  type GameType,
+} from "./forebet-ai.js";
+export type { GameType };
 
 /**
  * "Expert Picks" engine.
@@ -54,16 +62,11 @@ const PICK_LABEL: Record<string, (h: string, a: string) => string> = {
   U35: () => "Under 3.5 Goals",
 };
 
-// Only 1X2 outcomes are used as the PRIMARY pick — "predict the result" reads
-// naturally as "X to Win" / "Draw", matching how a sports analyst talks. O/U
-// odds are still fetched (SportyBet feed carries them) but not used as the
-// headline pick here.
-const RESULT_CODES = ["1", "X", "2"] as const;
-
 export interface ExpertOptions {
-  count: number; // how many picks the user wants
-  days: number; // window: fixtures within the next N days (clamped 3..7)
-  minConfidence?: number; // optional hard floor; default is NO floor
+  count: number; // how many picks the user wants (1..50)
+  days: number; // window: fixtures within the next N days (1..30 — "a month")
+  gameType?: GameType; // "result" (1X2, default) | "goals" (O/U) | "both"
+  minConfidence?: number; // 0..1 floor on the (de-vigged) confidence %; default 0
   maxPerLeague?: number; // diversity cap; default scales with count
   seed?: number; // rotation for variety across refreshes
 }
@@ -78,18 +81,6 @@ export interface ExpertResult {
   poolSize: number;
 }
 
-/** Best (shortest-price) 1X2 outcome for a fixture, with its implied prob. */
-function marketFavourite(ev: SbEvent): { code: string; odds: number; implied: number } | null {
-  let best: { code: string; odds: number; implied: number } | null = null;
-  for (const code of RESULT_CODES) {
-    const odds = ev.outcomes[code];
-    if (!odds || odds <= 1) continue;
-    const implied = 1 / odds;
-    if (!best || implied > best.implied) best = { code, odds, implied };
-  }
-  return best;
-}
-
 /** A same-fixture external tip (Forebet / API-Football), if one exists. */
 function findExternalTip(ev: SbEvent, preds: ExtPrediction[]): ExtPrediction | undefined {
   return preds.find(
@@ -102,11 +93,13 @@ const round = (n: number, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
 /** The N highest-confidence, GUARANTEED-BOOKABLE picks within the window. */
 export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertResult> {
   const count = Math.max(1, Math.min(50, Math.floor(opts.count) || 5));
-  const days = Math.max(3, Math.min(7, Math.floor(opts.days) || 5));
+  const days = Math.max(1, Math.min(30, Math.floor(opts.days) || 5)); // up to a month out
+  const gameType = opts.gameType ?? "result";
+  const codes = CODE_SETS[gameType] ?? CODE_SETS.result;
   const minConf = opts.minConfidence ?? 0;
   // Diversity cap: scales with how many picks were asked for, floor of 3, so a
   // big request still spreads across leagues instead of one tournament
-  // filling every slot. (count=5 → cap 3; count=20 → cap 5; count=50 → cap 9)
+  // filling every slot. (count=5 → cap 3; count=20 → cap 5; count=50 → cap 15)
   const maxPerLeague = opts.maxPerLeague ?? Math.max(3, Math.ceil(count / 4) + 2);
 
   const now = Date.now();
@@ -120,26 +113,33 @@ export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertResult>
   const scored: ExpertPick[] = [];
   for (const ev of fixtures) {
     if (!ev.kickoff || ev.kickoff <= now || ev.kickoff > maxT) continue; // in window only
-    const fav = marketFavourite(ev);
-    if (!fav) continue; // no usable 1X2 price for this fixture right now
+    const fav = bestOutcome(ev, codes);
+    if (!fav) continue; // no usable price for this fixture/game-type right now
 
-    const reasons: string[] = [`market odds ${fav.odds.toFixed(2)} (${Math.round(fav.implied * 100)}% implied)`];
+    const reasons: string[] = [
+      `market odds ${fav.odds.toFixed(2)} (${Math.round(fav.implied * 100)}% fair probability, bookmaker margin removed)`,
+    ];
     let confidence = fav.implied;
 
     const tip = findExternalTip(ev, preds);
-    if (tip?.predCode && RESULT_CODES.includes(tip.predCode as (typeof RESULT_CODES)[number])) {
-      const idx = tip.predCode === "1" ? 0 : tip.predCode === "X" ? 1 : 2;
-      const modelPct = tip.probs?.[idx];
-      if (tip.predCode === fav.code) {
-        // External model agrees with SportyBet's own favourite — real signal
-        // agreement, not just one source's opinion.
-        if (modelPct) {
-          confidence = confidence * 0.6 + (modelPct / 100) * 0.4;
-          reasons.push(`${modelPct}% model win probability (${tip.source})`);
-        }
-        confidence = Math.min(0.95, confidence + 0.05);
-        reasons.push(`confirmed by ${tip.source}`);
+    if (tip?.predCode === fav.code) {
+      // External model agrees with SportyBet's own favourite — real signal
+      // agreement, not just one source's opinion. Model win % is only
+      // meaningful for 1X2 picks (Forebet's probs array is home/draw/away).
+      const modelPct =
+        fav.code === "1"
+          ? tip.probs?.[0]
+          : fav.code === "X"
+            ? tip.probs?.[1]
+            : fav.code === "2"
+              ? tip.probs?.[2]
+              : undefined;
+      if (modelPct) {
+        confidence = confidence * 0.6 + (modelPct / 100) * 0.4;
+        reasons.push(`${modelPct}% model win probability (${tip.source})`);
       }
+      confidence = Math.min(0.95, confidence + 0.05);
+      reasons.push(`confirmed by ${tip.source}`);
     }
 
     const label = (PICK_LABEL[fav.code] ?? (() => fav.code))(ev.home, ev.away);

@@ -10,7 +10,7 @@ import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
 import { verifyCode } from "./verifier.js";
 import { telegramClientEnabled } from "./adapters/telegram-client.js";
-import { getExpertPicks } from "./analyst.js";
+import { getExpertPicks, type GameType } from "./analyst.js";
 
 /** Read a request body with a hard size cap (default 10 MB for images). */
 function readBody(req: http.IncomingMessage, maxBytes = 10 * 1024 * 1024): Promise<string> {
@@ -51,7 +51,12 @@ async function renderDashboard(
   mode: Mode = "human",
   tier: Tier = "free",
   dateStr = "",
-  expertOpts: { count: number; days: number } = { count: 5, days: 5 },
+  expertOpts: { count: number; days: number; gameType: GameType; minConfidence: number } = {
+    count: 5,
+    days: 5,
+    gameType: "result",
+    minConfidence: 0,
+  },
 ): Promise<string> {
   const preds = mode === "pred" ? await getPredictions() : [];
   // Expert picks: highest-confidence selections across the chosen day window.
@@ -60,6 +65,8 @@ async function renderDashboard(
       ? await getExpertPicks({
           count: expertOpts.count,
           days: expertOpts.days,
+          gameType: expertOpts.gameType,
+          minConfidence: expertOpts.minConfidence / 100, // form stores plain %, engine wants a 0..1 fraction
           seed: Math.floor(Date.now() / (8 * 60_000)), // rotate every ~8 min
         })
       : { picks: [], requested: 0, windowDays: 0, poolSize: 0 };
@@ -555,13 +562,35 @@ async function renderDashboard(
       <form class="xform" method="get" action="/">
         <input type="hidden" name="mode" value="expert"/>
         <label>Games
-          <select name="n">${[1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20]
+          <select name="n">${[1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 25, 30, 40, 50]
             .map((n) => `<option value="${n}"${n === expertOpts.count ? " selected" : ""}>${n}</option>`)
             .join("")}</select>
         </label>
         <label>Within
-          <select name="days">${[3, 4, 5, 6, 7]
-            .map((d) => `<option value="${d}"${d === expertOpts.days ? " selected" : ""}>${d} days</option>`)
+          <select name="days">${[1, 2, 3, 4, 5, 6, 7, 10, 14, 21, 30]
+            .map(
+              (d) =>
+                `<option value="${d}"${d === expertOpts.days ? " selected" : ""}>${d === 30 ? "1 month" : d === 1 ? "1 day" : `${d} days`}</option>`,
+            )
+            .join("")}</select>
+        </label>
+        <label>Game type
+          <select name="type" id="xtype">${(
+            [
+              ["result", "Match Result (1X2)"],
+              ["goals", "Over/Under Goals"],
+              ["both", "Both"],
+            ] as [GameType, string][]
+          )
+            .map(([v, label]) => `<option value="${v}"${v === expertOpts.gameType ? " selected" : ""}>${label}</option>`)
+            .join("")}</select>
+        </label>
+        <label>Min. confidence
+          <select name="minconf">${[0, 50, 60, 70, 80, 90]
+            .map(
+              (v) =>
+                `<option value="${v}"${v === expertOpts.minConfidence ? " selected" : ""}>${v === 0 ? "Any" : `${v}%+`}</option>`,
+            )
             .join("")}</select>
         </label>
         <button class="btn" type="submit">Get picks</button>
@@ -574,7 +603,7 @@ async function renderDashboard(
     }
     <div class="xlist">${
       expertCards ||
-      '<div class="card empty">No bookable fixtures in this window yet — try widening the days (up to 7), or check back shortly as fixtures and predictions load (busiest mid-day WAT).</div>'
+      '<div class="card empty">No bookable fixtures match your filters — try widening the days (up to a month), loosening the minimum confidence, or including more game types.</div>'
     }</div>${slipBar}`;
 
   const body =
@@ -1105,8 +1134,14 @@ async function renderDashboard(
     if(keys.length > 50){ showToast('Maximum 50 matches per code — remove some','warn'); return; }
     btn.disabled = true; var o = btn.textContent; btn.textContent = '⚡ Booking on SportyBet…';
     try{
+      // On the Expert Picks page, tell the server which game type (1X2 /
+      // Over-Under / both) was selected, so it books the SAME market it
+      // displayed rather than re-deriving a possibly different one.
+      var xtype = document.getElementById('xtype');
+      var body = {keys:keys};
+      if(xtype) body.gameType = xtype.value;
       var r = await fetch('/api/predictions/book',{method:'POST',
-        headers:{'Content-Type':'application/json'}, body: JSON.stringify({keys:keys})});
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
       var j = await r.json();
       if(j.code){
         var skipped = j.skipped || [];
@@ -1427,9 +1462,11 @@ export function startServer() {
           res.end(JSON.stringify(o));
         };
         let keys: string[] = [];
+        let gameType: GameType = "result";
         try {
           const body = JSON.parse((await readBody(req, 64 * 1024)) || "{}");
           keys = Array.isArray(body.keys) ? body.keys.map((k: unknown) => String(k)) : [];
+          if (body.gameType === "goals" || body.gameType === "both") gameType = body.gameType;
         } catch {
           return json(400, { error: "Bad request body." });
         }
@@ -1450,7 +1487,7 @@ export function startServer() {
         // external tip. Book directly against SportyBet's own favourite for
         // that fixture (same pick Expert Picks displayed).
         const remainingKeys = keys.filter((k) => !tipMatched.includes(k));
-        const { legs: directLegs, matchedKeys: directMatched } = await legsForFixtureKeys(remainingKeys);
+        const { legs: directLegs, matchedKeys: directMatched } = await legsForFixtureKeys(remainingKeys, gameType);
 
         const legs = [...tipLegs, ...directLegs];
         const matchedSet = new Set([...tipMatched, ...directMatched]);
@@ -1531,8 +1568,16 @@ export function startServer() {
       }
       const dateStr = url.searchParams.get("date") ?? "";
       const expertCount = Math.max(1, Math.min(50, Number(url.searchParams.get("n")) || 5));
-      const expertDays = Math.max(3, Math.min(7, Number(url.searchParams.get("days")) || 5));
-      const html = await renderDashboard(mode, tier, dateStr, { count: expertCount, days: expertDays });
+      const expertDays = Math.max(1, Math.min(30, Number(url.searchParams.get("days")) || 5));
+      const typeParam = url.searchParams.get("type");
+      const expertGameType: GameType = typeParam === "goals" ? "goals" : typeParam === "both" ? "both" : "result";
+      const expertMinConf = Math.max(0, Math.min(90, Number(url.searchParams.get("minconf")) || 0));
+      const html = await renderDashboard(mode, tier, dateStr, {
+        count: expertCount,
+        days: expertDays,
+        gameType: expertGameType,
+        minConfidence: expertMinConf, // plain percentage (0/50/60/70/80/90) — kept for form state
+      });
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(html);
     } catch (err: any) {
