@@ -10,6 +10,7 @@ import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
 import { verifyCode } from "./verifier.js";
 import { telegramClientEnabled } from "./adapters/telegram-client.js";
+import { getExpertPicks } from "./analyst.js";
 
 /** Read a request body with a hard size cap (default 10 MB for images). */
 function readBody(req: http.IncomingMessage, maxBytes = 10 * 1024 * 1024): Promise<string> {
@@ -43,15 +44,25 @@ function stars(n: number): string {
   return "★".repeat(v) + "☆".repeat(5 - v);
 }
 
-type Mode = "human" | "ai" | "pred";
+type Mode = "human" | "ai" | "pred" | "expert";
 type Tier = "free" | "premium";
 
 async function renderDashboard(
   mode: Mode = "human",
   tier: Tier = "free",
   dateStr = "",
+  expertOpts: { count: number; days: number } = { count: 5, days: 5 },
 ): Promise<string> {
   const preds = mode === "pred" ? await getPredictions() : [];
+  // Expert picks: highest-confidence selections across the chosen day window.
+  const expertPicks =
+    mode === "expert"
+      ? await getExpertPicks({
+          count: expertOpts.count,
+          days: expertOpts.days,
+          seed: Math.floor(Date.now() / (8 * 60_000)), // rotate every ~8 min
+        })
+      : [];
   const isPremium = tier === "premium";
   const freshCut = Date.now() - config.freeDelayMin * 60_000;
 
@@ -466,8 +477,17 @@ async function renderDashboard(
     </div>`;
 
   // ---- KPI cards (mode-aware) ----
+  const avgConf = expertPicks.length
+    ? Math.round((expertPicks.reduce((a, p) => a + p.confidence, 0) / expertPicks.length) * 100)
+    : 0;
   const kpis =
-    mode === "pred"
+    mode === "expert"
+      ? `
+      ${kpi("🎯", expertPicks.length, "expert picks", "indigo")}
+      ${kpi("📊", avgConf ? `${avgConf}%` : "—", "avg confidence", "green")}
+      ${kpi("🗓️", `${expertOpts.days}d`, "search window", "orange")}
+      ${kpi("🔗", new Set(expertPicks.map((p) => p.source)).size, "sources scanned", "blue")}`
+      : mode === "pred"
       ? `
       ${kpi("📈", preds.length, "predictions", "indigo")}
       ${kpi("🎯", preds.filter((p) => p.odds).length, "with tip + odds", "orange")}
@@ -493,8 +513,68 @@ async function renderDashboard(
       <button class="btn ghost sm" onclick="clearSel()">Clear</button>
     </div>`;
 
+  // ---- Expert Picks: confidence-ranked selections + controls ----
+  const confClass = (c: number) => (c >= 0.7 ? "hi" : c >= 0.6 ? "mid" : "lo");
+  const expertCards = expertPicks
+    .map((p, i) => {
+      const kick = p.kickoff
+        ? new Date(p.kickoff).toLocaleString("en", {
+            weekday: "short",
+            day: "numeric",
+            month: "short",
+            hour: "2-digit",
+            minute: "2-digit",
+            timeZone: "Africa/Lagos",
+          })
+        : "TBD";
+      const pct = Math.round(p.confidence * 100);
+      return `
+      <div class="xcard" data-key="${esc(p.key)}">
+        <div class="xrank">#${i + 1}</div>
+        <div class="xmain">
+          <div class="xmatch">${esc(p.home)} <span class="muted">v</span> ${esc(p.away)}</div>
+          <div class="xmeta">${esc(p.league ?? "Football")} · ⏰ ${esc(kick)} WAT · <span class="muted">${esc(p.source)}</span></div>
+          <div class="xpick">🎯 ${esc(p.pick)}${p.odds ? ` <span class="xodds">@ ${esc(p.odds)}</span>` : ""}</div>
+          <div class="xwhy">${p.reasons.map((r) => `<span>${esc(r)}</span>`).join("")}</div>
+        </div>
+        <div class="xconf ${confClass(p.confidence)}">
+          <div class="xconf-n">${pct}%</div><div class="xconf-l">confidence</div>
+          <label class="xsel"><input type="checkbox" checked data-key="${esc(p.key)}" onchange="selTog(this)"/> in slip</label>
+        </div>
+      </div>`;
+    })
+    .join("");
+
+  const expertBody = `
+    <div class="xhead card">
+      <div>
+        <h3 style="margin:0">🎯 Expert Picks — confidence-ranked</h3>
+        <div class="muted small">Scanned every fixture we have a read on across your window and ranked by model probability + market odds + source agreement. These are estimates ranked by confidence — <b>not guarantees</b>.</div>
+      </div>
+      <form class="xform" method="get" action="/">
+        <input type="hidden" name="mode" value="expert"/>
+        <label>Games
+          <select name="n">${[1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20]
+            .map((n) => `<option value="${n}"${n === expertOpts.count ? " selected" : ""}>${n}</option>`)
+            .join("")}</select>
+        </label>
+        <label>Within
+          <select name="days">${[3, 4, 5, 6, 7]
+            .map((d) => `<option value="${d}"${d === expertOpts.days ? " selected" : ""}>${d} days</option>`)
+            .join("")}</select>
+        </label>
+        <button class="btn" type="submit">Get picks</button>
+      </form>
+    </div>
+    <div class="xlist">${
+      expertCards ||
+      '<div class="card empty">No high-confidence picks in this window yet — try widening the days, or check back as fixtures and predictions load (busiest mid-day WAT).</div>'
+    }</div>${slipBar}`;
+
   const body =
-    mode === "pred"
+    mode === "expert"
+      ? expertBody
+      : mode === "pred"
       ? `<div class="pred-hint card">✨ <b>Build your own code:</b> tick <i>“➕ Add to slip”</i> on any predictions below (pick 1 to 50), then hit <b>Generate SportyBet Code</b> — you get a real booking code to copy, just like the human ones. Matches SportyBet doesn't offer are skipped automatically.</div>
         ${predDateBar}
         ${dayGroupsHtml || analystHtml ? dayGroupsHtml + analystHtml : '<div class="card empty">No predictions available right now — the source may be updating. Check back shortly.</div>'}${slipBar}`
@@ -606,6 +686,35 @@ async function renderDashboard(
   .btn.sm{padding:6px 12px;font-size:12px}
   .btn.gold{background:linear-gradient(135deg,#e0a531,#f6c453);color:#3a2a06;box-shadow:0 6px 16px rgba(224,165,49,.3)}
   .btn:disabled{opacity:.7;cursor:default}
+  /* Expert Picks */
+  .xhead{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:18px}
+  .xform{display:flex;align-items:end;gap:10px;flex-wrap:wrap}
+  .xform label{display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+  .xform select{padding:8px 10px;border:1px solid var(--line);border-radius:9px;background:#f7f9fc;font-size:13px;font-weight:600;color:var(--ink)}
+  .xlist{display:flex;flex-direction:column;gap:12px}
+  .xcard{display:flex;align-items:center;gap:16px;background:var(--card);border:1px solid var(--line);
+    border-radius:16px;padding:16px 18px;box-shadow:var(--shadow);position:relative}
+  .xcard.picked{border:2px solid var(--green);box-shadow:0 8px 24px rgba(22,168,107,.18)}
+  .xrank{flex-shrink:0;width:34px;height:34px;border-radius:10px;background:#eeecfb;color:var(--indigo);
+    display:grid;place-items:center;font-weight:800;font-size:13px}
+  .xmain{flex:1;min-width:0}
+  .xmatch{font-weight:800;font-size:15px}
+  .xmeta{font-size:12px;color:var(--muted);margin:3px 0 8px}
+  .xpick{font-size:13px;font-weight:700;color:var(--ink);background:#f4f6fb;display:inline-block;
+    padding:5px 12px;border-radius:999px;margin-bottom:6px}
+  .xodds{color:var(--indigo);font-weight:800}
+  .xwhy{display:flex;flex-wrap:wrap;gap:6px}
+  .xwhy span{font-size:11px;color:#59617a;background:#f7f9fc;border:1px solid var(--line);padding:3px 9px;border-radius:999px}
+  .xconf{flex-shrink:0;text-align:center;width:92px}
+  .xconf-n{font-size:22px;font-weight:800;line-height:1.1}
+  .xconf-l{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px}
+  .xconf.hi .xconf-n{color:var(--green)}
+  .xconf.mid .xconf-n{color:#c9820f}
+  .xconf.lo .xconf-n{color:var(--muted)}
+  .xsel{display:flex;align-items:center;justify-content:center;gap:5px;font-size:11px;font-weight:700;
+    color:#59617a;cursor:pointer}
+  .xsel input{accent-color:var(--green);cursor:pointer}
+  @media(max-width:640px){ .xcard{flex-direction:column;align-items:stretch} .xconf{width:auto;display:flex;align-items:center;justify-content:space-between} }
   /* Prediction match calendar */
   .pred-datebar{padding:16px 18px 8px;margin-bottom:18px}
   .pd-chip{position:relative;flex:0 0 auto;width:68px;display:flex;flex-direction:column;
@@ -840,6 +949,7 @@ async function renderDashboard(
     ${nav("human", "📊", "Dashboard", mode === "human")}
     ${nav("ai", "🤖", "AI Codes", mode === "ai")}
     ${nav("pred", "📈", "Predictions", mode === "pred")}
+    ${nav("expert", "🎯", "Expert Picks", mode === "expert")}
     <div class="nav-label">Data</div>
     <a class="nav-item" href="/api/codes" target="_blank"><span class="ni">🔗</span>Codes API</a>
     <a class="nav-item" href="/api/ai-slips" target="_blank"><span class="ni">🧠</span>AI Slips API</a>
@@ -852,8 +962,8 @@ async function renderDashboard(
   <div class="app">
     <div class="topbar">
       <div>
-        <h1>${mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
-        <div class="sub">${mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
+        <h1>${mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
+        <div class="sub">${mode === "expert" ? "Confidence-ranked picks across your chosen window — estimates, never guarantees" : mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
       </div>
       <div class="search"><input id="search" placeholder="Search codes, leagues, sources…" oninput="flt(this.value)"/></div>
       <div class="top-right">
@@ -895,7 +1005,9 @@ async function renderDashboard(
       <div class="kpis">${kpis}</div>
       ${body}
       <div class="disclaimer"><b>⚠️ Gambling involves real risk of loss — never bet more than you can afford to lose.</b><br/>${esc(RESPONSIBLE_GAMBLING_DISCLAIMER)} ${
-        mode === "pred"
+        mode === "expert"
+          ? "Confidence scores blend model win probability, market odds and source agreement — they rank likelihood, they do NOT guarantee an outcome. No pick is ever \"sure\"; anyone claiming 99–100% guaranteed wins is misleading you."
+          : mode === "pred"
           ? "Predictions from footballpredictions.com, forebet.com + Telegram analysts (@betmines, @eaglepredict) — third-party tips, not affiliated with SportyBet. No prediction is ever guaranteed."
           : mode === "ai"
             ? "AI slips are model estimates — booking codes save selections only; review & stake yourself."
@@ -956,7 +1068,8 @@ async function renderDashboard(
   function selTog(cb){
     var k = cb.getAttribute('data-key');
     if(cb.checked) SEL[k]=1; else delete SEL[k];
-    cb.closest('.slip').classList.toggle('picked', cb.checked);
+    var card = cb.closest('.slip') || cb.closest('.xcard');
+    if(card) card.classList.toggle('picked', cb.checked);
     updBar();
   }
   function updBar(){
@@ -967,11 +1080,18 @@ async function renderDashboard(
   }
   function clearSel(){
     SEL = {};
-    document.querySelectorAll('.selbox input').forEach(function(c){ c.checked=false; });
-    document.querySelectorAll('.slip.picked').forEach(function(s){ s.classList.remove('picked'); });
+    document.querySelectorAll('[data-key]').forEach(function(c){ if(c.tagName==='INPUT') c.checked=false; });
+    document.querySelectorAll('.slip.picked,.xcard.picked').forEach(function(s){ s.classList.remove('picked'); });
     var r = document.getElementById('slipres'); if(r) r.innerHTML='';
     updBar();
   }
+  // Pre-selected picks (Expert Picks come checked by default) → seed SEL on load.
+  (function(){
+    document.querySelectorAll('input[type=checkbox][data-key]').forEach(function(cb){
+      if(cb.checked){ SEL[cb.getAttribute('data-key')] = 1; var c = cb.closest('.xcard'); if(c) c.classList.add('picked'); }
+    });
+    updBar();
+  })();
   async function genCode(btn){
     var keys = Object.keys(SEL);
     if(keys.length < 1){ showToast('Pick at least 1 match first','warn'); return; }
@@ -1123,7 +1243,7 @@ async function renderDashboard(
 </body></html>`;
 }
 
-function kpi(icon: string, value: number, label: string, color: string): string {
+function kpi(icon: string, value: number | string, label: string, color: string): string {
   return `<div class="kpi ${color}"><div class="ic">${icon}</div><div><b>${value}</b><small>${label}</small></div></div>`;
 }
 
@@ -1197,7 +1317,14 @@ export function startServer() {
     try {
       const url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
       const modeParam = url.searchParams.get("mode");
-      const mode: Mode = modeParam === "ai" ? "ai" : modeParam === "pred" ? "pred" : "human";
+      const mode: Mode =
+        modeParam === "ai"
+          ? "ai"
+          : modeParam === "pred"
+            ? "pred"
+            : modeParam === "expert"
+              ? "expert"
+              : "human";
       const tier: Tier =
         config.defaultTier === "premium" ||
         /(?:^|;\s*)tier=premium(?:;|$)/.test(req.headers.cookie ?? "")
@@ -1378,7 +1505,9 @@ export function startServer() {
         return json(200, { text: text.slice(0, 400), codes: results });
       }
       const dateStr = url.searchParams.get("date") ?? "";
-      const html = await renderDashboard(mode, tier, dateStr);
+      const expertCount = Math.max(1, Math.min(50, Number(url.searchParams.get("n")) || 5));
+      const expertDays = Math.max(3, Math.min(7, Number(url.searchParams.get("days")) || 5));
+      const html = await renderDashboard(mode, tier, dateStr, { count: expertCount, days: expertDays });
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(html);
     } catch (err: any) {
