@@ -55,14 +55,15 @@ async function renderDashboard(
 ): Promise<string> {
   const preds = mode === "pred" ? await getPredictions() : [];
   // Expert picks: highest-confidence selections across the chosen day window.
-  const expertPicks =
+  const expertResult =
     mode === "expert"
       ? await getExpertPicks({
           count: expertOpts.count,
           days: expertOpts.days,
           seed: Math.floor(Date.now() / (8 * 60_000)), // rotate every ~8 min
         })
-      : [];
+      : { picks: [], requested: 0, windowDays: 0, poolSize: 0 };
+  const expertPicks = expertResult.picks;
   const isPremium = tier === "premium";
   const freshCut = Date.now() - config.freeDelayMin * 60_000;
 
@@ -566,9 +567,14 @@ async function renderDashboard(
         <button class="btn" type="submit">Get picks</button>
       </form>
     </div>
+    ${
+      expertResult.poolSize > 0 && expertResult.poolSize < expertResult.requested
+        ? `<div class="xshort card">ℹ️ Showing ${expertResult.poolSize} of the ${expertResult.requested} you asked for — that's every fixture in this window we could both read AND confirm bookable on SportyBet right now. More fixtures load in as kickoffs approach; try widening the day range or checking back shortly.</div>`
+        : ""
+    }
     <div class="xlist">${
       expertCards ||
-      '<div class="card empty">No high-confidence picks in this window yet — try widening the days, or check back as fixtures and predictions load (busiest mid-day WAT).</div>'
+      '<div class="card empty">No bookable fixtures in this window yet — try widening the days (up to 7), or check back shortly as fixtures and predictions load (busiest mid-day WAT).</div>'
     }</div>${slipBar}`;
 
   const body =
@@ -687,6 +693,7 @@ async function renderDashboard(
   .btn.gold{background:linear-gradient(135deg,#e0a531,#f6c453);color:#3a2a06;box-shadow:0 6px 16px rgba(224,165,49,.3)}
   .btn:disabled{opacity:.7;cursor:default}
   /* Expert Picks */
+  .xshort{padding:12px 16px;margin-bottom:14px;font-size:13px;background:#eef1fb;border:1px solid #d8ddf5;color:#3a3f6b}
   .xhead{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:18px}
   .xform{display:flex;align-items:end;gap:10px;flex-wrap:wrap}
   .xform label{display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}

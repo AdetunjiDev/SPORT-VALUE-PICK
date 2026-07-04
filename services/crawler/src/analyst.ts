@@ -91,15 +91,31 @@ function scoreOf(p: ExtPrediction): { conf: number; reasons: string[] } | null {
 export interface ExpertOptions {
   count: number; // how many picks the user wants
   days: number; // window: fixtures within the next N days (clamped 3..7)
-  minConfidence?: number; // default 0.55
+  minConfidence?: number; // optional hard floor; default is NO floor (see below)
   seed?: number; // rotation for variety across refreshes
 }
 
-/** The N highest-confidence picks within the date window. */
-export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertPick[]> {
+export interface ExpertResult {
+  picks: ExpertPick[];
+  requested: number;
+  windowDays: number;
+  // Total fixtures that were both in-window and bookable on SportyBet, before
+  // ranking — lets the UI explain honestly why fewer than requested came back.
+  poolSize: number;
+}
+
+/**
+ * The N highest-confidence picks within the date window.
+ *
+ * No hard confidence cutoff by default: a real analyst still gives you their
+ * best N picks even on a thin day, just honestly labelled by confidence
+ * (color-coded hi/mid/lo on the card) rather than returning nothing. Pass
+ * minConfidence to enforce a floor instead.
+ */
+export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertResult> {
   const count = Math.max(1, Math.min(50, Math.floor(opts.count) || 5));
   const days = Math.max(3, Math.min(7, Math.floor(opts.days) || 5));
-  const minConf = opts.minConfidence ?? 0.55;
+  const minConf = opts.minConfidence ?? 0;
 
   const preds = await getPredictions();
   const now = Date.now();
@@ -160,5 +176,5 @@ export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertPick[]>
 
   // Present soonest kick-off first.
   chosen.sort((a, b) => new Date(a.kickoff ?? 0).getTime() - new Date(b.kickoff ?? 0).getTime());
-  return chosen;
+  return { picks: chosen, requested: count, windowDays: days, poolSize: scored.length };
 }
