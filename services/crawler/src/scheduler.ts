@@ -12,10 +12,11 @@ export let nextRunAt: Date | null = null;
 export let lastSummary = "";
 export const intervalSec = config.defaultIntervalSec;
 
-// Regenerate AI slips (which create booking codes on SportyBet) only every N
-// cycles — this keeps human-code scanning at 3 min while easing our call volume
-// on SportyBet's booking API to avoid rate-limits.
-const AI_EVERY = Math.max(1, Number(process.env.AI_REGEN_EVERY_CYCLES ?? 5));
+// Recompute AI slips every cycle (default). This is cheap — delta booking in
+// generateAiSlips() reuses existing codes when a slip's selections are
+// unchanged and only mints a new SportyBet code when the picks actually change
+// (capped per cycle), so refreshing every 3 min doesn't hammer the booking API.
+const AI_EVERY = Math.max(1, Number(process.env.AI_REGEN_EVERY_CYCLES ?? 1));
 
 /** Run one full crawl cycle unless one is already in flight. */
 export async function runCycle(trigger: string): Promise<string> {

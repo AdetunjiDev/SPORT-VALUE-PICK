@@ -1,7 +1,24 @@
+import { createHash } from "node:crypto";
 import { prisma, Prisma } from "@sportybet/db";
 import { createBookingCode } from "./booker.js";
 import { forebetLegs, legsForTips } from "./forebet-ai.js";
 import { getApiFootballPredictions } from "./apifootball.js";
+
+// Delta booking: recompute slips every cycle, but only mint a NEW SportyBet
+// booking code when a slip's selections actually change — so we can refresh
+// every 3 min without hammering SportyBet's booking API.
+const MAX_NEW_BOOKINGS_PER_CYCLE = Math.max(1, Number(process.env.AI_MAX_BOOKINGS_PER_CYCLE ?? 3));
+// Rotate the pick selection on a slow clock (default 15 min) so codes stay
+// STABLE between data changes instead of churning every cycle.
+const ROTATE_MS = Math.max(1, Number(process.env.AI_ROTATE_MIN ?? 15)) * 60_000;
+
+/** Stable fingerprint of a slip's bookable selections (order-independent). */
+function legHash(legs: Leg[]): string {
+  const parts = legs
+    .map((l) => `${l.eventId}:${l.marketId ?? ""}:${l.specifier ?? ""}:${l.outcomeId ?? ""}`)
+    .sort();
+  return createHash("sha1").update(parts.join("|")).digest("hex");
+}
 
 /**
  * AI recommendation engine (v1).
@@ -272,7 +289,9 @@ export async function generateAiSlips(): Promise<number> {
     },
   ];
 
-  generation += 1; // advance rotation each cycle
+  // Rotate on a slow clock, not every cycle, so an unchanged pool yields the
+  // SAME picks (and thus keeps the same booking code) between rotation windows.
+  generation = Math.floor(Date.now() / ROTATE_MS);
   const slips = profiles.map((p) => buildSlip(pool, p, generation)).filter(Boolean) as NonNullable<
     ReturnType<typeof buildSlip>
   >[];
@@ -320,40 +339,100 @@ export async function generateAiSlips(): Promise<number> {
 
   if (!slips.length) return 0;
 
-  // Replace the current auto-generated set.
-  await prisma.aiBetSlip.deleteMany({});
-  for (const s of slips) {
-    // Auto-generate a REAL SportyBet booking code for this slip (no bet placed).
-    const booking = await createBookingCode(
-      s.legs.map((l) => ({
-        eventId: l.eventId,
-        marketId: l.marketId,
-        specifier: l.specifier,
-        outcomeId: l.outcomeId,
-      })),
-    );
-    const note = booking.code
-      ? `Real SportyBet booking code — load it on SportyBet, review & stake yourself.${
-          booking.unavailable ? ` (${booking.unavailable} selection(s) dropped as unavailable)` : ""
-        }`
-      : "Auto-booking unavailable right now — enter selections manually on SportyBet.";
+  // ---- Delta booking ----
+  // Recompute every cycle, but reuse an existing booking code when a slip's
+  // selections are unchanged (compare a hash of the current legs to the stored
+  // legs). Only mint a NEW code when the picks actually change, capped per
+  // cycle so a big fixture drop can't burst SportyBet's booking API.
+  const priorSlips = await prisma.aiBetSlip.findMany();
+  const priorByTitle = new Map(priorSlips.map((p) => [p.title, p]));
 
-    await prisma.aiBetSlip.create({
-      data: {
-        title: s.title,
-        codeType: s.codeType,
-        status: "ACTIVE",
-        totalOdds: s.totalOdds,
-        confidence: s.confidence,
-        riskScore: s.riskScore,
-        expectedValue: s.expectedValue,
-        kellyStakePct: s.kellyStakePct,
-        bookingCode: booking.code,
-        bookingCodeNote: note,
-        reasoning: s.reasoning,
-        legs: s.legs as any,
-      },
-    });
+  let booked = 0; // SportyBet booking calls spent this cycle (capped)
+  let kept = 0; // slips whose code was reused unchanged
+  let deferred = 0; // changed slips left for a later cycle (cap reached)
+  const keepIds: string[] = [];
+
+  // Fresh metrics for a slip (everything derived from the legs; not the code).
+  const metricsOf = (s: (typeof slips)[number]) => ({
+    codeType: s.codeType,
+    status: "ACTIVE" as const,
+    totalOdds: s.totalOdds,
+    confidence: s.confidence,
+    riskScore: s.riskScore,
+    expectedValue: s.expectedValue,
+    kellyStakePct: s.kellyStakePct,
+    reasoning: s.reasoning,
+    legs: s.legs as any,
+  });
+
+  for (const s of slips) {
+    const hash = legHash(s.legs);
+    const prior = priorByTitle.get(s.title);
+    const priorHash = prior ? legHash((prior.legs as unknown as Leg[]) ?? []) : "";
+    const sameSelections = !!prior && priorHash === hash;
+
+    // Same picks + we already have a real code → reuse it; just refresh metrics.
+    if (sameSelections && prior!.bookingCode) {
+      kept += 1;
+      await prisma.aiBetSlip.update({ where: { id: prior!.id }, data: metricsOf(s) });
+      keepIds.push(prior!.id);
+      continue;
+    }
+
+    // Picks changed (or we never got a code). Mint a new one within the cap.
+    if (booked < MAX_NEW_BOOKINGS_PER_CYCLE) {
+      booked += 1; // count the call whether or not it succeeds
+      const booking = await createBookingCode(
+        s.legs.map((l) => ({
+          eventId: l.eventId,
+          marketId: l.marketId,
+          specifier: l.specifier,
+          outcomeId: l.outcomeId,
+        })),
+      );
+      await new Promise((r) => setTimeout(r, 400)); // polite spacing
+      const bookingCode = booking.code ?? null;
+      const bookingCodeNote = booking.code
+        ? `Real SportyBet booking code — load it on SportyBet, review & stake yourself.${
+            booking.unavailable ? ` (${booking.unavailable} selection(s) dropped as unavailable)` : ""
+          }`
+        : "Auto-booking unavailable right now — enter selections manually on SportyBet.";
+      const data = { title: s.title, ...metricsOf(s), bookingCode, bookingCodeNote };
+      if (prior) {
+        await prisma.aiBetSlip.update({ where: { id: prior.id }, data });
+        keepIds.push(prior.id);
+      } else {
+        const created = await prisma.aiBetSlip.create({ data });
+        keepIds.push(created.id);
+      }
+      continue;
+    }
+
+    // Cap reached this cycle. Keep the prior slip fully intact (its legs and
+    // code still match) and defer the change to a later cycle — never show new
+    // legs against an old code.
+    if (prior) {
+      deferred += 1;
+      keepIds.push(prior.id);
+    } else {
+      // Brand-new profile with no prior row: show its legs, code pending.
+      const created = await prisma.aiBetSlip.create({
+        data: {
+          title: s.title,
+          ...metricsOf(s),
+          bookingCode: null,
+          bookingCodeNote: "Booking code updating shortly — refreshes next cycle.",
+        },
+      });
+      keepIds.push(created.id);
+    }
   }
+
+  // Drop any slip whose profile is no longer produced this cycle.
+  await prisma.aiBetSlip.deleteMany({ where: { id: { notIn: keepIds } } });
+
+  console.log(
+    `  AI: ${slips.length} slips · ${booked} booked · ${kept} unchanged · ${deferred} deferred`,
+  );
   return slips.length;
 }
