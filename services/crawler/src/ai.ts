@@ -1,24 +1,15 @@
-import { createHash } from "node:crypto";
 import { prisma, Prisma } from "@sportybet/db";
 import { createBookingCode } from "./booker.js";
 import { forebetLegs, legsForTips } from "./forebet-ai.js";
 import { getApiFootballPredictions } from "./apifootball.js";
 
 // Delta booking: recompute slips every cycle, but only mint a NEW SportyBet
-// booking code when a slip's selections actually change — so we can refresh
-// every 3 min without hammering SportyBet's booking API.
+// booking code when a slip's selections actually change (a leg drops out of the
+// pool) — so we can refresh every 3 min without hammering SportyBet's API.
 const MAX_NEW_BOOKINGS_PER_CYCLE = Math.max(1, Number(process.env.AI_MAX_BOOKINGS_PER_CYCLE ?? 3));
-// Rotate the pick selection on a slow clock (default 15 min) so codes stay
-// STABLE between data changes instead of churning every cycle.
+// Rotate the pick selection on a slow clock (default 15 min) so fresh slips
+// vary over time instead of churning every cycle.
 const ROTATE_MS = Math.max(1, Number(process.env.AI_ROTATE_MIN ?? 15)) * 60_000;
-
-/** Stable fingerprint of a slip's bookable selections (order-independent). */
-function legHash(legs: Leg[]): string {
-  const parts = legs
-    .map((l) => `${l.eventId}:${l.marketId ?? ""}:${l.specifier ?? ""}:${l.outcomeId ?? ""}`)
-    .sort();
-  return createHash("sha1").update(parts.join("|")).digest("hex");
-}
 
 /**
  * AI recommendation engine (v1).
@@ -365,21 +356,33 @@ export async function generateAiSlips(): Promise<number> {
     legs: s.legs as any,
   });
 
-  for (const s of slips) {
-    const hash = legHash(s.legs);
-    const prior = priorByTitle.get(s.title);
-    const priorHash = prior ? legHash((prior.legs as unknown as Leg[]) ?? []) : "";
-    const sameSelections = !!prior && priorHash === hash;
+  // Sticky reuse: a booked slip is kept EXACTLY as-is (legs + code) as long as
+  // every one of its legs is still a live, upcoming selection in the pool. This
+  // stops needless rebooking when the candidate pool merely jitters (external
+  // feeds refetch and add/drop a marginal leg). We only rebuild + rebook when a
+  // leg actually drops out of the pool (or a match kicks off).
+  const nowMs = Date.now();
+  const keyOfLeg = (l: Leg) =>
+    `${l.eventId}:${l.marketId ?? ""}:${l.specifier ?? ""}:${l.outcomeId ?? ""}`;
+  const liveKeys = new Set(
+    pool.filter((l) => !l.kickoff || l.kickoff > nowMs).map(keyOfLeg),
+  );
 
-    // Same picks + we already have a real code → reuse it; just refresh metrics.
-    if (sameSelections && prior!.bookingCode) {
-      kept += 1;
-      await prisma.aiBetSlip.update({ where: { id: prior!.id }, data: metricsOf(s) });
-      keepIds.push(prior!.id);
-      continue;
+  for (const s of slips) {
+    const prior = priorByTitle.get(s.title);
+
+    // Sticky: keep the prior slip intact if it has a code and all legs live.
+    if (prior?.bookingCode) {
+      const priorLegs = (prior.legs as unknown as Leg[]) ?? [];
+      const allLive = priorLegs.length >= 2 && priorLegs.every((l) => liveKeys.has(keyOfLeg(l)));
+      if (allLive) {
+        kept += 1;
+        keepIds.push(prior.id); // leave legs + code + metrics exactly as booked
+        continue;
+      }
     }
 
-    // Picks changed (or we never got a code). Mint a new one within the cap.
+    // A leg dropped out (or no code yet). Mint a fresh one within the cap.
     if (booked < MAX_NEW_BOOKINGS_PER_CYCLE) {
       booked += 1; // count the call whether or not it succeeds
       const booking = await createBookingCode(
