@@ -86,7 +86,8 @@ async function main() {
   const telegramChannels: { channel: string; trust: number }[] = [
     { channel: "SportybetOfficialChannel", trust: 0.9 }, // official
     { channel: "bookingcodes", trust: 0.65 },
-    { channel: "sportybetcodes", trust: 0.55 },
+    // NOTE: "sportybetcodes" (plural) is an invalid/dead username on Telegram —
+    // removed in favour of "sportybetcode" (singular), which is the real one.
     { channel: "sportybetcode", trust: 0.5 },
     { channel: "SportyBet_Codes", trust: 0.5 },
     { channel: "betfuse", trust: 0.5 },
