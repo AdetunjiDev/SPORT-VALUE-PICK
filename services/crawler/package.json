@@ -7,6 +7,7 @@
     "dev": "dotenv -e ../../.env -- tsx watch src/index.ts",
     "start": "dotenv -e ../../.env -- tsx src/index.ts",
     "start:docker": "tsx src/index.ts",
+    "telegram:login": "dotenv -e ../../.env -- tsx scripts/telegram-login.ts",
     "scan:once": "dotenv -e ../../.env -- tsx src/runOnce.ts",
     "verify:once": "dotenv -e ../../.env -- tsx src/runVerify.ts",
     "ai:once": "dotenv -e ../../.env -- tsx src/runAi.ts",
@@ -16,7 +17,8 @@
     "@sportybet/db": "workspace:*",
     "@sportybet/shared": "workspace:*",
     "fast-xml-parser": "^4.5.0",
-    "node-tesseract-ocr": "^2.2.1"
+    "node-tesseract-ocr": "^2.2.1",
+    "telegram": "^2.26.22"
   },
   "devDependencies": {
     "@types/node": "^22.7.4",

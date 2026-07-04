@@ -1,10 +1,12 @@
 import { fetchText, stripHtml } from "./http.js";
 import type { RawItem, SourceLike } from "./types.js";
+import { telegramClientEnabled, fetchTelegramViaClient } from "./telegram-client.js";
 
 /**
- * Telegram public channel preview (https://t.me/s/<channel>).
- * This is a PUBLIC, no-auth, sanctioned preview page — not scraping behind a
- * login. Channels like @SportybetOfficialChannel post real booking codes here.
+ * Telegram channel reader. Prefers the OFFICIAL Telegram API (MTProto via
+ * GramJS) when credentials are configured — real-time, works on preview-
+ * disabled channels, and downloads photos for OCR. Falls back to the PUBLIC,
+ * no-auth web preview (https://t.me/s/<channel>) otherwise.
  * config: { channel: "SportybetOfficialChannel" } (falls back to URL slug).
  */
 export async function fetchTelegram(source: SourceLike): Promise<RawItem[]> {
@@ -12,6 +14,17 @@ export async function fetchTelegram(source: SourceLike): Promise<RawItem[]> {
     (source.config as { channel?: string })?.channel ??
     source.url.replace(/\/+$/, "").split("/").pop() ??
     "";
+
+  // Preferred path: official Telegram API. On any failure, fall through to the
+  // public web-preview scraper so a client hiccup never drops a source.
+  if (telegramClientEnabled()) {
+    try {
+      return await fetchTelegramViaClient(channel);
+    } catch (e: any) {
+      console.warn(`  ! telegram client (@${channel}) → web-preview fallback: ${e?.message ?? e}`);
+    }
+  }
+
   const url = `https://t.me/s/${channel}`;
   const html = await fetchText(url, "text/html");
 

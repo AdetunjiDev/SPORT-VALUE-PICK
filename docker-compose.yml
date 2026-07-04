@@ -78,6 +78,13 @@ services:
       APIFOOTBALL_PROVIDER: ${APIFOOTBALL_PROVIDER:-apisports}
       APIFOOTBALL_DAILY_BUDGET: ${APIFOOTBALL_DAILY_BUDGET:-80}
       APIFOOTBALL_PREDS_PER_CYCLE: ${APIFOOTBALL_PREDS_PER_CYCLE:-6}
+      # Telegram official API (MTProto) — inherited from .env if set. All three
+      # blank ⇒ TELEGRAM sources use the public web-preview scrape instead.
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
+      TELEGRAM_SESSION: ${TELEGRAM_SESSION:-}
+      TELEGRAM_MSG_LIMIT: ${TELEGRAM_MSG_LIMIT:-25}
+      TELEGRAM_OCR_PER_CHANNEL: ${TELEGRAM_OCR_PER_CHANNEL:-4}
     depends_on:
       postgres:
         condition: service_healthy

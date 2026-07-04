@@ -13,6 +13,19 @@ export const config = {
   // Default tier when no premium cookie is present. Set to "premium" locally so
   // the owner isn't paywalled while developing; leave unset (→ free) in prod.
   defaultTier: process.env.DEFAULT_TIER === "premium" ? "premium" : "free",
+  // --- Telegram official API (MTProto via GramJS) ---
+  // When apiId/apiHash/session are all set, TELEGRAM sources read messages
+  // through Telegram's official API (real-time, hidden channels, media for OCR)
+  // instead of the public web-preview scrape. Empty ⇒ web-preview fallback.
+  telegram: {
+    apiId: Number(process.env.TELEGRAM_API_ID ?? 0),
+    apiHash: process.env.TELEGRAM_API_HASH ?? "",
+    session: process.env.TELEGRAM_SESSION ?? "",
+    // Recent messages to pull per channel per cycle.
+    messageLimit: Number(process.env.TELEGRAM_MSG_LIMIT ?? 25),
+    // Max images to download + OCR per channel per cycle (bounded cost).
+    ocrPerChannel: Number(process.env.TELEGRAM_OCR_PER_CHANNEL ?? 4),
+  },
   // --- API-Football (api-sports.io) premium data feed ---
   // Empty key ⇒ adapter is a no-op, so the app runs fine without paying. Add a
   // key from your api-sports.io (or RapidAPI) dashboard to switch it on.
