@@ -1,6 +1,7 @@
 import { prisma, Prisma } from "@sportybet/db";
 import { createBookingCode } from "./booker.js";
-import { forebetLegs } from "./forebet-ai.js";
+import { forebetLegs, legsForTips } from "./forebet-ai.js";
+import { getApiFootballPredictions } from "./apifootball.js";
 
 /**
  * AI recommendation engine (v1).
@@ -210,22 +211,36 @@ export async function generateAiSlips(): Promise<number> {
   } catch {
     /* keep going */
   }
-  // Merge Forebet legs into the shared pool (dedupe: same event+market+pick
-  // from a human code counts as extra consensus, not a duplicate entry).
-  const poolKeys = new Set(pool.map((l) => `${l.eventId}|${l.market}|${l.pick}`));
-  for (const l of fbPool) {
-    const key = `${l.eventId}|${l.market}|${l.pick}`;
-    if (poolKeys.has(key)) {
-      const ex = pool.find((p) => `${p.eventId}|${p.market}|${p.pick}` === key)!;
-      ex.consensus += 1;
-      ex.prob = Math.min(0.95, Math.max(ex.prob, l.prob));
-    } else {
-      pool.push(l);
-      poolKeys.add(key);
-    }
+
+  // API-Football (premium, if a key is set) model predictions matched to live
+  // SportyBet fixtures. Empty when the adapter is off — costs nothing then.
+  let afPool: Leg[] = [];
+  try {
+    afPool = await legsForTips(await getApiFootballPredictions());
+  } catch {
+    /* keep going */
   }
 
-  if (pool.length < 2 && fbPool.length < 2) return 0;
+  // Merge external legs into the shared pool (dedupe: the same event+market+pick
+  // from another source counts as extra consensus, not a duplicate entry).
+  const poolKeys = new Set(pool.map((l) => `${l.eventId}|${l.market}|${l.pick}`));
+  const mergeIn = (legs: Leg[]) => {
+    for (const l of legs) {
+      const key = `${l.eventId}|${l.market}|${l.pick}`;
+      if (poolKeys.has(key)) {
+        const ex = pool.find((p) => `${p.eventId}|${p.market}|${p.pick}` === key)!;
+        ex.consensus += 1;
+        ex.prob = Math.min(0.95, Math.max(ex.prob, l.prob));
+      } else {
+        pool.push(l);
+        poolKeys.add(key);
+      }
+    }
+  };
+  mergeIn(fbPool);
+  mergeIn(afPool);
+
+  if (pool.length < 2 && fbPool.length < 2 && afPool.length < 2) return 0;
 
   const profiles: Profile[] = [
     {
@@ -280,6 +295,26 @@ export async function generateAiSlips(): Promise<number> {
     if (fbSlip) {
       fbSlip.reasoning += " Legs sourced from Forebet's 1X2 statistical model.";
       slips.push(fbSlip);
+    }
+  }
+
+  // Dedicated API-Football slip: built purely from the premium model's picks.
+  if (afPool.length >= 2) {
+    const afSlip = buildSlip(
+      afPool,
+      {
+        title: "AI Premium Slip ⭐",
+        codeType: "COMBO",
+        minOdds: 1.15,
+        maxOdds: 8,
+        legs: 4,
+        sort: (a, b) => b.prob - a.prob || b.odds - a.odds,
+      },
+      generation,
+    );
+    if (afSlip) {
+      afSlip.reasoning += " Legs sourced from API-Football's premium prediction model.";
+      slips.push(afSlip);
     }
   }
 
