@@ -1,5 +1,5 @@
 export const config = {
-  port: Number(process.env.CRAWLER_PORT ?? 4100),
+  port: Number(process.env.CRAWLER_PORT ?? 4200),
   defaultIntervalSec: Number(process.env.DEFAULT_CRAWL_INTERVAL_SEC ?? 180),
   // Polite crawler identity — Reddit requires a descriptive User-Agent.
   userAgent:

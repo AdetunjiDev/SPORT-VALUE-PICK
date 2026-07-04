@@ -33,7 +33,7 @@ async function getClient(): Promise<any> {
       new StringSession(config.telegram.session),
       config.telegram.apiId,
       config.telegram.apiHash,
-      { connectionRetries: 3, autoReconnect: true },
+      { connectionRetries: 1, autoReconnect: false },
     );
     // Quiet GramJS's own logging.
     try {
@@ -41,9 +41,17 @@ async function getClient(): Promise<any> {
     } catch {
       /* older versions */
     }
-    await client.connect();
+    try {
+      await client.connect();
+    } catch (err) {
+      // Reset so the next call can retry rather than hanging on this rejected promise.
+      clientPromise = null;
+      throw new Error(`Telegram connect failed (check TELEGRAM_API_ID/HASH/SESSION): ${err}`);
+    }
     return client;
   })();
+  // If the promise itself rejects, clear it so callers can retry.
+  clientPromise.catch(() => { clientPromise = null; });
   return clientPromise;
 }
 
