@@ -9,6 +9,7 @@ import { createBookingCode } from "./booker.js";
 import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
 import { verifyCode } from "./verifier.js";
+import { telegramClientEnabled } from "./adapters/telegram-client.js";
 
 /** Read a request body with a hard size cap (default 10 MB for images). */
 function readBody(req: http.IncomingMessage, maxBytes = 10 * 1024 * 1024): Promise<string> {
@@ -89,6 +90,11 @@ async function renderDashboard(
         SELECT to_char("foundAt" AT TIME ZONE 'Africa/Lagos', 'YYYY-MM-DD') AS d, count(*)::int AS n
         FROM human_codes WHERE status <> 'INVALID' GROUP BY 1 ORDER BY 1 DESC LIMIT 14`,
     ]);
+
+  // Telegram data-source status: are we reading via the OFFICIAL API or the
+  // public web-preview scrape? Surfaced on the dashboard so it's visible.
+  const tgApiLive = telegramClientEnabled();
+  const tgChannels = await prisma.source.count({ where: { enabled: true, type: "TELEGRAM" } });
 
   // Feature the latest ACTIVE code in the hero — never an INVALID/expired one.
   const latest = codes.find((c) => c.status === "ACTIVE") ?? codes[0];
@@ -516,6 +522,19 @@ async function renderDashboard(
           </div>
           <div class="col-side">
             <div class="card">
+              <div class="card-head"><h3>Data sources</h3></div>
+              <div class="src-status">
+                <span class="src-pill ${tgApiLive ? "on" : "off"}">
+                  ${tgApiLive ? "⚡ Telegram API — LIVE" : "🌐 Telegram — web preview"}
+                </span>
+                <div class="muted small">${
+                  tgApiLive
+                    ? `Reading ${tgChannels} channel${tgChannels === 1 ? "" : "s"} in real time via Telegram's official API (MTProto).`
+                    : `Scraping public previews of ${tgChannels} channel${tgChannels === 1 ? "" : "s"}. Add TELEGRAM_* keys for real-time API.`
+                }</div>
+              </div>
+            </div>
+            <div class="card">
               <div class="card-head"><h3>Crawl activity</h3></div>
               <ul class="runs">${runRows || '<li class="muted">No runs yet.</li>'}</ul>
               <div class="muted small mono">${esc(lastSummary)}</div>
@@ -555,6 +574,11 @@ async function renderDashboard(
   .nav-item.on .ni{filter:grayscale(0)}
   .ni{width:20px;text-align:center}
   .side-foot{margin-top:auto;padding:12px 10px 0;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
+  .src-status{display:flex;flex-direction:column;gap:8px}
+  .src-pill{display:inline-flex;align-items:center;gap:6px;align-self:flex-start;padding:6px 12px;
+    border-radius:999px;font-size:12px;font-weight:800;line-height:1.2}
+  .src-pill.on{background:#eafaf1;color:#0f8a52;border:1px solid #c8ecd8}
+  .src-pill.off{background:#fef3e8;color:#b7791f;border:1px solid #f0dcc0}
   .live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:6px;
     box-shadow:0 0 0 0 rgba(22,168,107,.6);animation:pulse 2s infinite}
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(22,168,107,.5)}70%{box-shadow:0 0 0 7px rgba(22,168,107,0)}100%{box-shadow:0 0 0 0 rgba(22,168,107,0)}}
@@ -1227,7 +1251,16 @@ export function startServer() {
       }
       if (url.pathname === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, lastRunAt, nextRunAt, intervalSec, lastSummary }));
+        res.end(
+          JSON.stringify({
+            ok: true,
+            lastRunAt,
+            nextRunAt,
+            intervalSec,
+            lastSummary,
+            telegramApi: telegramClientEnabled() ? "live" : "web-preview",
+          }),
+        );
         return;
       }
       if (url.pathname === "/api/codes") {
