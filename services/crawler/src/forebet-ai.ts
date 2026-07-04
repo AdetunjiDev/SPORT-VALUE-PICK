@@ -233,3 +233,70 @@ export async function bookableTipKeys(tips: ExtPrediction[]): Promise<Set<string
 export async function forebetLegs(): Promise<Leg[]> {
   return legsForTips(await getForebetTips());
 }
+
+// ---- Exposed for Expert Picks: SportyBet's own live fixture+odds feed ----
+// This is the ground truth of what's actually bookable, across every league
+// SportyBet carries (not just the leagues our external prediction sources
+// happen to cover) — Expert Picks scans this directly instead of matching
+// backward from tips, so every pick it returns is guaranteed bookable.
+export type { SbEvent };
+export const getSportyFixtures = sportyEvents;
+export const fuzzyTeamsMatch = teamsMatch;
+
+/**
+ * Book directly against SportyBet's own market favourite (shortest-price 1X2
+ * outcome) for arbitrary "home|away" keys. Used for Expert Picks selections,
+ * which are sourced straight from SportyBet's fixture list rather than an
+ * external tip — so, unlike planForTips(), there's no ExtPrediction/predCode
+ * to look up. Resolves each key against the SAME live fixture list and picks
+ * the SAME favourite Expert Picks displayed, so the booked code always
+ * matches what the user saw.
+ */
+export async function legsForFixtureKeys(
+  keys: string[],
+): Promise<{ legs: Leg[]; matchedKeys: string[] }> {
+  if (!keys.length) return { legs: [], matchedKeys: [] };
+  const events = await sportyEvents();
+  const now = Date.now();
+  const legs: Leg[] = [];
+  const matchedKeys: string[] = [];
+  const used = new Set<string>();
+  for (const key of keys) {
+    const [h, a] = key.split("|");
+    if (!h || !a) continue;
+    const ev = events.find(
+      (e) => e.kickoff > now && !used.has(e.eventId) && teamsMatch(e.home, h) && teamsMatch(e.away, a),
+    );
+    if (!ev) continue;
+    let bestCode: string | null = null;
+    let bestOdds = 0;
+    for (const code of ["1", "X", "2"]) {
+      const odds = ev.outcomes[code];
+      if (odds && odds > 1 && (!bestCode || 1 / odds > 1 / bestOdds)) {
+        bestCode = code;
+        bestOdds = odds;
+      }
+    }
+    if (!bestCode) continue;
+    const meta = PICKS[bestCode];
+    used.add(ev.eventId);
+    legs.push({
+      eventId: ev.eventId,
+      home: ev.home,
+      away: ev.away,
+      league: ev.league,
+      kickoff: ev.kickoff,
+      market: meta.market,
+      pick: meta.label,
+      odds: round(bestOdds, 2),
+      prob: round(Math.min(0.95, 1 / bestOdds)),
+      consensus: 1,
+      foundAt: now,
+      marketId: meta.marketId,
+      specifier: meta.specifier,
+      outcomeId: meta.outcomeId,
+    });
+    matchedKeys.push(key);
+  }
+  return { legs, matchedKeys };
+}

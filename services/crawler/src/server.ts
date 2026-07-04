@@ -4,7 +4,7 @@ import { RESPONSIBLE_GAMBLING_DISCLAIMER } from "@sportybet/shared";
 import { config } from "./config.js";
 import { runCycle, lastRunAt, nextRunAt, lastSummary, intervalSec } from "./scheduler.js";
 import { getPredictions } from "./predictions.js";
-import { planForTips } from "./forebet-ai.js";
+import { planForTips, legsForFixtureKeys } from "./forebet-ai.js";
 import { createBookingCode } from "./booker.js";
 import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
@@ -1435,17 +1435,35 @@ export function startServer() {
         }
         if (keys.length < 1) return json(400, { error: "Select at least 1 match." });
         if (keys.length > 50) return json(400, { error: "Maximum 50 matches per booking code." });
+
+        // Path 1: keys backed by an external tip (Predictions tab cards).
         const preds = await getPredictions();
         const wanted = preds.filter(
           (p) => p.home && p.away && keys.includes(`${p.home}|${p.away}`.toLowerCase()),
         );
-        if (!wanted.length)
-          return json(422, { error: "Selected matches are no longer bookable — refresh and retry." });
-        const { legs, matchedKeys } = await planForTips(wanted);
-        const matchedSet = new Set(matchedKeys);
-        const skipped = wanted
-          .filter((p) => !matchedSet.has(`${p.home}|${p.away}`.toLowerCase()))
-          .map((p) => `${p.home} v ${p.away}`);
+        const { legs: tipLegs, matchedKeys: tipMatched } = wanted.length
+          ? await planForTips(wanted)
+          : { legs: [], matchedKeys: [] as string[] };
+
+        // Path 2: any leftover keys — e.g. from Expert Picks, which sources
+        // selections straight from SportyBet's fixture list rather than an
+        // external tip. Book directly against SportyBet's own favourite for
+        // that fixture (same pick Expert Picks displayed).
+        const remainingKeys = keys.filter((k) => !tipMatched.includes(k));
+        const { legs: directLegs, matchedKeys: directMatched } = await legsForFixtureKeys(remainingKeys);
+
+        const legs = [...tipLegs, ...directLegs];
+        const matchedSet = new Set([...tipMatched, ...directMatched]);
+
+        // Human-readable names for the skip report, preferring proper casing
+        // from whichever source resolved the fixture.
+        const nameByKey = new Map<string, string>();
+        for (const p of wanted) if (p.home && p.away) nameByKey.set(`${p.home}|${p.away}`.toLowerCase(), `${p.home} v ${p.away}`);
+        for (const l of legs) nameByKey.set(`${l.home}|${l.away}`.toLowerCase(), `${l.home} v ${l.away}`);
+        const titleFromKey = (k: string) =>
+          k.split("|").map((s) => s.replace(/\b\w/g, (c) => c.toUpperCase())).join(" v ");
+        const skipped = keys.filter((k) => !matchedSet.has(k)).map((k) => nameByKey.get(k) ?? titleFromKey(k));
+
         if (!legs.length)
           return json(422, {
             error: "None of those matches are on SportyBet right now (kicked off, or not offered) — try other matches.",

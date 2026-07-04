@@ -1,20 +1,31 @@
 import { getPredictions, type ExtPrediction } from "./predictions.js";
-import { bookableTipKeys } from "./forebet-ai.js";
+import { getSportyFixtures, fuzzyTeamsMatch, type SbEvent } from "./forebet-ai.js";
 
 /**
  * "Expert Picks" engine.
  *
- * Acts like a seasoned analyst: it scans every fixture we have a prediction for
- * across the next few days and ranks them by a transparent CONFIDENCE score,
- * blending three real signals:
- *   1. Model probability — Forebet / API-Football win % for the tipped outcome.
- *   2. Market odds       — the bookmaker's own implied probability (1 / odds).
- *   3. Source agreement  — a small boost when a pick is short-priced AND the
- *                          model likes it (the two signals concur).
+ * Scans SportyBet's OWN live fixture + odds feed directly — every league it
+ * carries (100+), not just the handful our external prediction sources happen
+ * to cover — so every pick returned is guaranteed bookable right now. This
+ * matters in practice: external tips (Forebet etc.) often predict a DIFFERENT
+ * fixture in the "same" league (e.g. a different regional zone of a lower
+ * division) than what SportyBet is actually offering that day, so matching
+ * backward from tips to SportyBet routinely comes up empty for anything but
+ * the biggest tournaments. Starting from SportyBet's list avoids that entirely.
  *
- * It returns the N highest-confidence picks the user asks for, spread across a
- * 3–7 day window. These are ESTIMATES ranked by confidence — never guarantees.
- * No pick is "sure"; the score just says which look strongest right now.
+ * Confidence blends:
+ *   1. Market implied probability — SportyBet's own odds for the outcome
+ *      (1 / odds). This is the primary, always-available signal.
+ *   2. External agreement — if a Forebet / API-Football tip exists for the
+ *      SAME fixture and picks the SAME outcome, confidence gets a boost and
+ *      the model's win % is cited alongside the market price.
+ *
+ * A per-league cap keeps one big tournament (World Cup) from dominating every
+ * slot — "search every other football game aside World Cup" — while still
+ * ranking by confidence within that constraint.
+ *
+ * These are estimates ranked by confidence — NEVER guarantees. No pick is
+ * "sure"; anyone claiming 99–100% guaranteed wins is misleading you.
  */
 
 export interface ExpertPick {
@@ -43,55 +54,17 @@ const PICK_LABEL: Record<string, (h: string, a: string) => string> = {
   U35: () => "Under 3.5 Goals",
 };
 
-function impliedFromOdds(odds?: string): number | undefined {
-  const v = Number(odds);
-  if (!Number.isFinite(v) || v <= 1) return undefined;
-  return 1 / v;
-}
-
-/** Confidence 0..1 for a prediction's tipped outcome, with the reasons why. */
-function scoreOf(p: ExtPrediction): { conf: number; reasons: string[] } | null {
-  const code = p.predCode;
-  if (!code || !p.home || !p.away) return null;
-  const reasons: string[] = [];
-  let model: number | undefined;
-
-  // 1) Model probability for 1X2 picks (home/draw/away %).
-  if (p.probs && (code === "1" || code === "X" || code === "2")) {
-    const idx = code === "1" ? 0 : code === "X" ? 1 : 2;
-    const pct = p.probs[idx];
-    if (pct > 0) {
-      model = pct / 100;
-      reasons.push(`${pct}% model win probability`);
-    }
-  }
-
-  // 2) Market implied probability from odds.
-  const implied = impliedFromOdds(p.odds);
-  if (implied) reasons.push(`market odds ${p.odds} (${Math.round(implied * 100)}% implied)`);
-
-  // Blend: average model + market when both present; else whichever we have.
-  let conf: number | undefined;
-  if (model !== undefined && implied !== undefined) {
-    conf = model * 0.6 + implied * 0.4;
-    // 3) Agreement boost when both signals are already strong.
-    if (model >= 0.6 && implied >= 0.6) {
-      conf = Math.min(0.95, conf + 0.05);
-      reasons.push("model & market agree (short price + high win %)");
-    }
-  } else {
-    conf = model ?? implied;
-  }
-  if (conf === undefined) return null;
-
-  reasons.push(`via ${p.source}`);
-  return { conf: Math.min(0.95, conf), reasons };
-}
+// Only 1X2 outcomes are used as the PRIMARY pick — "predict the result" reads
+// naturally as "X to Win" / "Draw", matching how a sports analyst talks. O/U
+// odds are still fetched (SportyBet feed carries them) but not used as the
+// headline pick here.
+const RESULT_CODES = ["1", "X", "2"] as const;
 
 export interface ExpertOptions {
   count: number; // how many picks the user wants
   days: number; // window: fixtures within the next N days (clamped 3..7)
-  minConfidence?: number; // optional hard floor; default is NO floor (see below)
+  minConfidence?: number; // optional hard floor; default is NO floor
+  maxPerLeague?: number; // diversity cap; default scales with count
   seed?: number; // rotation for variety across refreshes
 }
 
@@ -99,82 +72,126 @@ export interface ExpertResult {
   picks: ExpertPick[];
   requested: number;
   windowDays: number;
-  // Total fixtures that were both in-window and bookable on SportyBet, before
-  // ranking — lets the UI explain honestly why fewer than requested came back.
+  // Fixtures that qualified (in-window, has an odds-based pick) before the
+  // per-league diversity cap and the final count slice — lets the UI explain
+  // honestly why fewer than requested came back.
   poolSize: number;
 }
 
-/**
- * The N highest-confidence picks within the date window.
- *
- * No hard confidence cutoff by default: a real analyst still gives you their
- * best N picks even on a thin day, just honestly labelled by confidence
- * (color-coded hi/mid/lo on the card) rather than returning nothing. Pass
- * minConfidence to enforce a floor instead.
- */
+/** Best (shortest-price) 1X2 outcome for a fixture, with its implied prob. */
+function marketFavourite(ev: SbEvent): { code: string; odds: number; implied: number } | null {
+  let best: { code: string; odds: number; implied: number } | null = null;
+  for (const code of RESULT_CODES) {
+    const odds = ev.outcomes[code];
+    if (!odds || odds <= 1) continue;
+    const implied = 1 / odds;
+    if (!best || implied > best.implied) best = { code, odds, implied };
+  }
+  return best;
+}
+
+/** A same-fixture external tip (Forebet / API-Football), if one exists. */
+function findExternalTip(ev: SbEvent, preds: ExtPrediction[]): ExtPrediction | undefined {
+  return preds.find(
+    (p) => p.home && p.away && fuzzyTeamsMatch(p.home, ev.home) && fuzzyTeamsMatch(p.away, ev.away),
+  );
+}
+
+const round = (n: number, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
+
+/** The N highest-confidence, GUARANTEED-BOOKABLE picks within the window. */
 export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertResult> {
   const count = Math.max(1, Math.min(50, Math.floor(opts.count) || 5));
   const days = Math.max(3, Math.min(7, Math.floor(opts.days) || 5));
   const minConf = opts.minConfidence ?? 0;
+  // Diversity cap: scales with how many picks were asked for, floor of 3, so a
+  // big request still spreads across leagues instead of one tournament
+  // filling every slot. (count=5 → cap 3; count=20 → cap 5; count=50 → cap 9)
+  const maxPerLeague = opts.maxPerLeague ?? Math.max(3, Math.ceil(count / 4) + 2);
 
-  const preds = await getPredictions();
   const now = Date.now();
   const maxT = now + days * 86_400_000;
 
-  // Candidate pool first (window + shape), THEN check which are actually
-  // bookable on SportyBet — an expert pick you can't turn into a code isn't
-  // useful, so unbookable matches are filtered out rather than just flagged.
-  type BookableCandidate = ExtPrediction & { home: string; away: string; predCode: NonNullable<ExtPrediction["predCode"]> };
-  const candidates = preds.filter((p): p is BookableCandidate => {
-    if (!p.kickoff || !p.home || !p.away || !p.predCode) return false;
-    const dateOnly = p.kickoff.length <= 10;
-    const start = dateOnly ? new Date(`${p.kickoff}T00:00:00+01:00`).getTime() : new Date(p.kickoff).getTime();
-    const end = dateOnly ? new Date(`${p.kickoff}T23:59:59+01:00`).getTime() : start;
-    return Number.isFinite(end) && end > now && start <= maxT;
-  });
-  let bookable: Set<string>;
-  try {
-    bookable = await bookableTipKeys(candidates);
-  } catch {
-    bookable = new Set(); // SportyBet hiccup — fail open to no picks, not a crash
-  }
+  const [fixtures, preds] = await Promise.all([
+    getSportyFixtures().catch(() => [] as SbEvent[]),
+    getPredictions().catch(() => [] as ExtPrediction[]),
+  ]);
 
   const scored: ExpertPick[] = [];
-  const seen = new Set<string>();
-  for (const p of candidates) {
-    const key = `${p.home}|${p.away}`.toLowerCase();
-    if (!bookable.has(key)) continue; // must be bookable on SportyBet right now
-    if (seen.has(key)) continue;
-    const s = scoreOf(p);
-    if (!s || s.conf < minConf) continue;
-    seen.add(key);
-    const label = (PICK_LABEL[p.predCode] ?? (() => p.tip ?? p.predCode!))(p.home, p.away);
+  for (const ev of fixtures) {
+    if (!ev.kickoff || ev.kickoff <= now || ev.kickoff > maxT) continue; // in window only
+    const fav = marketFavourite(ev);
+    if (!fav) continue; // no usable 1X2 price for this fixture right now
+
+    const reasons: string[] = [`market odds ${fav.odds.toFixed(2)} (${Math.round(fav.implied * 100)}% implied)`];
+    let confidence = fav.implied;
+
+    const tip = findExternalTip(ev, preds);
+    if (tip?.predCode && RESULT_CODES.includes(tip.predCode as (typeof RESULT_CODES)[number])) {
+      const idx = tip.predCode === "1" ? 0 : tip.predCode === "X" ? 1 : 2;
+      const modelPct = tip.probs?.[idx];
+      if (tip.predCode === fav.code) {
+        // External model agrees with SportyBet's own favourite — real signal
+        // agreement, not just one source's opinion.
+        if (modelPct) {
+          confidence = confidence * 0.6 + (modelPct / 100) * 0.4;
+          reasons.push(`${modelPct}% model win probability (${tip.source})`);
+        }
+        confidence = Math.min(0.95, confidence + 0.05);
+        reasons.push(`confirmed by ${tip.source}`);
+      }
+    }
+
+    const label = (PICK_LABEL[fav.code] ?? (() => fav.code))(ev.home, ev.away);
     scored.push({
-      home: p.home,
-      away: p.away,
-      league: p.league,
-      kickoff: p.kickoff,
+      home: ev.home,
+      away: ev.away,
+      league: ev.league,
+      kickoff: new Date(ev.kickoff).toISOString(),
       pick: label,
-      key,
-      confidence: s.conf,
-      odds: p.odds,
-      reasons: s.reasons,
-      source: p.source,
-      url: p.url,
+      key: `${ev.home}|${ev.away}`.toLowerCase(),
+      confidence: round(Math.min(0.95, confidence)),
+      odds: fav.odds.toFixed(2),
+      reasons,
+      source: tip ? `SportyBet + ${tip.source}` : "SportyBet odds",
     });
   }
 
-  // Rank by confidence, then take a slightly wider top band and rotate within
-  // it (variety across refreshes) — still high-confidence, never the long tail.
-  scored.sort((a, b) => b.confidence - a.confidence);
-  const band = scored.slice(0, Math.min(scored.length, count + 6));
+  const eligible = scored.filter((p) => p.confidence >= minConf);
+  eligible.sort((a, b) => b.confidence - a.confidence);
+
+  // Greedy selection with a per-league cap so one tournament (World Cup, the
+  // biggest thing on the board right now) can't fill every slot — spreads
+  // across whatever other leagues SportyBet is carrying today.
+  const leagueCount = new Map<string, number>();
+  const diversified: ExpertPick[] = [];
+  for (const p of eligible) {
+    const lg = p.league ?? "—";
+    const n = leagueCount.get(lg) ?? 0;
+    if (n >= maxPerLeague) continue;
+    leagueCount.set(lg, n + 1);
+    diversified.push(p);
+  }
+  // If the cap left slots unfilled (few leagues in total), backfill from the
+  // remainder ignoring the cap rather than under-deliver on the count.
+  if (diversified.length < Math.min(count, eligible.length)) {
+    const used = new Set(diversified.map((p) => p.key));
+    for (const p of eligible) {
+      if (diversified.length >= Math.min(count + 6, eligible.length)) break;
+      if (!used.has(p.key)) {
+        used.add(p.key);
+        diversified.push(p);
+      }
+    }
+    diversified.sort((a, b) => b.confidence - a.confidence);
+  }
+
+  // Rotate within a slightly wider top band for variety across refreshes.
+  const band = diversified.slice(0, Math.min(diversified.length, count + 6));
   const off = band.length ? (((opts.seed ?? 0) % band.length) + band.length) % band.length : 0;
-  const chosen = band
-    .slice(off)
-    .concat(band.slice(0, off))
-    .slice(0, count);
+  const chosen = band.slice(off).concat(band.slice(0, off)).slice(0, count);
 
   // Present soonest kick-off first.
   chosen.sort((a, b) => new Date(a.kickoff ?? 0).getTime() - new Date(b.kickoff ?? 0).getTime());
-  return { picks: chosen, requested: count, windowDays: days, poolSize: scored.length };
+  return { picks: chosen, requested: count, windowDays: days, poolSize: eligible.length };
 }
