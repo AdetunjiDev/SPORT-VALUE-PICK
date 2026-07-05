@@ -10,7 +10,7 @@ import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
 import { verifyCode } from "./verifier.js";
 import { telegramClientEnabled } from "./adapters/telegram-client.js";
-import { getExpertPicks, type GameType } from "./analyst.js";
+import { getExpertPicks, getExpertRecord, type GameType } from "./analyst.js";
 
 /** Read a request body with a hard size cap (default 10 MB for images). */
 function readBody(req: http.IncomingMessage, maxBytes = 10 * 1024 * 1024): Promise<string> {
@@ -71,6 +71,7 @@ async function renderDashboard(
         })
       : { picks: [], requested: 0, windowDays: 0, poolSize: 0 };
   const expertPicks = expertResult.picks;
+  const expertRecord = mode === "expert" ? await getExpertRecord().catch(() => null) : null;
   const isPremium = tier === "premium";
   const freshCut = Date.now() - config.freeDelayMin * 60_000;
 
@@ -553,7 +554,53 @@ async function renderDashboard(
     })
     .join("");
 
+  // ---- Track record card: honest, settled hit-rate by confidence band ----
+  const pct1 = (n: number | null) => (n === null ? "—" : `${Math.round(n * 100)}%`);
+  const recordCard = (() => {
+    if (!expertRecord) return "";
+    const r = expertRecord;
+    if (r.totalSettled === 0) {
+      return `<div class="xrecord card">
+        <div class="xrec-head"><b>📊 Track record</b><span class="muted small">building — ${r.pending} pick${r.pending === 1 ? "" : "s"} awaiting results</span></div>
+        <div class="muted small">Every recommendation is logged and checked against the real final score after kickoff. Verified win-rate by confidence band appears here once matches finish — an honest, auditable record, not a marketing number.</div>
+      </div>`;
+    }
+    const bandBars = r.bands
+      .filter((b) => b.total > 0)
+      .map((b) => {
+        const hit = b.hitRate ?? 0;
+        return `<div class="xband">
+          <span class="xband-l">${b.label}</span>
+          <div class="xband-track"><div class="xband-fill" style="width:${Math.round(hit * 100)}%"></div></div>
+          <span class="xband-v">${pct1(b.hitRate)} <small>(${b.won}/${b.total})</small></span>
+        </div>`;
+      })
+      .join("");
+    const recentRows = r.recent
+      .map((x) => {
+        const icon = x.outcome === "WON" ? "✅" : x.outcome === "LOST" ? "❌" : "➖";
+        return `<div class="xrec-row">
+          <span>${icon} ${esc(x.home)} v ${esc(x.away)}</span>
+          <span class="muted">${esc(x.pickLabel)}${x.finalScore ? ` · ${esc(x.finalScore)}` : ""} · ${Math.round(x.confidence * 100)}%</span>
+        </div>`;
+      })
+      .join("");
+    return `<div class="xrecord card">
+      <div class="xrec-head"><b>📊 Track record</b><span class="muted small">verified against real final scores · updates automatically</span></div>
+      <div class="xrec-top">
+        <div class="xrec-big"><b>${pct1(r.hitRate)}</b><small>overall hit rate</small></div>
+        <div class="xrec-stat"><b>${r.won}</b><small>won</small></div>
+        <div class="xrec-stat"><b>${r.lost}</b><small>lost</small></div>
+        <div class="xrec-stat"><b>${r.totalSettled}</b><small>settled</small></div>
+        <div class="xrec-stat"><b>${r.pending}</b><small>pending</small></div>
+      </div>
+      ${bandBars ? `<div class="xbands"><div class="muted small" style="margin-bottom:6px">Win rate by confidence band (does higher confidence really win more?)</div>${bandBars}</div>` : ""}
+      ${recentRows ? `<div class="xrecent"><div class="muted small" style="margin:10px 0 4px">Recently settled</div>${recentRows}</div>` : ""}
+    </div>`;
+  })();
+
   const expertBody = `
+    ${recordCard}
     <div class="xhead card">
       <div>
         <h3 style="margin:0">🎯 Expert Picks — confidence-ranked</h3>
@@ -723,6 +770,23 @@ async function renderDashboard(
   .btn:disabled{opacity:.7;cursor:default}
   /* Expert Picks */
   .xshort{padding:12px 16px;margin-bottom:14px;font-size:13px;background:#eef1fb;border:1px solid #d8ddf5;color:#3a3f6b}
+  /* Track record */
+  .xrecord{padding:16px 18px;margin-bottom:16px}
+  .xrec-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+  .xrec-top{display:flex;gap:22px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px}
+  .xrec-big b{font-size:32px;line-height:1;color:var(--green)}
+  .xrec-big small,.xrec-stat small{display:block;font-size:11px;color:var(--muted);margin-top:3px}
+  .xrec-stat b{font-size:20px;line-height:1}
+  .xbands{border-top:1px solid var(--line);padding-top:10px}
+  .xband{display:flex;align-items:center;gap:10px;margin:5px 0;font-size:12px}
+  .xband-l{width:56px;font-weight:700;color:#59617a;flex-shrink:0}
+  .xband-track{flex:1;height:10px;background:#eef1f8;border-radius:999px;overflow:hidden}
+  .xband-fill{height:100%;background:linear-gradient(90deg,var(--indigo),var(--green));border-radius:999px}
+  .xband-v{width:96px;text-align:right;font-weight:700;flex-shrink:0}
+  .xband-v small{color:var(--muted);font-weight:500}
+  .xrecent{border-top:1px solid var(--line);padding-top:8px}
+  .xrec-row{display:flex;justify-content:space-between;gap:12px;padding:4px 0;font-size:12.5px;border-bottom:1px solid var(--line)}
+  .xrec-row:last-child{border-bottom:0}
   .xhead{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:18px}
   .xform{display:flex;align-items:end;gap:10px;flex-wrap:wrap}
   .xform label{display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
@@ -1452,6 +1516,12 @@ export function startServer() {
         const data = await getPredictions();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ data, meta: { total: data.length } }));
+        return;
+      }
+      if (url.pathname === "/api/expert/record") {
+        const data = await getExpertRecord();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(data));
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/predictions/book") {

@@ -48,6 +48,9 @@ export interface ExpertPick {
   reasons: string[];
   source: string;
   url?: string;
+  eventId?: string; // SportyBet sr:match: id — for result tracking
+  pickCode?: string; // 1 | X | 2 | O15 | … — for settlement
+  market?: string; // "1X2" | "Over/Under"
 }
 
 const PICK_LABEL: Record<string, (h: string, a: string) => string> = {
@@ -143,6 +146,7 @@ export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertResult>
     }
 
     const label = (PICK_LABEL[fav.code] ?? (() => fav.code))(ev.home, ev.away);
+    const isGoals = fav.code.startsWith("O") || fav.code.startsWith("U");
     scored.push({
       home: ev.home,
       away: ev.away,
@@ -154,6 +158,9 @@ export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertResult>
       odds: fav.odds.toFixed(2),
       reasons,
       source: tip ? `SportyBet + ${tip.source}` : "SportyBet odds",
+      eventId: ev.eventId,
+      pickCode: fav.code,
+      market: isGoals ? "Over/Under" : "1X2",
     });
   }
 
@@ -194,4 +201,252 @@ export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertResult>
   // Present soonest kick-off first.
   chosen.sort((a, b) => new Date(a.kickoff ?? 0).getTime() - new Date(b.kickoff ?? 0).getTime());
   return { picks: chosen, requested: count, windowDays: days, poolSize: eligible.length };
+}
+
+// =====================================================================
+// TRACK RECORD — honest, auditable hit-rate for Expert Picks
+// =====================================================================
+// Each cycle we log the engine's current top recommendations, then settle
+// finished ones against SportyBet's OWN final score (factsCenter/event, keyed
+// by the SportyBet event id we already store) — no external API, no
+// cross-matching. Over time this proves whether the confidence % is real.
+
+import { prisma } from "@sportybet/db";
+import { config } from "./config.js";
+
+const EVENT_API = "https://www.sportybet.com/api/ng/factsCenter/event?eventId=";
+
+/**
+ * Snapshot the engine's current top result-market picks into the log (deduped
+ * by event+pickCode). Logs a broad, confidence-diverse set — not just the very
+ * top — so the record can show calibration across confidence bands.
+ */
+export async function logExpertPicks(): Promise<number> {
+  // A wide, 7-day result-market sweep with no confidence floor and a generous
+  // per-league cap gives a representative sample of what the engine recommends.
+  const { picks } = await getExpertPicks({
+    count: 40,
+    days: 7,
+    gameType: "result",
+    minConfidence: 0,
+    maxPerLeague: 8,
+  });
+  let logged = 0;
+  for (const p of picks) {
+    if (!p.eventId || !p.pickCode || !p.kickoff) continue;
+    try {
+      await prisma.expertPickLog.upsert({
+        where: { eventId_pickCode: { eventId: p.eventId, pickCode: p.pickCode } },
+        // Never overwrite a settled/confidence record; keep the first read.
+        update: {},
+        create: {
+          eventId: p.eventId,
+          home: p.home,
+          away: p.away,
+          league: p.league,
+          kickoff: new Date(p.kickoff),
+          market: p.market ?? "1X2",
+          pickCode: p.pickCode,
+          pickLabel: p.pick,
+          confidence: p.confidence,
+          odds: Number(p.odds) || 0,
+        },
+      });
+      logged += 1;
+    } catch {
+      /* dupe race / transient — skip */
+    }
+  }
+  return logged;
+}
+
+/** Did this pick win, given a "H:A" final score? null = void/unknown. */
+function settlePick(pickCode: string, score: string): boolean | null {
+  const m = score.match(/(\d+)\s*:\s*(\d+)/);
+  if (!m) return null;
+  const h = Number(m[1]);
+  const a = Number(m[2]);
+  const total = h + a;
+  switch (pickCode) {
+    case "1":
+      return h > a;
+    case "X":
+      return h === a;
+    case "2":
+      return h < a;
+    case "O15":
+      return total >= 2;
+    case "O25":
+      return total >= 3;
+    case "O35":
+      return total >= 4;
+    case "U15":
+      return total <= 1;
+    case "U25":
+      return total <= 2;
+    case "U35":
+      return total <= 3;
+    default:
+      return null;
+  }
+}
+
+async function fetchEventScore(
+  eventId: string,
+): Promise<{ ended: boolean; score?: string } | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.fetchTimeoutMs);
+  try {
+    const res = await fetch(`${EVENT_API}${encodeURIComponent(eventId)}`, {
+      headers: {
+        "User-Agent": config.userAgent,
+        Accept: "application/json",
+        Referer: "https://www.sportybet.com/",
+        ClientId: "web",
+      },
+      signal: controller.signal,
+    });
+    const json: any = await res.json().catch(() => null);
+    const d = json?.data;
+    if (!d) return null;
+    // status 4 / matchStatus "Ended" = finished; setScore is "H:A".
+    const ended = Number(d.status) === 4 || d.matchStatus === "Ended";
+    return { ended, score: d.setScore ?? undefined };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Settle logged picks whose match has finished (kickoff older than ~2.5h),
+ * against SportyBet's own final score. Capped per cycle to stay polite.
+ */
+export async function settleExpertPicks(limit = 12): Promise<{ settled: number; won: number }> {
+  const cutoff = new Date(Date.now() - 2.5 * 60 * 60 * 1000); // give matches time to finish
+  const pending = await prisma.expertPickLog.findMany({
+    where: { outcome: "PENDING", kickoff: { lt: cutoff } },
+    orderBy: { kickoff: "asc" },
+    take: limit,
+  });
+  let settled = 0;
+  let won = 0;
+  for (const p of pending) {
+    const r = await fetchEventScore(p.eventId);
+    if (!r) continue;
+    if (!r.ended || !r.score) {
+      // Not finished after this long (postponed/abandoned) — void after 24h.
+      if (Date.now() - p.kickoff.getTime() > 24 * 60 * 60 * 1000) {
+        await prisma.expertPickLog.update({
+          where: { id: p.id },
+          data: { outcome: "VOID", settledAt: new Date() },
+        });
+      }
+      continue;
+    }
+    const win = settlePick(p.pickCode, r.score);
+    if (win === null) {
+      await prisma.expertPickLog.update({
+        where: { id: p.id },
+        data: { outcome: "VOID", finalScore: r.score, settledAt: new Date() },
+      });
+      continue;
+    }
+    await prisma.expertPickLog.update({
+      where: { id: p.id },
+      data: { outcome: win ? "WON" : "LOST", finalScore: r.score, settledAt: new Date() },
+    });
+    settled += 1;
+    if (win) won += 1;
+    await new Promise((res) => setTimeout(res, 300)); // polite pacing
+  }
+  return { settled, won };
+}
+
+export interface RecordBand {
+  label: string;
+  lo: number;
+  hi: number;
+  won: number;
+  lost: number;
+  total: number;
+  hitRate: number | null; // null until any settled
+}
+
+export interface ExpertRecord {
+  totalSettled: number;
+  won: number;
+  lost: number;
+  hitRate: number | null;
+  pending: number;
+  bands: RecordBand[];
+  recent: {
+    home: string;
+    away: string;
+    pickLabel: string;
+    confidence: number;
+    outcome: string;
+    finalScore: string | null;
+    kickoff: Date;
+  }[];
+}
+
+/** Aggregate the settled log into an overall + per-confidence-band hit rate. */
+export async function getExpertRecord(): Promise<ExpertRecord> {
+  const [settledRows, pendingCount, recent] = await Promise.all([
+    prisma.expertPickLog.findMany({
+      where: { outcome: { in: ["WON", "LOST"] } },
+      select: { confidence: true, outcome: true },
+    }),
+    prisma.expertPickLog.count({ where: { outcome: "PENDING" } }),
+    prisma.expertPickLog.findMany({
+      where: { outcome: { in: ["WON", "LOST", "VOID"] } },
+      orderBy: { settledAt: "desc" },
+      take: 12,
+      select: {
+        home: true,
+        away: true,
+        pickLabel: true,
+        confidence: true,
+        outcome: true,
+        finalScore: true,
+        kickoff: true,
+      },
+    }),
+  ]);
+
+  const bandDefs: [string, number, number][] = [
+    ["50–59%", 0.5, 0.6],
+    ["60–69%", 0.6, 0.7],
+    ["70–79%", 0.7, 0.8],
+    ["80–89%", 0.8, 0.9],
+    ["90%+", 0.9, 1.01],
+  ];
+  const bands: RecordBand[] = bandDefs.map(([label, lo, hi]) => {
+    const inBand = settledRows.filter((r) => r.confidence >= lo && r.confidence < hi);
+    const won = inBand.filter((r) => r.outcome === "WON").length;
+    const total = inBand.length;
+    return {
+      label,
+      lo,
+      hi,
+      won,
+      lost: total - won,
+      total,
+      hitRate: total ? won / total : null,
+    };
+  });
+
+  const won = settledRows.filter((r) => r.outcome === "WON").length;
+  const total = settledRows.length;
+  return {
+    totalSettled: total,
+    won,
+    lost: total - won,
+    hitRate: total ? won / total : null,
+    pending: pendingCount,
+    bands,
+    recent,
+  };
 }

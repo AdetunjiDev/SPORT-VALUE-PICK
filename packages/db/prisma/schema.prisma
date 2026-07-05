@@ -631,3 +631,30 @@ model AuditLog {
   @@index([entity, entityId])
   @@map("audit_logs")
 }
+
+// Track record for Expert Picks: each distinct recommendation the engine makes
+// is logged once, then settled after kickoff against SportyBet's own final
+// score (factsCenter/event) — giving an HONEST, auditable hit-rate by
+// confidence band instead of a theoretical percentage.
+model ExpertPickLog {
+  id         String     @id @default(cuid())
+  eventId    String // SportyBet sr:match: id — used to fetch the final score
+  home       String
+  away       String
+  league     String?
+  kickoff    DateTime
+  market     String // "1X2" | "Over/Under"
+  pickCode   String // 1 | X | 2 | O15 | O25 | O35 | U15 | U25 | U35
+  pickLabel  String // human-readable, e.g. "Spain to Win"
+  confidence Float // 0..1 (de-vigged) at time of logging
+  odds       Float
+  outcome    BetOutcome @default(PENDING)
+  finalScore String? // "3:0" once settled
+  settledAt  DateTime?
+  createdAt  DateTime   @default(now())
+
+  // One row per fixture+pick — re-shown picks update rather than duplicate.
+  @@unique([eventId, pickCode])
+  @@index([outcome, kickoff])
+  @@map("expert_pick_logs")
+}

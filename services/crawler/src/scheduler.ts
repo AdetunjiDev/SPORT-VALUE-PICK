@@ -2,6 +2,7 @@ import { crawlAll } from "./crawler.js";
 import { verifyPending } from "./verifier.js";
 import { generateAiSlips } from "./ai.js";
 import { getPredictions } from "./predictions.js";
+import { logExpertPicks, settleExpertPicks } from "./analyst.js";
 import { config } from "./config.js";
 
 let running = false;
@@ -42,10 +43,25 @@ export async function runCycle(trigger: string): Promise<string> {
     } catch {
       /* keep going */
     }
+    // Expert Picks track record: log current recommendations + settle finished
+    // ones against SportyBet's own final scores. Both are best-effort and must
+    // never break the crawl cycle.
+    let logged = 0;
+    let settled = { settled: 0, won: 0 };
+    try {
+      logged = await logExpertPicks();
+    } catch {
+      /* keep going */
+    }
+    try {
+      settled = await settleExpertPicks(12);
+    } catch {
+      /* keep going */
+    }
     cycleCount += 1;
     lastRunAt = new Date();
     const aiPart = aiSlips < 0 ? "AI kept" : `${aiSlips} AI slips`;
-    lastSummary = `[${trigger}] ${results.length} sources · ${items} items · ${codes} new · ${verified} verified (${active} active) · ${aiPart} · ${predCount} predictions · ${failed} failed · ${Date.now() - started}ms`;
+    lastSummary = `[${trigger}] ${results.length} sources · ${items} items · ${codes} new · ${verified} verified (${active} active) · ${aiPart} · ${predCount} predictions · ${logged} picks logged · ${settled.settled} settled · ${failed} failed · ${Date.now() - started}ms`;
     console.log(lastSummary);
     for (const r of results.filter((x) => x.error)) {
       console.warn(`  ! ${r.sourceName}: ${r.error}`);
