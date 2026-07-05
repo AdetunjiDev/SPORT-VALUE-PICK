@@ -44,7 +44,7 @@ function stars(n: number): string {
   return "★".repeat(v) + "☆".repeat(5 - v);
 }
 
-type Mode = "human" | "ai" | "pred" | "expert";
+type Mode = "human" | "ai" | "pred" | "expert" | "saved";
 type Tier = "free" | "premium";
 
 async function renderDashboard(
@@ -72,6 +72,12 @@ async function renderDashboard(
       : { picks: [], requested: 0, windowDays: 0, poolSize: 0 };
   const expertPicks = expertResult.picks;
   const expertRecord = mode === "expert" ? await getExpertRecord().catch(() => null) : null;
+  const savedCodes =
+    mode === "saved"
+      ? await prisma.generatedCode
+          .findMany({ orderBy: { createdAt: "desc" }, take: 200 })
+          .catch(() => [])
+      : [];
   const isPremium = tier === "premium";
   const freshCut = Date.now() - config.freeDelayMin * 60_000;
 
@@ -489,8 +495,20 @@ async function renderDashboard(
   const avgConf = expertPicks.length
     ? Math.round((expertPicks.reduce((a, p) => a + p.confidence, 0) / expertPicks.length) * 100)
     : 0;
+  const savedByCount = new Set(savedCodes.map((c) => c.generatorName)).size;
+  const savedToday = savedCodes.filter(
+    (c) =>
+      new Date(c.createdAt).toLocaleDateString("en-CA", { timeZone: "Africa/Lagos" }) ===
+      new Date().toLocaleDateString("en-CA", { timeZone: "Africa/Lagos" }),
+  ).length;
   const kpis =
-    mode === "expert"
+    mode === "saved"
+      ? `
+      ${kpi("💾", savedCodes.length, "codes saved", "indigo")}
+      ${kpi("📅", savedToday, "saved today", "green")}
+      ${kpi("👥", savedByCount, "contributors", "orange")}
+      ${kpi("🎟️", savedCodes.reduce((a, c) => a + c.games, 0), "games booked", "blue")}`
+      : mode === "expert"
       ? `
       ${kpi("🎯", expertPicks.length, "expert picks", "indigo")}
       ${kpi("📊", avgConf ? `${avgConf}%` : "—", "avg confidence", "green")}
@@ -517,6 +535,7 @@ async function renderDashboard(
   const slipBar = `
     <div id="slipbar" class="slipbar" hidden>
       <span class="sb-info">🎟️ <b id="slipcount">0</b> selected</span>
+      <input id="genname" class="sb-name" placeholder="Your name" maxlength="60" title="Saved with the generated code"/>
       <button class="btn" id="genbtn" onclick="genCode(this)">⚡ Generate SportyBet Code</button>
       <span id="slipres"></span>
       <button class="btn ghost sm" onclick="clearSel()">Clear</button>
@@ -653,8 +672,65 @@ async function renderDashboard(
       '<div class="card empty">No bookable fixtures match your filters — try widening the days (up to a month), loosening the minimum confidence, or including more game types.</div>'
     }</div>${slipBar}`;
 
+  // ---- Saved Codes ledger: every generated code + who made it, when ----
+  const savedRows = savedCodes
+    .map((c) => {
+      const dt = new Date(c.createdAt);
+      const day = dt.toLocaleDateString("en-GB", {
+        weekday: "short",
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        timeZone: "Africa/Lagos",
+      });
+      const time = dt.toLocaleTimeString("en-GB", {
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: "Africa/Lagos",
+      });
+      const legs = Array.isArray(c.legs) ? (c.legs as any[]) : [];
+      const matchList = legs
+        .slice(0, 6)
+        .map((l) => `${esc(l.home ?? "")} v ${esc(l.away ?? "")} — ${esc(l.pick ?? "")}`)
+        .join("<br/>");
+      const more = legs.length > 6 ? `<div class="muted small">+${legs.length - 6} more…</div>` : "";
+      return `
+      <div class="sc-row">
+        <div class="sc-when">
+          <div class="sc-day">${esc(day)}</div>
+          <div class="sc-time">⏰ ${esc(time)} WAT</div>
+          <div class="sc-by">👤 ${esc(c.generatorName)}</div>
+          <span class="tag ${c.origin === "expert" ? "green" : "indigo"}">${c.origin === "expert" ? "Expert" : "Predictions"}</span>
+        </div>
+        <div class="sc-mid">
+          <div class="sc-matches">${matchList || '<span class="muted">—</span>'}</div>
+          ${more}
+        </div>
+        <div class="sc-right">
+          <span class="slipcode ccopy" title="Click to copy" onclick="cp(this,'${esc(c.code)}')">${esc(c.code)}</span>
+          <div class="sc-meta">${c.games} games · ${esc(String(c.totalOdds))} odds</div>
+          <a class="btn ghost sm" target="_blank" rel="noopener" href="https://www.sportybet.com/ng/?shareCode=${esc(c.code)}">Open ↗</a>
+        </div>
+      </div>`;
+    })
+    .join("");
+  const savedBody = `
+    <div class="sc-head card">
+      <div>
+        <h3 style="margin:0">💾 Saved Codes</h3>
+        <div class="muted small">Every booking code generated in the app is saved here automatically — stamped with the day, time (WAT) and the name of whoever generated it.</div>
+      </div>
+      <div class="sc-count"><b>${savedCodes.length}</b><small>saved</small></div>
+    </div>
+    <div class="sc-list">${
+      savedRows ||
+      '<div class="card empty">No codes saved yet. Generate one from Expert Picks or the Predictions tab — enter your name when prompted, and it will appear here with the date and time.</div>'
+    }</div>`;
+
   const body =
-    mode === "expert"
+    mode === "saved"
+      ? savedBody
+      : mode === "expert"
       ? expertBody
       : mode === "pred"
       ? `<div class="pred-hint card">✨ <b>Build your own code:</b> tick <i>“➕ Add to slip”</i> on any predictions below (pick 1 to 50), then hit <b>Generate SportyBet Code</b> — you get a real booking code to copy, just like the human ones. Matches SportyBet doesn't offer are skipped automatically.</div>
@@ -868,6 +944,24 @@ async function renderDashboard(
   .slipcode{display:inline-block;background:#141a2e;color:#7df0b8;font-family:ui-monospace,Consolas,monospace;
     font-size:16px;font-weight:800;letter-spacing:2px;padding:7px 14px;border-radius:9px;cursor:pointer}
   .slipcode:hover{filter:brightness(1.2)}
+  .sb-name{padding:8px 12px;border:1px solid var(--line);border-radius:9px;font-size:13px;width:130px;
+    background:#f7f9fc;outline:none}
+  .sb-name:focus{border-color:var(--primary);background:#fff}
+  /* Saved Codes ledger */
+  .sc-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:16px;flex-wrap:wrap}
+  .sc-count{text-align:center}.sc-count b{font-size:26px;display:block;line-height:1;color:var(--indigo)}
+  .sc-count small{font-size:11px;color:var(--muted)}
+  .sc-list{display:flex;flex-direction:column;gap:10px}
+  .sc-row{display:flex;gap:16px;align-items:stretch;background:var(--card);border:1px solid var(--line);
+    border-radius:14px;padding:14px 16px;box-shadow:var(--shadow)}
+  .sc-when{flex-shrink:0;width:180px;display:flex;flex-direction:column;gap:3px;font-size:12px}
+  .sc-day{font-weight:800;font-size:13px}
+  .sc-time,.sc-by{color:#59617a}
+  .sc-when .tag{align-self:flex-start;margin-top:4px}
+  .sc-mid{flex:1;min-width:0;font-size:12.5px;line-height:1.5;border-left:1px solid var(--line);padding-left:16px}
+  .sc-right{flex-shrink:0;display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+  .sc-meta{font-size:11px;color:var(--muted)}
+  @media(max-width:720px){ .sc-row{flex-direction:column} .sc-when{width:auto} .sc-mid{border-left:0;padding-left:0;border-top:1px solid var(--line);padding-top:10px} .sc-right{align-items:flex-start} }
   /* Drag-and-drop overlay */
   #dropzone{position:fixed;inset:0;z-index:70;background:rgba(20,26,46,.55);display:grid;place-items:center;
     opacity:0;pointer-events:none;transition:opacity .15s}
@@ -1050,6 +1144,7 @@ async function renderDashboard(
     ${nav("ai", "🤖", "AI Codes", mode === "ai")}
     ${nav("pred", "📈", "Predictions", mode === "pred")}
     ${nav("expert", "🎯", "Expert Picks", mode === "expert")}
+    ${nav("saved", "💾", "Saved Codes", mode === "saved")}
     <div class="nav-label">Data</div>
     <a class="nav-item" href="/api/codes" target="_blank"><span class="ni">🔗</span>Codes API</a>
     <a class="nav-item" href="/api/ai-slips" target="_blank"><span class="ni">🧠</span>AI Slips API</a>
@@ -1062,8 +1157,8 @@ async function renderDashboard(
   <div class="app">
     <div class="topbar">
       <div>
-        <h1>${mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
-        <div class="sub">${mode === "expert" ? "Confidence-ranked picks across your chosen window — estimates, never guarantees" : mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
+        <h1>${mode === "saved" ? "Saved Codes" : mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
+        <div class="sub">${mode === "saved" ? "Every generated code — with the day, time and who made it" : mode === "expert" ? "Confidence-ranked picks across your chosen window — estimates, never guarantees" : mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
       </div>
       <div class="search"><input id="search" placeholder="Search codes, leagues, sources…" oninput="flt(this.value)"/></div>
       <div class="top-right">
@@ -1190,26 +1285,36 @@ async function renderDashboard(
     document.querySelectorAll('input[type=checkbox][data-key]').forEach(function(cb){
       if(cb.checked){ SEL[cb.getAttribute('data-key')] = 1; var c = cb.closest('.xcard'); if(c) c.classList.add('picked'); }
     });
+    // Prefill the saved generator name so it's remembered across visits.
+    try{ var n = localStorage.getItem('genName'); var el = document.getElementById('genname'); if(n && el) el.value = n; }catch(e){}
     updBar();
   })();
   async function genCode(btn){
     var keys = Object.keys(SEL);
     if(keys.length < 1){ showToast('Pick at least 1 match first','warn'); return; }
     if(keys.length > 50){ showToast('Maximum 50 matches per code — remove some','warn'); return; }
+    // Capture the generator's name (remembered per browser). Prompt once if unset.
+    var nameEl = document.getElementById('genname');
+    var name = (nameEl && nameEl.value.trim()) || '';
+    if(!name){ try{ name = localStorage.getItem('genName') || ''; }catch(e){} }
+    if(!name){ name = (prompt('Your name (saved with this code):') || '').trim(); }
+    if(!name){ showToast('Enter your name to save the code','warn'); return; }
+    try{ localStorage.setItem('genName', name); }catch(e){}
+    if(nameEl && !nameEl.value) nameEl.value = name;
     btn.disabled = true; var o = btn.textContent; btn.textContent = '⚡ Booking on SportyBet…';
     try{
       // On the Expert Picks page, tell the server which game type (1X2 /
       // Over-Under / both) was selected, so it books the SAME market it
       // displayed rather than re-deriving a possibly different one.
       var xtype = document.getElementById('xtype');
-      var body = {keys:keys};
+      var body = {keys:keys, name:name, origin: xtype ? 'expert' : 'predictions'};
       if(xtype) body.gameType = xtype.value;
       var r = await fetch('/api/predictions/book',{method:'POST',
         headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
       var j = await r.json();
       if(j.code){
         var skipped = j.skipped || [];
-        var note = j.matched + ' of ' + j.requested + ' games booked';
+        var note = j.matched + ' of ' + j.requested + ' games booked' + (j.savedBy ? ' · saved by '+j.savedBy : '');
         document.getElementById('slipres').innerHTML =
           '<span class="slipcode ccopy" title="Click to copy" onclick="cp(this,\\''+j.code+'\\')">'+j.code+'</span>'+
           '<a class="btn ghost sm" target="_blank" rel="noopener" href="https://www.sportybet.com/ng/?shareCode='+j.code+'">Open ↗</a>'+
@@ -1430,7 +1535,9 @@ export function startServer() {
             ? "pred"
             : modeParam === "expert"
               ? "expert"
-              : "human";
+              : modeParam === "saved"
+                ? "saved"
+                : "human";
       const tier: Tier =
         config.defaultTier === "premium" ||
         /(?:^|;\s*)tier=premium(?:;|$)/.test(req.headers.cookie ?? "")
@@ -1533,10 +1640,14 @@ export function startServer() {
         };
         let keys: string[] = [];
         let gameType: GameType = "result";
+        let generatorName = "Anonymous";
+        let origin = "predictions";
         try {
           const body = JSON.parse((await readBody(req, 64 * 1024)) || "{}");
           keys = Array.isArray(body.keys) ? body.keys.map((k: unknown) => String(k)) : [];
           if (body.gameType === "goals" || body.gameType === "both") gameType = body.gameType;
+          if (body.name) generatorName = String(body.name).trim().slice(0, 60) || "Anonymous";
+          if (body.origin === "expert") origin = "expert";
         } catch {
           return json(400, { error: "Bad request body." });
         }
@@ -1586,6 +1697,32 @@ export function startServer() {
         if (!booking.code)
           return json(502, { error: "SportyBet booking failed — try again in a minute." });
         const totalOdds = Math.round(legs.reduce((a, l) => a * l.odds, 1) * 100) / 100;
+
+        // Save the generated code to the ledger with day+time (createdAt) and
+        // who generated it. Best-effort — never fail the booking over this.
+        try {
+          await prisma.generatedCode.create({
+            data: {
+              code: booking.code,
+              url: booking.url,
+              generatorName,
+              origin,
+              games: booking.games ?? legs.length,
+              totalOdds,
+              legs: legs.map((l) => ({
+                home: l.home,
+                away: l.away,
+                league: l.league,
+                pick: l.pick,
+                odds: l.odds,
+                kickoff: l.kickoff,
+              })) as any,
+            },
+          });
+        } catch {
+          /* ledger save failed — booking still succeeded, continue */
+        }
+
         return json(200, {
           code: booking.code,
           url: booking.url,
@@ -1594,6 +1731,7 @@ export function startServer() {
           matched: legs.length,
           skipped,
           totalOdds,
+          savedBy: generatorName,
         });
       }
       if (req.method === "POST" && url.pathname === "/api/ocr") {

@@ -632,6 +632,25 @@ model AuditLog {
   @@map("audit_logs")
 }
 
+// Ledger of booking codes GENERATED through the app (Expert Picks / slip
+// builder). Every code is saved with the day+time it was made and the name of
+// the person who generated it — an auditable history of who created what.
+model GeneratedCode {
+  id            String   @id @default(cuid())
+  code          String // SportyBet booking code
+  url           String?
+  generatorName String   @default("Anonymous") // who generated it
+  origin        String   @default("expert") // "expert" | "predictions"
+  games         Int      @default(0)
+  totalOdds     Float    @default(1)
+  legs          Json? // [{ home, away, league, pick, odds, kickoff }]
+  createdAt     DateTime @default(now()) // the day + time it was generated
+
+  @@index([generatorName, createdAt])
+  @@index([createdAt])
+  @@map("generated_codes")
+}
+
 // Track record for Expert Picks: each distinct recommendation the engine makes
 // is logged once, then settled after kickoff against SportyBet's own final
 // score (factsCenter/event) — giving an HONEST, auditable hit-rate by
