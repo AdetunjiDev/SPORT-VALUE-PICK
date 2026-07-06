@@ -6,8 +6,15 @@ import { logExpertPicks, settleExpertPicks } from "./analyst.js";
 import { config } from "./config.js";
 
 let running = false;
+let runningSince = 0; // when the in-flight cycle started (for the stuck-cycle watchdog)
 let timer: NodeJS.Timeout | null = null;
+let watchdog: NodeJS.Timeout | null = null;
 let cycleCount = 0;
+
+// A cycle normally takes ~60–120s. If `running` has been true far longer than
+// that, the process was almost certainly frozen mid-cycle (host sleep/
+// hibernate) and the flag is stuck — force-clear it so scanning can resume.
+const STUCK_MS = 5 * 60 * 1000;
 export let lastRunAt: Date | null = null;
 export let nextRunAt: Date | null = null;
 export let lastSummary = "";
@@ -21,8 +28,16 @@ const AI_EVERY = Math.max(1, Number(process.env.AI_REGEN_EVERY_CYCLES ?? 1));
 
 /** Run one full crawl cycle unless one is already in flight. */
 export async function runCycle(trigger: string): Promise<string> {
-  if (running) return "A crawl is already running.";
+  if (running) {
+    // Watchdog: a normal cycle never runs this long — if it has, the previous
+    // cycle is stuck (e.g. host slept mid-scan) so reset and proceed.
+    if (Date.now() - runningSince < STUCK_MS) return "A crawl is already running.";
+    console.warn(
+      `Stuck cycle detected (${Math.round((Date.now() - runningSince) / 1000)}s) — resetting and resuming.`,
+    );
+  }
   running = true;
+  runningSince = Date.now();
   try {
     const started = Date.now();
     const results = await crawlAll();
@@ -82,8 +97,23 @@ export function startScheduler() {
     nextRunAt = new Date(Date.now() + intervalMs);
     void runCycle("scheduled");
   }, intervalMs);
+
+  // Catch-up watchdog: setInterval timers pause while the host is asleep, so
+  // after a long sleep the main tick can be badly overdue. This lightweight
+  // 60s check notices when we've missed the schedule (or a cycle got stuck)
+  // and kicks a scan immediately on wake — no manual restart needed.
+  watchdog = setInterval(() => {
+    if (running) return; // a healthy cycle is in flight
+    const overdue = !lastRunAt || Date.now() - lastRunAt.getTime() > intervalMs * 1.5;
+    if (overdue) {
+      console.warn("Watchdog: scan overdue (likely resumed from sleep) — running catch-up cycle.");
+      nextRunAt = new Date(Date.now() + intervalMs);
+      void runCycle("watchdog");
+    }
+  }, 60 * 1000);
 }
 
 export function stopScheduler() {
   if (timer) clearInterval(timer);
+  if (watchdog) clearInterval(watchdog);
 }
