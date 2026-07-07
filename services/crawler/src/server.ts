@@ -10,7 +10,7 @@ import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
 import { verifyCode } from "./verifier.js";
 import { telegramClientEnabled } from "./adapters/telegram-client.js";
-import { getExpertPicks, getExpertRecord, getValuePicks, type GameType } from "./analyst.js";
+import { getExpertPicks, getExpertRecord, getExpertRoi, getValuePicks, type GameType } from "./analyst.js";
 
 const GAME_TYPES: GameType[] = ["result", "goals", "double", "dnb", "btts", "teamgoals", "safe", "both"];
 const validGameType = (v: unknown): GameType =>
@@ -76,6 +76,7 @@ async function renderDashboard(
       : { picks: [], requested: 0, windowDays: 0, poolSize: 0 };
   const expertPicks = expertResult.picks;
   const expertRecord = mode === "expert" ? await getExpertRecord().catch(() => null) : null;
+  const expertRoi = mode === "expert" ? await getExpertRoi().catch(() => null) : null;
   const valueResult =
     mode === "value"
       ? await getValuePicks({
@@ -643,8 +644,71 @@ async function renderDashboard(
     </div>`;
   })();
 
+  // ---- ROI / profit card: does flat-staking actually make money? ----
+  const roiCard = (() => {
+    if (!expertRoi || expertRoi.settled === 0) return "";
+    const r = expertRoi;
+    const units = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(2)}u`;
+    const roiPct = r.roi === null ? "—" : `${r.roi >= 0 ? "+" : ""}${Math.round(r.roi * 100)}%`;
+    const good = (r.profit ?? 0) >= 0;
+
+    // Profit sparkline: cumulative units over settled picks.
+    const curve = r.curve;
+    const w = 320;
+    const h = 64;
+    let spark = "";
+    if (curve.length >= 2) {
+      const min = Math.min(0, ...curve);
+      const max = Math.max(0, ...curve);
+      const range = max - min || 1;
+      const x = (i: number) => (i / (curve.length - 1)) * w;
+      const y = (v: number) => h - ((v - min) / range) * h;
+      const pts = curve.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+      const zeroY = y(0).toFixed(1);
+      const col = good ? "var(--green)" : "var(--bad)";
+      spark = `<svg class="roi-spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+        <line x1="0" y1="${zeroY}" x2="${w}" y2="${zeroY}" stroke="var(--line)" stroke-width="1" stroke-dasharray="3 3"/>
+        <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2"/>
+      </svg>`;
+    }
+
+    const bandRows = r.bands
+      .filter((b) => b.settled > 0)
+      .map(
+        (b) =>
+          `<div class="roi-row"><span class="roi-l">${b.label}</span><span class="roi-n">${b.settled} bets</span><span class="roi-p ${b.profit >= 0 ? "up" : "down"}">${units(b.profit)}</span><span class="roi-r ${(b.roi ?? 0) >= 0 ? "up" : "down"}">${b.roi === null ? "—" : `${b.roi >= 0 ? "+" : ""}${Math.round(b.roi * 100)}%`}</span></div>`,
+      )
+      .join("");
+    const mktRows = r.markets
+      .filter((b) => b.settled > 0)
+      .map(
+        (b) =>
+          `<div class="roi-row"><span class="roi-l">${esc(b.label)}</span><span class="roi-n">${b.settled} bets</span><span class="roi-p ${b.profit >= 0 ? "up" : "down"}">${units(b.profit)}</span><span class="roi-r ${(b.roi ?? 0) >= 0 ? "up" : "down"}">${b.roi === null ? "—" : `${b.roi >= 0 ? "+" : ""}${Math.round(b.roi * 100)}%`}</span></div>`,
+      )
+      .join("");
+
+    return `<div class="xrecord card">
+      <div class="xrec-head"><b>💰 Profit & ROI</b><span class="muted small">flat 1-unit stake per pick · the honest "did it make money?" test</span></div>
+      <div class="roi-top">
+        <div class="roi-big ${good ? "up" : "down"}"><b>${units(r.profit)}</b><small>profit (flat stakes)</small></div>
+        <div class="roi-stat ${good ? "up" : "down"}"><b>${roiPct}</b><small>ROI</small></div>
+        <div class="roi-stat"><b>${r.settled}</b><small>bets settled</small></div>
+        <div class="roi-stat"><b>${r.avgOdds ?? "—"}</b><small>avg odds</small></div>
+        <div class="roi-spark-wrap">${spark}</div>
+      </div>
+      <div class="roi-note muted small">${
+        good
+          ? `📈 Flat-staking every pick would be <b>up ${units(r.profit)}</b> (${roiPct} ROI) over ${r.settled} settled bets.`
+          : `📉 Honestly: flat-staking every pick would be <b>down ${units(r.profit)}</b> (${roiPct} ROI) over ${r.settled} bets. High hit-rate at short odds doesn't guarantee profit — this is why ROI matters more than win-rate.`
+      } Still a small sample; give it time to grow.</div>
+      ${bandRows ? `<div class="roi-block"><div class="muted small" style="margin:8px 0 4px">Profit by confidence band</div>${bandRows}</div>` : ""}
+      ${mktRows ? `<div class="roi-block"><div class="muted small" style="margin:8px 0 4px">Profit by market</div>${mktRows}</div>` : ""}
+    </div>`;
+  })();
+
   const expertBody = `
     ${recordCard}
+    ${roiCard}
     <div class="xhead card">
       <div>
         <h3 style="margin:0">🎯 Expert Picks — daily recommendations</h3>
@@ -986,6 +1050,21 @@ async function renderDashboard(
   .xrecent{border-top:1px solid var(--line);padding-top:8px}
   .xrec-row{display:flex;justify-content:space-between;gap:12px;padding:4px 0;font-size:12.5px;border-bottom:1px solid var(--line)}
   .xrec-row:last-child{border-bottom:0}
+  /* ROI / profit */
+  .roi-top{display:flex;gap:22px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+  .roi-big b{font-size:30px;line-height:1}
+  .roi-big.up b,.roi-stat.up b{color:var(--green)} .roi-big.down b,.roi-stat.down b{color:var(--bad)}
+  .roi-big small,.roi-stat small{display:block;font-size:11px;color:var(--muted);margin-top:3px}
+  .roi-stat b{font-size:20px;line-height:1}
+  .roi-spark-wrap{flex:1;min-width:180px}
+  .roi-spark{width:100%;height:64px}
+  .roi-note{border-top:1px solid var(--line);padding-top:10px;line-height:1.5}
+  .roi-block{border-top:1px solid var(--line);padding-top:8px;margin-top:8px}
+  .roi-row{display:grid;grid-template-columns:1fr auto 72px 60px;gap:10px;align-items:center;padding:4px 0;font-size:12.5px;border-bottom:1px solid var(--line)}
+  .roi-row:last-child{border-bottom:0}
+  .roi-l{font-weight:700;color:#475069} .roi-n{color:var(--muted);font-size:11px;text-align:right}
+  .roi-p,.roi-r{text-align:right;font-weight:800}
+  .roi-p.up,.roi-r.up{color:var(--green)} .roi-p.down,.roi-r.down{color:var(--bad)}
   .xhead{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:18px}
   .xform{display:flex;align-items:end;gap:10px;flex-wrap:wrap}
   .xform label{display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
@@ -1771,6 +1850,12 @@ export function startServer() {
       }
       if (url.pathname === "/api/expert/record") {
         const data = await getExpertRecord();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(data));
+        return;
+      }
+      if (url.pathname === "/api/expert/roi") {
+        const data = await getExpertRoi();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(data));
         return;

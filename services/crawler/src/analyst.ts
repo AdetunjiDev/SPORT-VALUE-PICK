@@ -671,3 +671,105 @@ export async function getExpertRecord(): Promise<ExpertRecord> {
     recent,
   };
 }
+
+// =====================================================================
+// ROI / PROFIT — does flat-staking the picks actually make money?
+// =====================================================================
+// The honest test of a tipster: not hit-rate, but return on investment.
+// Flat stake = 1 unit per settled pick. WON → +(odds−1), LOST → −1, VOID → 0
+// (stake refunded, so it doesn't count toward staked). ROI = profit / staked.
+
+export interface RoiBand {
+  label: string;
+  settled: number;
+  won: number;
+  profit: number;
+  roi: number | null;
+}
+export interface ExpertRoi {
+  settled: number; // WON + LOST (void excluded — stake refunded)
+  won: number;
+  lost: number;
+  voided: number;
+  staked: number; // = settled (1 unit each)
+  profit: number; // units
+  roi: number | null; // profit / staked
+  avgOdds: number | null;
+  bands: RoiBand[];
+  markets: RoiBand[]; // reuse shape, label = market
+  curve: number[]; // cumulative profit after each settled pick, in time order
+}
+
+const profitOf = (outcome: string, odds: number): number =>
+  outcome === "WON" ? odds - 1 : outcome === "LOST" ? -1 : 0;
+
+export async function getExpertRoi(): Promise<ExpertRoi> {
+  const rows = await prisma.expertPickLog.findMany({
+    where: { outcome: { in: ["WON", "LOST", "VOID"] } },
+    orderBy: { settledAt: "asc" },
+    select: { confidence: true, odds: true, outcome: true, market: true },
+  });
+
+  const nonVoid = rows.filter((r) => r.outcome !== "VOID");
+  const won = nonVoid.filter((r) => r.outcome === "WON").length;
+  const staked = nonVoid.length;
+  const profit = nonVoid.reduce((a, r) => a + profitOf(r.outcome, r.odds), 0);
+  const avgOdds = staked ? nonVoid.reduce((a, r) => a + r.odds, 0) / staked : null;
+
+  // Cumulative profit curve (settled non-void picks, in settle order).
+  let run = 0;
+  const curve = nonVoid.map((r) => {
+    run += profitOf(r.outcome, r.odds);
+    return round(run, 2);
+  });
+
+  // By confidence band.
+  const bandDefs: [string, number, number][] = [
+    ["50–59%", 0.5, 0.6],
+    ["60–69%", 0.6, 0.7],
+    ["70–79%", 0.7, 0.8],
+    ["80–89%", 0.8, 0.9],
+    ["90%+", 0.9, 1.01],
+  ];
+  const bands: RoiBand[] = bandDefs.map(([label, lo, hi]) => {
+    const inb = nonVoid.filter((r) => r.confidence >= lo && r.confidence < hi);
+    const p = inb.reduce((a, r) => a + profitOf(r.outcome, r.odds), 0);
+    return {
+      label,
+      settled: inb.length,
+      won: inb.filter((r) => r.outcome === "WON").length,
+      profit: round(p, 2),
+      roi: inb.length ? round(p / inb.length, 4) : null,
+    };
+  });
+
+  // By market.
+  const marketNames = [...new Set(nonVoid.map((r) => r.market))];
+  const markets: RoiBand[] = marketNames
+    .map((mk) => {
+      const inm = nonVoid.filter((r) => r.market === mk);
+      const p = inm.reduce((a, r) => a + profitOf(r.outcome, r.odds), 0);
+      return {
+        label: mk,
+        settled: inm.length,
+        won: inm.filter((r) => r.outcome === "WON").length,
+        profit: round(p, 2),
+        roi: inm.length ? round(p / inm.length, 4) : null,
+      };
+    })
+    .sort((a, b) => b.settled - a.settled);
+
+  return {
+    settled: staked,
+    won,
+    lost: staked - won,
+    voided: rows.length - staked,
+    staked,
+    profit: round(profit, 2),
+    roi: staked ? round(profit / staked, 4) : null,
+    avgOdds: avgOdds ? round(avgOdds, 2) : null,
+    bands,
+    markets,
+    curve,
+  };
+}
