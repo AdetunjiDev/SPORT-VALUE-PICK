@@ -10,7 +10,14 @@ import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
 import { verifyCode } from "./verifier.js";
 import { telegramClientEnabled } from "./adapters/telegram-client.js";
-import { getExpertPicks, getExpertRecord, getExpertRoi, getValuePicks, type GameType } from "./analyst.js";
+import {
+  getExpertPicks,
+  getExpertRecord,
+  getExpertRoi,
+  getValuePicks,
+  getCombos,
+  type GameType,
+} from "./analyst.js";
 
 const GAME_TYPES: GameType[] = ["result", "goals", "double", "dnb", "btts", "teamgoals", "safe", "both"];
 const validGameType = (v: unknown): GameType =>
@@ -48,7 +55,7 @@ function stars(n: number): string {
   return "★".repeat(v) + "☆".repeat(5 - v);
 }
 
-type Mode = "human" | "ai" | "pred" | "expert" | "value" | "saved";
+type Mode = "human" | "ai" | "pred" | "expert" | "value" | "combo" | "saved";
 type Tier = "free" | "premium";
 
 async function renderDashboard(
@@ -85,6 +92,10 @@ async function renderDashboard(
           seed: Math.floor(Date.now() / (8 * 60_000)),
         }).catch(() => ({ picks: [], requested: 0, windowDays: 0, scanned: 0 }))
       : { picks: [], requested: 0, windowDays: 0, scanned: 0 };
+  const combos =
+    mode === "combo"
+      ? await getCombos(Math.floor(Date.now() / (10 * 60_000))).catch(() => [])
+      : [];
   const savedCodes =
     mode === "saved"
       ? await prisma.generatedCode
@@ -520,8 +531,15 @@ async function renderDashboard(
   const bestEv = valueResult.picks.length
     ? Math.round(Math.max(...valueResult.picks.map((p) => p.ev)) * 100)
     : 0;
+  const bestCombo = combos.length ? Math.max(...combos.map((c) => c.combinedOdds)) : 0;
   const kpis =
-    mode === "value"
+    mode === "combo"
+      ? `
+      ${kpi("🎰", combos.length, "combos ready", "indigo")}
+      ${kpi("💎", combos.filter((c) => c.kind === "value").length, "value combos", "green")}
+      ${kpi("🚀", bestCombo ? bestCombo.toFixed(1) : "—", "biggest odds", "orange")}
+      ${kpi("⏱️", "10m", "auto-rebuild", "blue")}`
+      : mode === "value"
       ? `
       ${kpi("💎", valueResult.picks.length, "value picks", "indigo")}
       ${kpi("📈", valueResult.picks.length ? `+${avgEv}%` : "—", "avg expected value", "green")}
@@ -912,8 +930,55 @@ async function renderDashboard(
       '<div class="card empty">No codes saved yet. Generate one from Expert Picks or the Predictions tab — enter your name when prompted, and it will appear here with the date and time.</div>'
     }</div>`;
 
+  // ---- Value Combos: ready-made accumulators to book in one click ----
+  const kindClass = (k: string) => (k === "value" ? "vk" : k === "big" ? "bk" : "sk");
+  const comboCards = combos
+    .map((c) => {
+      const legRows = c.legs
+        .map((l) => {
+          const kick = l.kickoff
+            ? new Date(l.kickoff).toLocaleString("en", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos" })
+            : "TBD";
+          return `<div class="cmb-leg"><span class="cmb-m">${esc(l.home)} v ${esc(l.away)}</span><span class="cmb-p">${esc(l.pick)} <b>@${l.odds.toFixed(2)}</b></span><span class="cmb-k muted">${esc(kick)}</span></div>`;
+        })
+        .join("");
+      const keysAttr = esc(JSON.stringify(c.legs.map((l) => l.key)));
+      const evLine =
+        c.totalEv !== null
+          ? ` · <span class="up">+${Math.round(c.totalEv * 100)}% combined EV</span>`
+          : c.avgConfidence !== null
+            ? ` · ${Math.round(c.avgConfidence * 100)}% avg confidence`
+            : "";
+      return `
+      <div class="cmb-card ${kindClass(c.kind)}">
+        <div class="cmb-head">
+          <div><span class="cmb-title">${c.emoji} ${esc(c.title)}</span><div class="muted small">${esc(c.note)}${evLine}</div></div>
+          <div class="cmb-odds"><b>${c.combinedOdds.toFixed(2)}</b><small>${c.legs.length} legs · total odds</small></div>
+        </div>
+        <div class="cmb-legs">${legRows}</div>
+        <div class="cmb-foot">
+          <button class="btn" data-keys="${keysAttr}" onclick="bookCombo(this)">⚡ Generate this combo code</button>
+          <span class="cmb-res"></span>
+        </div>
+      </div>`;
+    })
+    .join("");
+  const comboBody = `
+    <div class="xhead card">
+      <div>
+        <h3 style="margin:0">🎰 Value Combos — ready-made accumulators</h3>
+        <div class="muted small">Auto-assembled every ~10 min from the current Value and Expert picks into ready combos across odds tiers — pick one and book it in a single click. 💎 value combos combine model-edge overlays; 🏦 bankers combine short-priced high-hit-rate picks; 🚀 big-odds go for a larger payout. All football (the only sport we can model for value). Estimates, not guarantees — accumulators are higher variance: every leg must land.</div>
+      </div>
+    </div>
+    <div class="cmb-list">${
+      comboCards ||
+      '<div class="card empty">No combos available right now — not enough qualifying picks in the current window. They rebuild automatically as fixtures and model coverage come in (busiest mid-day WAT).</div>'
+    }</div>`;
+
   const body =
-    mode === "saved"
+    mode === "combo"
+      ? comboBody
+      : mode === "saved"
       ? savedBody
       : mode === "value"
       ? valueBody
@@ -1097,6 +1162,22 @@ async function renderDashboard(
     padding:2px 8px;border-radius:999px;margin-bottom:6px;display:inline-block}
   .xanalysis{display:inline-block;margin-top:7px;font-size:12px;font-weight:700;color:var(--indigo)}
   .xanalysis:hover{text-decoration:underline}
+  /* Value Combos */
+  .cmb-list{display:flex;flex-direction:column;gap:14px}
+  .cmb-card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px;box-shadow:var(--shadow);border-left:4px solid var(--indigo)}
+  .cmb-card.vk{border-left-color:#7b5bd6} .cmb-card.sk{border-left-color:var(--green)} .cmb-card.bk{border-left-color:var(--primary)}
+  .cmb-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:10px}
+  .cmb-title{font-weight:800;font-size:16px}
+  .cmb-odds{text-align:right;flex-shrink:0}
+  .cmb-odds b{font-size:24px;line-height:1;color:var(--indigo)} .cmb-odds small{display:block;font-size:10px;color:var(--muted)}
+  .cmb-legs{border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:6px 0;margin-bottom:12px}
+  .cmb-leg{display:grid;grid-template-columns:1fr auto auto;gap:12px;align-items:center;padding:5px 0;font-size:12.5px}
+  .cmb-m{font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cmb-p{white-space:nowrap} .cmb-p b{color:var(--indigo)}
+  .cmb-k{font-size:11px;white-space:nowrap}
+  .cmb-foot{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .cmb-res{display:flex;align-items:center;gap:8px}
+  @media(max-width:640px){ .cmb-leg{grid-template-columns:1fr auto} .cmb-k{display:none} }
   /* Auto-recommended value banner */
   .vauto{padding:14px 18px;margin-bottom:16px;background:linear-gradient(120deg,#f3f0ff,#eef6ff);border:1px solid #ddd6f5}
   .vauto-head{font-size:14px;font-weight:800;margin-bottom:10px}
@@ -1365,6 +1446,7 @@ async function renderDashboard(
     ${nav("pred", "📈", "Predictions", mode === "pred")}
     ${nav("expert", "🎯", "Expert Picks", mode === "expert")}
     ${nav("value", "💎", "Value Picks", mode === "value")}
+    ${nav("combo", "🎰", "Value Combos", mode === "combo")}
     ${nav("saved", "💾", "Saved Codes", mode === "saved")}
     <div class="nav-label">Data</div>
     <a class="nav-item" href="/api/codes" target="_blank"><span class="ni">🔗</span>Codes API</a>
@@ -1378,8 +1460,8 @@ async function renderDashboard(
   <div class="app">
     <div class="topbar">
       <div>
-        <h1>${mode === "value" ? "Value Picks" : mode === "saved" ? "Saved Codes" : mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
-        <div class="sub">${mode === "value" ? "Higher-odds opportunities where a model beats the market price — EV-ranked, estimates not guarantees" : mode === "saved" ? "Every generated code — with the day, time and who made it" : mode === "expert" ? "Confidence-ranked picks across your chosen window — estimates, never guarantees" : mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
+        <h1>${mode === "combo" ? "Value Combos" : mode === "value" ? "Value Picks" : mode === "saved" ? "Saved Codes" : mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
+        <div class="sub">${mode === "combo" ? "Ready-made accumulators auto-built from the best picks — book one in a click" : mode === "value" ? "Higher-odds opportunities where a model beats the market price — EV-ranked, estimates not guarantees" : mode === "saved" ? "Every generated code — with the day, time and who made it" : mode === "expert" ? "Confidence-ranked picks across your chosen window — estimates, never guarantees" : mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
       </div>
       <div class="search"><input id="search" placeholder="Search codes, leagues, sources…" oninput="flt(this.value)"/></div>
       <div class="top-right">
@@ -1510,6 +1592,29 @@ async function renderDashboard(
     try{ var n = localStorage.getItem('genName'); var el = document.getElementById('genname'); if(n && el) el.value = n; }catch(e){}
     updBar();
   })();
+  // One-click book a ready-made combo (Value Combos tab).
+  async function bookCombo(btn){
+    var keys;
+    try{ keys = JSON.parse(btn.getAttribute('data-keys')||'[]'); }catch(e){ keys = []; }
+    if(!keys || !keys.length){ showToast('This combo has no legs','warn'); return; }
+    var name = '';
+    try{ name = localStorage.getItem('genName') || ''; }catch(e){}
+    if(!name){ name = (prompt('Your name (saved with this code):')||'').trim(); if(name){ try{ localStorage.setItem('genName',name); }catch(e){} } }
+    if(!name){ showToast('Enter your name to save the code','warn'); return; }
+    var res = btn.parentElement.querySelector('.cmb-res');
+    btn.disabled = true; var o = btn.textContent; btn.textContent = '⚡ Booking…';
+    try{
+      var r = await fetch('/api/predictions/book',{method:'POST',headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({keys:keys, name:name, origin:'combo'})});
+      var j = await r.json();
+      if(j.code){
+        if(res) res.innerHTML = '<span class="slipcode ccopy" title="Click to copy" onclick="cp(this,\\''+j.code+'\\')">'+j.code+'</span>'+
+          '<a class="btn ghost sm" target="_blank" rel="noopener" href="https://www.sportybet.com/ng/?shareCode='+j.code+'">Open ↗</a>';
+        showToast('✅ Combo code '+j.code+' — '+j.matched+' legs, '+(j.totalOdds||'—')+' odds. Click to copy.','ok');
+      } else { showToast(j.error || 'Booking failed — try again shortly','warn'); }
+    }catch(e){ showToast('Booking failed — network error','warn'); }
+    btn.disabled = false; btn.textContent = o;
+  }
   async function genCode(btn){
     var keys = Object.keys(SEL);
     if(keys.length < 1){ showToast('Pick at least 1 match first','warn'); return; }
@@ -1758,9 +1863,11 @@ export function startServer() {
               ? "expert"
               : modeParam === "value"
                 ? "value"
-                : modeParam === "saved"
-                  ? "saved"
-                  : "human";
+                : modeParam === "combo"
+                  ? "combo"
+                  : modeParam === "saved"
+                    ? "saved"
+                    : "human";
       const tier: Tier =
         config.defaultTier === "premium" ||
         /(?:^|;\s*)tier=premium(?:;|$)/.test(req.headers.cookie ?? "")
@@ -1876,7 +1983,7 @@ export function startServer() {
           keys = Array.isArray(body.keys) ? body.keys.map((k: unknown) => String(k)) : [];
           gameType = validGameType(body.gameType);
           if (body.name) generatorName = String(body.name).trim().slice(0, 60) || "Anonymous";
-          if (body.origin === "expert") origin = "expert";
+          if (body.origin === "expert" || body.origin === "combo") origin = String(body.origin);
         } catch {
           return json(400, { error: "Bad request body." });
         }

@@ -395,6 +395,133 @@ export async function getValuePicks(opts: ValueOptions): Promise<ValueResult> {
 }
 
 // =====================================================================
+// COMBOS — ready-made accumulators auto-assembled from the best picks
+// =====================================================================
+// Combines multiple picks into one slip at different risk/odds tiers, so the
+// user can book a whole "combined game" in one click. Value combos are built
+// from the model-edge Value Picks (football — the only sport we can model);
+// banker/big-odds combos from the confidence engine. Combined odds = product
+// of the legs. Refreshed every cycle (rotation seed), all legs bookable.
+
+export interface ComboLeg {
+  home: string;
+  away: string;
+  league?: string;
+  kickoff?: string;
+  pick: string;
+  odds: number;
+  key: string; // bookable key (carries the explicit outcome code)
+  confidence: number; // 0..1 for this leg
+  ev?: number; // value legs only
+}
+export interface Combo {
+  id: string;
+  title: string;
+  emoji: string;
+  kind: "value" | "safe" | "big";
+  note: string;
+  legs: ComboLeg[];
+  combinedOdds: number;
+  avgConfidence: number | null; // mean model/confidence across legs
+  totalEv: number | null; // combined EV for value combos (∏(1+ev) − 1)
+}
+
+const asLeg = (p: {
+  home: string;
+  away: string;
+  league?: string;
+  kickoff?: string;
+  pick: string;
+  odds?: string;
+  key: string;
+  pickCode?: string;
+  confidence: number;
+  ev?: number;
+}): ComboLeg => ({
+  home: p.home,
+  away: p.away,
+  league: p.league,
+  kickoff: p.kickoff,
+  pick: p.pick,
+  odds: Number(p.odds) || 0,
+  // Always carry the EXACT pick code in the key so booking reproduces the
+  // displayed selection (e.g. a Double Chance safe pick), not the re-derived
+  // 1X2 favourite. Value keys are already home|away|code; this makes all combo
+  // legs consistent.
+  key: p.pickCode ? `${p.home}|${p.away}|${p.pickCode}`.toLowerCase() : p.key,
+  confidence: p.confidence,
+  ev: p.ev,
+});
+const comboOdds = (legs: ComboLeg[]) => round(legs.reduce((a, l) => a * (l.odds || 1), 1), 2);
+const comboConf = (legs: ComboLeg[]) =>
+  legs.length ? round(legs.reduce((a, l) => a + l.confidence, 0) / legs.length) : null;
+const comboEv = (legs: ComboLeg[]) =>
+  legs.some((l) => l.ev !== undefined)
+    ? round(legs.reduce((a, l) => a * (1 + (l.ev ?? 0)), 1) - 1)
+    : null;
+
+/**
+ * Auto-build a menu of ready-made accumulators to choose from. Pulls the
+ * current Value Picks (edge-based) and Safe/Result Expert Picks, then composes
+ * several combos across odds tiers. Sparse inputs simply yield fewer combos.
+ */
+export async function getCombos(seed = 0): Promise<Combo[]> {
+  const [safe, value, result] = await Promise.all([
+    getExpertPicks({ count: 30, days: 21, gameType: "safe", minConfidence: 0.7, seed }),
+    getValuePicks({ count: 25, days: 21, seed }),
+    getExpertPicks({ count: 40, days: 21, gameType: "result", minConfidence: 0.55, seed }),
+  ]);
+  const combos: Combo[] = [];
+  const push = (
+    id: string,
+    title: string,
+    emoji: string,
+    kind: Combo["kind"],
+    note: string,
+    legs: ComboLeg[],
+  ) => {
+    combos.push({
+      id,
+      title,
+      emoji,
+      kind,
+      note,
+      legs,
+      combinedOdds: comboOdds(legs),
+      avgConfidence: comboConf(legs),
+      totalEv: comboEv(legs),
+    });
+  };
+
+  // ---- Banker / safe combos (high hit-rate, short combined odds) ----
+  const safeP = safe.picks;
+  if (safeP.length >= 3)
+    push("banker3", "Banker Treble", "🏦", "safe", "3 highest-confidence safe picks — the steady one", safeP.slice(0, 3).map(asLeg));
+  if (safeP.length >= 5)
+    push("safe5", "Five-Fold Banker", "🎯", "safe", "5 short-priced picks — bigger combined odds, still high hit-rate", safeP.slice(0, 5).map(asLeg));
+
+  // ---- Value combos (model edge; combined EV compounds) ----
+  const vsorted = [...value.picks].sort((a, b) => b.ev - a.ev);
+  if (vsorted.length >= 2)
+    push("value2", "Value Double", "💎", "value", "The 2 strongest overlays combined", vsorted.slice(0, 2).map(asLeg));
+  if (vsorted.length >= 3)
+    push("value3", "Value Treble", "💎", "value", "Top 3 model-edge picks — higher odds", vsorted.slice(0, 3).map(asLeg));
+  if (vsorted.length >= 5)
+    push("value5", "Value Accumulator", "💎", "value", "5 overlays — high odds, higher variance", vsorted.slice(0, 5).map(asLeg));
+
+  // ---- Big-odds combo (bigger payout from higher-priced favourites) ----
+  const bigLegs = result.picks
+    .filter((p) => Number(p.odds) >= 1.7)
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, 4)
+    .map(asLeg);
+  if (bigLegs.length >= 4)
+    push("big4", "Big-Odds Four", "🚀", "big", "4 confident but higher-priced results — for a bigger payout", bigLegs);
+
+  return combos;
+}
+
+// =====================================================================
 // TRACK RECORD — honest, auditable hit-rate for Expert Picks
 // =====================================================================
 // Each cycle we log the engine's current top recommendations, then settle
