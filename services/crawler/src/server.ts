@@ -931,7 +931,7 @@ async function renderDashboard(
     }</div>`;
 
   // ---- Value Combos: ready-made accumulators to book in one click ----
-  const kindClass = (k: string) => (k === "value" ? "vk" : k === "big" ? "bk" : "sk");
+  const kindClass = (k: string) => (k === "value" ? "vk" : k === "big" ? "bk" : k === "boost" ? "bo" : "sk");
   const comboCards = combos
     .map((c) => {
       const legRows = c.legs
@@ -946,9 +946,11 @@ async function renderDashboard(
       const evLine =
         c.totalEv !== null
           ? ` · <span class="up">+${Math.round(c.totalEv * 100)}% combined EV</span>`
-          : c.avgConfidence !== null
-            ? ` · ${Math.round(c.avgConfidence * 100)}% avg confidence`
-            : "";
+          : c.winProb !== null && c.winProb !== undefined
+            ? ` · <b>${Math.round(c.winProb * 100)}%</b> combined win chance`
+            : c.avgConfidence !== null
+              ? ` · ${Math.round(c.avgConfidence * 100)}% avg confidence`
+              : "";
       return `
       <div class="cmb-card ${kindClass(c.kind)}">
         <div class="cmb-head">
@@ -967,7 +969,7 @@ async function renderDashboard(
     <div class="xhead card">
       <div>
         <h3 style="margin:0">🎰 Value Combos — ready-made accumulators</h3>
-        <div class="muted small">Auto-assembled every ~10 min from the current Value and Expert picks into ready combos across odds tiers — pick one and book it in a single click. 💎 value combos combine model-edge overlays; 🏦 bankers combine short-priced high-hit-rate picks; 🚀 big-odds go for a larger payout. All football (the only sport we can model for value). Estimates, not guarantees — accumulators are higher variance: every leg must land.</div>
+        <div class="muted small">Auto-assembled every ~10 min from the current Value and Expert picks into ready combos across odds tiers — pick one and book it in a single click. 🏦 bankers combine short-priced high-hit-rate picks; 💎 value combos combine model-edge overlays; 🔥 Odds Boosters chase big payouts (~5× to ~100×) built the smartest way — each shows its honest combined win chance, because a big odds number means a small chance. All football (the only sport we can model). Estimates, not guarantees — every leg must land.</div>
       </div>
     </div>
     <div class="cmb-list">${
@@ -1165,7 +1167,8 @@ async function renderDashboard(
   /* Value Combos */
   .cmb-list{display:flex;flex-direction:column;gap:14px}
   .cmb-card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px;box-shadow:var(--shadow);border-left:4px solid var(--indigo)}
-  .cmb-card.vk{border-left-color:#7b5bd6} .cmb-card.sk{border-left-color:var(--green)} .cmb-card.bk{border-left-color:var(--primary)}
+  .cmb-card.vk{border-left-color:#7b5bd6} .cmb-card.sk{border-left-color:var(--green)} .cmb-card.bk{border-left-color:var(--primary)} .cmb-card.bo{border-left-color:#e5484d}
+  .cmb-card.bo .cmb-odds b{color:#e5484d}
   .cmb-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:10px}
   .cmb-title{font-weight:800;font-size:16px}
   .cmb-odds{text-align:right;flex-shrink:0}

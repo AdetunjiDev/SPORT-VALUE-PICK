@@ -418,12 +418,13 @@ export interface Combo {
   id: string;
   title: string;
   emoji: string;
-  kind: "value" | "safe" | "big";
+  kind: "value" | "safe" | "big" | "boost";
   note: string;
   legs: ComboLeg[];
   combinedOdds: number;
   avgConfidence: number | null; // mean model/confidence across legs
   totalEv: number | null; // combined EV for value combos (∏(1+ev) − 1)
+  winProb?: number | null; // combined win probability (∏ leg confidence) — the honest risk
 }
 
 const asLeg = (p: {
@@ -459,6 +460,10 @@ const comboEv = (legs: ComboLeg[]) =>
   legs.some((l) => l.ev !== undefined)
     ? round(legs.reduce((a, l) => a * (1 + (l.ev ?? 0)), 1) - 1)
     : null;
+// Combined win probability = product of leg confidences. This is the honest
+// counterweight to a big combined-odds number: an 80× combo may only land ~3%.
+const comboWinProb = (legs: ComboLeg[]) =>
+  legs.length ? round(legs.reduce((a, l) => a * l.confidence, 1)) : null;
 
 /**
  * Auto-build a menu of ready-made accumulators to choose from. Pulls the
@@ -490,6 +495,7 @@ export async function getCombos(seed = 0): Promise<Combo[]> {
       combinedOdds: comboOdds(legs),
       avgConfidence: comboConf(legs),
       totalEv: comboEv(legs),
+      winProb: comboWinProb(legs),
     });
   };
 
@@ -517,6 +523,49 @@ export async function getCombos(seed = 0): Promise<Combo[]> {
     .map(asLeg);
   if (bigLegs.length >= 4)
     push("big4", "Big-Odds Four", "🚀", "big", "4 confident but higher-priced results — for a bigger payout", bigLegs);
+
+  // ---- Odds Boosters: reach big payout tiers the SMART way ----
+  // For each target payout, greedily stack the highest-confidence picks until
+  // the combined odds reach it — i.e. the most probable accumulator that pays
+  // ~N×. Each is labelled with its honest combined win chance.
+  const boostPool = result.picks
+    .filter((p) => Number(p.odds) > 1) // any real price
+    .sort((a, b) => b.confidence - a.confidence);
+  const usedTargets = new Set<string>();
+  const buildToTarget = (target: number): ComboLeg[] | null => {
+    const legs: ComboLeg[] = [];
+    let prod = 1;
+    for (const p of boostPool) {
+      if (prod >= target) break;
+      if (legs.length >= 40) break;
+      legs.push(asLeg(p));
+      prod *= Number(p.odds) || 1;
+    }
+    // Only accept if we genuinely reached the tier and it's a real multi.
+    return prod >= target * 0.85 && legs.length >= 2 ? legs : null;
+  };
+  for (const [target, label] of [
+    [5, "~5×"],
+    [10, "~10×"],
+    [25, "~25×"],
+    [50, "~50×"],
+    [100, "~100×"],
+  ] as [number, string][]) {
+    const legs = buildToTarget(target);
+    if (!legs) continue;
+    const key = legs.length + ":" + legs[legs.length - 1].key; // dedupe identical builds
+    if (usedTargets.has(key)) continue;
+    usedTargets.add(key);
+    const wp = comboWinProb(legs);
+    push(
+      `boost${target}`,
+      `Odds Booster ${label}`,
+      "🔥",
+      "boost",
+      `${legs.length} legs to reach ~${target}× — the most likely way to that payout. Win chance ≈ ${wp !== null ? Math.round(wp * 100) : "?"}% (big payout = big risk).`,
+      legs,
+    );
+  }
 
   return combos;
 }
