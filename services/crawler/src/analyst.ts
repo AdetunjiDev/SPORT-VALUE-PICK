@@ -265,6 +265,135 @@ export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertResult>
 }
 
 // =====================================================================
+// VALUE PICKS — higher-odds opportunities with a genuine model edge
+// =====================================================================
+// A value bet = where an INDEPENDENT model (Forebet / API-Football) rates an
+// outcome MORE likely than SportyBet's price implies. Edge = model prob −
+// de-vigged market prob; EV = model prob × odds − 1. We only surface positive-
+// edge picks at meaningful odds — real overlays, not invented ones. Coverage
+// is limited to fixtures an external model actually covers (honest constraint).
+
+export interface ValuePick extends ExpertPick {
+  edge: number; // model prob − market implied (0..1)
+  ev: number; // expected value: modelProb × odds − 1
+  modelProb: number; // the external model's probability for this outcome
+}
+
+export interface ValueResult {
+  picks: ValuePick[];
+  requested: number;
+  windowDays: number;
+  scanned: number; // fixtures with an external model opinion we could compare
+}
+
+export interface ValueOptions {
+  count: number;
+  days: number;
+  minEdge?: number; // default 0.06 (6-point overlay)
+  minOdds?: number; // default 1.7 — value needs some price
+  maxOdds?: number; // default 6 — cap wild longshots
+  maxEv?: number; // default 0.45 — reject implausibly high EV (model error, not value)
+  seed?: number;
+}
+
+export async function getValuePicks(opts: ValueOptions): Promise<ValueResult> {
+  const count = Math.max(1, Math.min(70, Math.floor(opts.count) || 5));
+  const days = Math.max(1, Math.min(30, Math.floor(opts.days) || 7));
+  const minEdge = opts.minEdge ?? 0.06;
+  const minOdds = opts.minOdds ?? 1.7;
+  const maxOdds = opts.maxOdds ?? 6;
+  // Genuine value edges are modest (5–25% EV). Anything much higher means the
+  // model disagrees with the market so wildly that the MODEL is almost
+  // certainly wrong (common in low-data leagues) — that's noise, not value, so
+  // we reject it rather than headline a fake "+100% EV" pick.
+  const maxEv = opts.maxEv ?? 0.45;
+
+  const now = Date.now();
+  const maxT = now + days * 86_400_000;
+  const [fixtures, preds] = await Promise.all([
+    getSportyFixtures().catch(() => [] as SbEvent[]),
+    getPredictions().catch(() => [] as ExtPrediction[]),
+  ]);
+
+  const RESULT = ["1", "X", "2"] as const;
+  const scoredVal: ValuePick[] = [];
+  let scanned = 0;
+  for (const ev of fixtures) {
+    if (!ev.kickoff || ev.kickoff <= now || ev.kickoff > maxT) continue;
+    const tip = findExternalTip(ev, preds);
+    if (!tip?.probs) continue; // need an independent model probability
+    scanned += 1;
+
+    // Evaluate each 1X2 outcome for a positive edge; keep the best EV.
+    let best: { code: string; odds: number; edge: number; ev: number; modelProb: number } | null = null;
+    for (const code of RESULT) {
+      const odds = ev.outcomes[code];
+      if (!odds || odds < minOdds || odds > maxOdds) continue;
+      const idx = code === "1" ? 0 : code === "X" ? 1 : 2;
+      const modelProb = (tip.probs[idx] ?? 0) / 100;
+      if (modelProb <= 0) continue;
+      // Domain sanity: a true draw probability rarely exceeds ~42%. A model
+      // claiming more is unreliable for this fixture — skip (kills draw-spam
+      // from low-data leagues).
+      if (code === "X" && modelProb > 0.42) continue;
+      const marketProb = devig(ev.outcomes, code);
+      const edge = modelProb - marketProb;
+      const evv = modelProb * odds - 1;
+      if (edge < minEdge || evv <= 0 || evv > maxEv) continue;
+      if (!best || evv > best.ev) best = { code, odds, edge, ev: evv, modelProb };
+    }
+    if (!best) continue;
+
+    const label = (PICK_LABEL[best.code] ?? (() => best.code))(ev.home, ev.away);
+    const reasons = [
+      `${tip.source} model rates this ${Math.round(best.modelProb * 100)}%`,
+      `market prices ${Math.round((1 / best.odds) * 100)}% (odds ${best.odds.toFixed(2)})`,
+      `+${Math.round(best.edge * 100)}pt edge · EV +${Math.round(best.ev * 100)}%`,
+    ];
+    if (tip.analysis) reasons.push(String(tip.analysis).slice(0, 120));
+    scoredVal.push({
+      home: ev.home,
+      away: ev.away,
+      league: ev.league,
+      kickoff: new Date(ev.kickoff).toISOString(),
+      pick: label,
+      // Explicit outcome code in the key so booking books THIS pick (the value
+      // outcome), not the market favourite.
+      key: `${ev.home}|${ev.away}|${best.code}`.toLowerCase(),
+      confidence: round(best.modelProb),
+      odds: best.odds.toFixed(2),
+      reasons,
+      signals: matchInsights(ev, best.code),
+      source: `${tip.source} vs SportyBet`,
+      eventId: ev.eventId,
+      pickCode: best.code,
+      market: "1X2",
+      edge: round(best.edge),
+      ev: round(best.ev),
+      modelProb: round(best.modelProb),
+    });
+  }
+
+  scoredVal.sort((a, b) => b.ev - a.ev); // best expected value first
+  // Light league diversity so it isn't all one competition.
+  const perLeague = new Map<string, number>();
+  const cap = Math.max(3, Math.ceil(count / 3));
+  const diversified = scoredVal.filter((p) => {
+    const lg = p.league ?? "—";
+    const n = perLeague.get(lg) ?? 0;
+    if (n >= cap) return false;
+    perLeague.set(lg, n + 1);
+    return true;
+  });
+  const pool = diversified.length >= count ? diversified : scoredVal;
+  const band = pool.slice(0, Math.min(pool.length, count + 5));
+  const off = band.length ? (((opts.seed ?? 0) % band.length) + band.length) % band.length : 0;
+  const picks = band.slice(off).concat(band.slice(0, off)).slice(0, count);
+  picks.sort((a, b) => new Date(a.kickoff ?? 0).getTime() - new Date(b.kickoff ?? 0).getTime());
+  return { picks, requested: count, windowDays: days, scanned };
+}
+
+// =====================================================================
 // TRACK RECORD — honest, auditable hit-rate for Expert Picks
 // =====================================================================
 // Each cycle we log the engine's current top recommendations, then settle

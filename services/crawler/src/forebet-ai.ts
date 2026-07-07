@@ -395,13 +395,24 @@ export async function legsForFixtureKeys(
   const matchedKeys: string[] = [];
   const used = new Set<string>();
   for (const key of keys) {
-    const [h, a] = key.split("|");
+    // Keys may be "home|away" (book the favourite for the game type) or
+    // "home|away|CODE" (book that EXACT outcome — used by Value Picks so the
+    // booked selection is the value pick, not the market favourite).
+    const parts = key.split("|");
+    const [h, a] = parts;
+    const explicitCode = parts.length >= 3 ? parts[2].toUpperCase() : "";
     if (!h || !a) continue;
     const ev = events.find(
       (e) => e.kickoff > now && !used.has(e.eventId) && teamsMatch(e.home, h) && teamsMatch(e.away, a),
     );
     if (!ev) continue;
-    const fav = bestOutcome(ev, codes);
+    let fav: { code: string; odds: number; implied: number } | null;
+    if (explicitCode && PICKS[explicitCode] && ev.outcomes[explicitCode]) {
+      const o = ev.outcomes[explicitCode];
+      fav = { code: explicitCode, odds: o, implied: devig(ev.outcomes, explicitCode) };
+    } else {
+      fav = bestOutcome(ev, codes);
+    }
     if (!fav) continue;
     const meta = PICKS[fav.code];
     used.add(ev.eventId);

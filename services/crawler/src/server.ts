@@ -10,7 +10,7 @@ import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
 import { verifyCode } from "./verifier.js";
 import { telegramClientEnabled } from "./adapters/telegram-client.js";
-import { getExpertPicks, getExpertRecord, type GameType } from "./analyst.js";
+import { getExpertPicks, getExpertRecord, getValuePicks, type GameType } from "./analyst.js";
 
 const GAME_TYPES: GameType[] = ["result", "goals", "double", "dnb", "btts", "teamgoals", "safe", "both"];
 const validGameType = (v: unknown): GameType =>
@@ -48,7 +48,7 @@ function stars(n: number): string {
   return "★".repeat(v) + "☆".repeat(5 - v);
 }
 
-type Mode = "human" | "ai" | "pred" | "expert" | "saved";
+type Mode = "human" | "ai" | "pred" | "expert" | "value" | "saved";
 type Tier = "free" | "premium";
 
 async function renderDashboard(
@@ -76,6 +76,14 @@ async function renderDashboard(
       : { picks: [], requested: 0, windowDays: 0, poolSize: 0 };
   const expertPicks = expertResult.picks;
   const expertRecord = mode === "expert" ? await getExpertRecord().catch(() => null) : null;
+  const valueResult =
+    mode === "value"
+      ? await getValuePicks({
+          count: expertOpts.count,
+          days: expertOpts.days,
+          seed: Math.floor(Date.now() / (8 * 60_000)),
+        }).catch(() => ({ picks: [], requested: 0, windowDays: 0, scanned: 0 }))
+      : { picks: [], requested: 0, windowDays: 0, scanned: 0 };
   const savedCodes =
     mode === "saved"
       ? await prisma.generatedCode
@@ -505,8 +513,20 @@ async function renderDashboard(
       new Date(c.createdAt).toLocaleDateString("en-CA", { timeZone: "Africa/Lagos" }) ===
       new Date().toLocaleDateString("en-CA", { timeZone: "Africa/Lagos" }),
   ).length;
+  const avgEv = valueResult.picks.length
+    ? Math.round((valueResult.picks.reduce((a, p) => a + p.ev, 0) / valueResult.picks.length) * 100)
+    : 0;
+  const bestEv = valueResult.picks.length
+    ? Math.round(Math.max(...valueResult.picks.map((p) => p.ev)) * 100)
+    : 0;
   const kpis =
-    mode === "saved"
+    mode === "value"
+      ? `
+      ${kpi("💎", valueResult.picks.length, "value picks", "indigo")}
+      ${kpi("📈", valueResult.picks.length ? `+${avgEv}%` : "—", "avg expected value", "green")}
+      ${kpi("🔝", valueResult.picks.length ? `+${bestEv}%` : "—", "best EV", "orange")}
+      ${kpi("🔍", valueResult.scanned, "fixtures analysed", "blue")}`
+      : mode === "saved"
       ? `
       ${kpi("💾", savedCodes.length, "codes saved", "indigo")}
       ${kpi("📅", savedToday, "saved today", "green")}
@@ -682,6 +702,68 @@ async function renderDashboard(
       '<div class="card empty">No bookable fixtures match your filters — try widening the days (up to a month), loosening the minimum confidence, or including more game types.</div>'
     }</div>${slipBar}`;
 
+  // ---- Value Picks: higher-odds opportunities with a model edge ----
+  const valueCards = valueResult.picks
+    .map((p, i) => {
+      const kick = p.kickoff
+        ? new Date(p.kickoff).toLocaleString("en", {
+            weekday: "short",
+            day: "numeric",
+            month: "short",
+            hour: "2-digit",
+            minute: "2-digit",
+            timeZone: "Africa/Lagos",
+          })
+        : "TBD";
+      const edgePct = Math.round(p.edge * 100);
+      const evPct = Math.round(p.ev * 100);
+      return `
+      <div class="xcard vcard" data-key="${esc(p.key)}">
+        <div class="xrank">#${i + 1}</div>
+        <div class="xmain">
+          <div class="xmatch">${esc(p.home)} <span class="muted">v</span> ${esc(p.away)}</div>
+          <div class="xmeta">${esc(p.league ?? "Football")} · ⏰ ${esc(kick)} WAT · <span class="muted">${esc(p.source)}</span></div>
+          <div class="xpick">💎 ${esc(p.pick)}${p.odds ? ` <span class="xodds">@ ${esc(p.odds)}</span>` : ""}</div>
+          <div class="xwhy">${p.reasons.map((r) => `<span>${esc(r)}</span>`).join("")}</div>
+          ${p.signals && p.signals.length ? `<div class="xsignals">🔎 ${p.signals.map((s) => `<span>${esc(s)}</span>`).join("")}</div>` : ""}
+        </div>
+        <div class="xconf vconf">
+          <div class="xconf-n">+${evPct}%</div><div class="xconf-l">expected value</div>
+          <div class="vedge">+${edgePct}pt edge</div>
+          <label class="xsel"><input type="checkbox" checked data-key="${esc(p.key)}" onchange="selTog(this)"/> in slip</label>
+        </div>
+      </div>`;
+    })
+    .join("");
+  const valueBody = `
+    <div class="xhead card">
+      <div>
+        <h3 style="margin:0">💎 Value Picks — daily opportunities</h3>
+        <div class="muted small">Scans upcoming fixtures for <b>overlays</b>: where an independent model (Forebet / API-Football) rates an outcome MORE likely than SportyBet's odds imply. Ranked by expected value (EV). Higher odds, higher risk AND reward — value means good long-term EV, <b>not</b> that any single pick wins. Only fixtures a model actually covers can be assessed, so these are deliberately fewer and choosier.</div>
+      </div>
+      <form class="xform" method="get" action="/">
+        <input type="hidden" name="mode" value="value"/>
+        <label>Games
+          <select name="n">${[1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30]
+            .map((n) => `<option value="${n}"${n === expertOpts.count ? " selected" : ""}>${n}</option>`)
+            .join("")}</select>
+        </label>
+        <label>Within
+          <select name="days">${[1, 2, 3, 5, 7, 14, 30]
+            .map(
+              (d) =>
+                `<option value="${d}"${d === expertOpts.days ? " selected" : ""}>${d === 30 ? "1 month" : d === 1 ? "1 day" : `${d} days`}</option>`,
+            )
+            .join("")}</select>
+        </label>
+        <button class="btn" type="submit">Find value</button>
+      </form>
+    </div>
+    <div class="xlist">${
+      valueCards ||
+      `<div class="card empty">No value overlays right now across ${valueResult.scanned} model-covered fixture${valueResult.scanned === 1 ? "" : "s"} in this window. Value spots are rare by nature — they only appear when a model disagrees with SportyBet's price. Widen the days, or check back as more fixtures get model coverage (busiest mid-day WAT). ${valueResult.scanned === 0 ? "(API-Football's free daily quota may be spent — it resets at midnight UTC and adds coverage.)" : ""}</div>`
+    }</div>${slipBar}`;
+
   // ---- Saved Codes ledger: every generated code + who made it, when ----
   const savedRows = savedCodes
     .map((c) => {
@@ -740,6 +822,8 @@ async function renderDashboard(
   const body =
     mode === "saved"
       ? savedBody
+      : mode === "value"
+      ? valueBody
       : mode === "expert"
       ? expertBody
       : mode === "pred"
@@ -899,6 +983,10 @@ async function renderDashboard(
   .xconf.hi .xconf-n{color:var(--green)}
   .xconf.mid .xconf-n{color:#c9820f}
   .xconf.lo .xconf-n{color:var(--muted)}
+  .vcard{border-left:4px solid #7b5bd6}
+  .vconf .xconf-n{color:#7b5bd6}
+  .vedge{font-size:11px;font-weight:800;color:#0f8a52;background:#eafaf1;border:1px solid #c8ecd8;
+    padding:2px 8px;border-radius:999px;margin-bottom:6px;display:inline-block}
   .xsel{display:flex;align-items:center;justify-content:center;gap:5px;font-size:11px;font-weight:700;
     color:#59617a;cursor:pointer}
   .xsel input{accent-color:var(--green);cursor:pointer}
@@ -1156,6 +1244,7 @@ async function renderDashboard(
     ${nav("ai", "🤖", "AI Codes", mode === "ai")}
     ${nav("pred", "📈", "Predictions", mode === "pred")}
     ${nav("expert", "🎯", "Expert Picks", mode === "expert")}
+    ${nav("value", "💎", "Value Picks", mode === "value")}
     ${nav("saved", "💾", "Saved Codes", mode === "saved")}
     <div class="nav-label">Data</div>
     <a class="nav-item" href="/api/codes" target="_blank"><span class="ni">🔗</span>Codes API</a>
@@ -1169,8 +1258,8 @@ async function renderDashboard(
   <div class="app">
     <div class="topbar">
       <div>
-        <h1>${mode === "saved" ? "Saved Codes" : mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
-        <div class="sub">${mode === "saved" ? "Every generated code — with the day, time and who made it" : mode === "expert" ? "Confidence-ranked picks across your chosen window — estimates, never guarantees" : mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
+        <h1>${mode === "value" ? "Value Picks" : mode === "saved" ? "Saved Codes" : mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
+        <div class="sub">${mode === "value" ? "Higher-odds opportunities where a model beats the market price — EV-ranked, estimates not guarantees" : mode === "saved" ? "Every generated code — with the day, time and who made it" : mode === "expert" ? "Confidence-ranked picks across your chosen window — estimates, never guarantees" : mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
       </div>
       <div class="search"><input id="search" placeholder="Search codes, leagues, sources…" oninput="flt(this.value)"/></div>
       <div class="top-right">
@@ -1547,9 +1636,11 @@ export function startServer() {
             ? "pred"
             : modeParam === "expert"
               ? "expert"
-              : modeParam === "saved"
-                ? "saved"
-                : "human";
+              : modeParam === "value"
+                ? "value"
+                : modeParam === "saved"
+                  ? "saved"
+                  : "human";
       const tier: Tier =
         config.defaultTier === "premium" ||
         /(?:^|;\s*)tier=premium(?:;|$)/.test(req.headers.cookie ?? "")
@@ -1691,7 +1782,11 @@ export function startServer() {
         for (const p of wanted) if (p.home && p.away) nameByKey.set(`${p.home}|${p.away}`.toLowerCase(), `${p.home} v ${p.away}`);
         for (const l of legs) nameByKey.set(`${l.home}|${l.away}`.toLowerCase(), `${l.home} v ${l.away}`);
         const titleFromKey = (k: string) =>
-          k.split("|").map((s) => s.replace(/\b\w/g, (c) => c.toUpperCase())).join(" v ");
+          k
+            .split("|")
+            .slice(0, 2) // drop any trailing outcome-code part (value-pick keys)
+            .map((s) => s.replace(/\b\w/g, (c) => c.toUpperCase()))
+            .join(" v ");
         const skipped = keys.filter((k) => !matchedSet.has(k)).map((k) => nameByKey.get(k) ?? titleFromKey(k));
 
         if (!legs.length)
