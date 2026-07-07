@@ -24,6 +24,43 @@ export const telegramClientEnabled = () =>
 // at runtime and the app boots fine even if it isn't installed.
 let clientPromise: Promise<any> | null = null;
 
+/**
+ * Race a promise against a timeout. GramJS's MTProto socket can go dead after
+ * the host sleeps and then hang getMessages()/connect() forever (it doesn't
+ * honour our fetch timeout). Without this guard a single dead call freezes the
+ * whole 3-minute scan cycle. On timeout we reject so the caller falls back to
+ * the web-preview scrape, and we drop the stale client so the next cycle
+ * reconnects fresh.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** Drop the cached client so the next call reconnects from scratch. */
+async function resetClient(): Promise<void> {
+  const cur = clientPromise;
+  clientPromise = null;
+  if (!cur) return;
+  try {
+    const c = await cur;
+    await c?.disconnect?.();
+  } catch {
+    /* ignore */
+  }
+}
+
 async function getClient(): Promise<any> {
   if (clientPromise) return clientPromise;
   clientPromise = (async () => {
@@ -42,7 +79,7 @@ async function getClient(): Promise<any> {
       /* older versions */
     }
     try {
-      await client.connect();
+      await withTimeout(client.connect(), 15_000, "telegram connect");
     } catch (err) {
       // Reset so the next call can retry rather than hanging on this rejected promise.
       clientPromise = null;
@@ -58,7 +95,19 @@ async function getClient(): Promise<any> {
 /** Fetch recent messages from one channel via the official API. */
 export async function fetchTelegramViaClient(channel: string): Promise<RawItem[]> {
   const client = await getClient();
-  const messages = await client.getMessages(channel, { limit: config.telegram.messageLimit });
+  let messages: any[];
+  try {
+    messages = await withTimeout(
+      client.getMessages(channel, { limit: config.telegram.messageLimit }),
+      15_000,
+      `telegram getMessages(@${channel})`,
+    );
+  } catch (e) {
+    // A hung/failed read means the socket is likely dead — drop the client so
+    // the next cycle reconnects, and let the caller fall back to web-preview.
+    void resetClient();
+    throw e;
+  }
   const items: RawItem[] = [];
   let ocrBudget = config.telegram.ocrPerChannel;
 
@@ -85,7 +134,11 @@ export async function fetchTelegramViaClient(channel: string): Promise<RawItem[]
     if (hasPhoto && ocrBudget > 0) {
       ocrBudget -= 1;
       try {
-        const buf: Buffer = await client.downloadMedia(m, {});
+        const buf: Buffer = await withTimeout(
+          client.downloadMedia(m, {}),
+          15_000,
+          "telegram downloadMedia",
+        );
         if (buf && buf.length > 100) {
           const ocrText = await ocrBuffer(buf);
           if (ocrText.trim()) {
