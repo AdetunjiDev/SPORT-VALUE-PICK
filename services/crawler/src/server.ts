@@ -726,6 +726,7 @@ async function renderDashboard(
           <div class="xpick">💎 ${esc(p.pick)}${p.odds ? ` <span class="xodds">@ ${esc(p.odds)}</span>` : ""}</div>
           <div class="xwhy">${p.reasons.map((r) => `<span>${esc(r)}</span>`).join("")}</div>
           ${p.signals && p.signals.length ? `<div class="xsignals">🔎 ${p.signals.map((s) => `<span>${esc(s)}</span>`).join("")}</div>` : ""}
+          ${p.url ? `<a class="xanalysis" href="${esc(p.url)}" target="_blank" rel="noopener">📊 Full analysis ↗</a>` : ""}
         </div>
         <div class="xconf vconf">
           <div class="xconf-n">+${evPct}%</div><div class="xconf-l">expected value</div>
@@ -735,6 +736,33 @@ async function renderDashboard(
       </div>`;
     })
     .join("");
+  // Auto-recommended: the few strongest overlays by EV, surfaced
+  // automatically at the top with an analysis link each — no config needed.
+  const autoRec = [...valueResult.picks].sort((a, b) => b.ev - a.ev).slice(0, 3);
+  const autoRecHtml = autoRec.length
+    ? `<div class="vauto card">
+        <div class="vauto-head">⭐ Auto-recommended value <span class="muted small">— our top ${autoRec.length} overlay${autoRec.length === 1 ? "" : "s"} right now, refreshed automatically</span></div>
+        <div class="vauto-list">${autoRec
+          .map((p) => {
+            const kick = p.kickoff
+              ? new Date(p.kickoff).toLocaleString("en", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos" })
+              : "TBD";
+            return `<div class="vauto-item">
+              <div class="vauto-main">
+                <b>${esc(p.home)} v ${esc(p.away)}</b> — 💎 ${esc(p.pick)} <span class="xodds">@ ${esc(p.odds ?? "")}</span>
+                <div class="muted small">${esc(p.league ?? "Football")} · ⏰ ${esc(kick)} WAT · +${Math.round(p.ev * 100)}% EV · +${Math.round(p.edge * 100)}pt edge</div>
+                <div class="vauto-why">${esc(p.reasons[0] ?? "")}${p.reasons[1] ? " · " + esc(p.reasons[1]) : ""}</div>
+              </div>
+              <div class="vauto-side">
+                ${p.url ? `<a class="btn ghost sm" href="${esc(p.url)}" target="_blank" rel="noopener">📊 Analysis ↗</a>` : ""}
+                <label class="xsel"><input type="checkbox" data-key="${esc(p.key)}" onchange="selTog(this)"/> add</label>
+              </div>
+            </div>`;
+          })
+          .join("")}</div>
+      </div>`
+    : "";
+
   const valueBody = `
     <div class="xhead card">
       <div>
@@ -744,7 +772,7 @@ async function renderDashboard(
       <form class="xform" method="get" action="/">
         <input type="hidden" name="mode" value="value"/>
         <label>Games
-          <select name="n">${[1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30]
+          <select name="n">${[1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30, 40, 50, 70]
             .map((n) => `<option value="${n}"${n === expertOpts.count ? " selected" : ""}>${n}</option>`)
             .join("")}</select>
         </label>
@@ -759,6 +787,7 @@ async function renderDashboard(
         <button class="btn" type="submit">Find value</button>
       </form>
     </div>
+    ${autoRecHtml}
     <div class="xlist">${
       valueCards ||
       `<div class="card empty">No value overlays right now across ${valueResult.scanned} model-covered fixture${valueResult.scanned === 1 ? "" : "s"} in this window. Value spots are rare by nature — they only appear when a model disagrees with SportyBet's price. Widen the days, or check back as more fixtures get model coverage (busiest mid-day WAT). ${valueResult.scanned === 0 ? "(API-Football's free daily quota may be spent — it resets at midnight UTC and adds coverage.)" : ""}</div>`
@@ -987,6 +1016,18 @@ async function renderDashboard(
   .vconf .xconf-n{color:#7b5bd6}
   .vedge{font-size:11px;font-weight:800;color:#0f8a52;background:#eafaf1;border:1px solid #c8ecd8;
     padding:2px 8px;border-radius:999px;margin-bottom:6px;display:inline-block}
+  .xanalysis{display:inline-block;margin-top:7px;font-size:12px;font-weight:700;color:var(--indigo)}
+  .xanalysis:hover{text-decoration:underline}
+  /* Auto-recommended value banner */
+  .vauto{padding:14px 18px;margin-bottom:16px;background:linear-gradient(120deg,#f3f0ff,#eef6ff);border:1px solid #ddd6f5}
+  .vauto-head{font-size:14px;font-weight:800;margin-bottom:10px}
+  .vauto-list{display:flex;flex-direction:column;gap:10px}
+  .vauto-item{display:flex;gap:14px;align-items:center;justify-content:space-between;background:#fff;
+    border:1px solid var(--line);border-radius:12px;padding:10px 14px}
+  .vauto-main{min-width:0}
+  .vauto-why{font-size:12px;color:#475069;margin-top:3px}
+  .vauto-side{flex-shrink:0;display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+  @media(max-width:640px){ .vauto-item{flex-direction:column;align-items:flex-start} .vauto-side{align-items:flex-start} }
   .xsel{display:flex;align-items:center;justify-content:center;gap:5px;font-size:11px;font-weight:700;
     color:#59617a;cursor:pointer}
   .xsel input{accent-color:var(--green);cursor:pointer}
@@ -1883,7 +1924,10 @@ export function startServer() {
       }
       const dateStr = url.searchParams.get("date") ?? "";
       const expertCount = Math.max(1, Math.min(70, Number(url.searchParams.get("n")) || 5));
-      const expertDays = Math.max(1, Math.min(30, Number(url.searchParams.get("days")) || 5));
+      // Value mode defaults to a wider window (14d) since overlays are sparse;
+      // other modes default to 5 days.
+      const daysDefault = mode === "value" ? 14 : 5;
+      const expertDays = Math.max(1, Math.min(30, Number(url.searchParams.get("days")) || daysDefault));
       const typeParam = url.searchParams.get("type");
       // Default view = the daily "safe picks" mix (high strike-rate markets).
       const expertGameType: GameType = typeParam ? validGameType(typeParam) : "safe";

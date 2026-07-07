@@ -365,6 +365,7 @@ export async function getValuePicks(opts: ValueOptions): Promise<ValueResult> {
       reasons,
       signals: matchInsights(ev, best.code),
       source: `${tip.source} vs SportyBet`,
+      url: tip.url, // link to the model's own match analysis page
       eventId: ev.eventId,
       pickCode: best.code,
       market: "1X2",
