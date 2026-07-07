@@ -3,6 +3,7 @@ import {
   getSportyFixtures,
   fuzzyTeamsMatch,
   bestOutcome,
+  devig,
   CODE_SETS,
   type SbEvent,
   type GameType,
@@ -46,11 +47,12 @@ export interface ExpertPick {
   confidence: number; // 0..1
   odds?: string;
   reasons: string[];
+  signals: string[]; // extra market insights (goals lean, BTTS, safest cover…)
   source: string;
   url?: string;
   eventId?: string; // SportyBet sr:match: id — for result tracking
   pickCode?: string; // 1 | X | 2 | O15 | … — for settlement
-  market?: string; // "1X2" | "Over/Under"
+  market?: string; // "1X2" | "Over/Under" | "Double Chance" | …
 }
 
 const PICK_LABEL: Record<string, (h: string, a: string) => string> = {
@@ -63,7 +65,66 @@ const PICK_LABEL: Record<string, (h: string, a: string) => string> = {
   U15: () => "Under 1.5 Goals",
   U25: () => "Under 2.5 Goals",
   U35: () => "Under 3.5 Goals",
+  DC1X: (h) => `${h} or Draw (Double Chance)`,
+  DC12: (h, a) => `${h} or ${a} (Double Chance)`,
+  DCX2: (_h, a) => `Draw or ${a} (Double Chance)`,
+  DNBH: (h) => `${h} (Draw No Bet)`,
+  DNBA: (_h, a) => `${a} (Draw No Bet)`,
+  BTTSY: () => "Both Teams To Score",
+  BTTSN: () => "Both Teams NOT To Score",
+  HO05: (h) => `${h} Over 0.5 Goals`,
+  HO15: (h) => `${h} Over 1.5 Goals`,
+  HU15: (h) => `${h} Under 1.5 Goals`,
+  AO05: (_h, a) => `${a} Over 0.5 Goals`,
+  AO15: (_h, a) => `${a} Over 1.5 Goals`,
+  AU15: (_h, a) => `${a} Under 1.5 Goals`,
 };
+
+// Market group label for a pick code (shown on the card).
+function marketOf(code: string): string {
+  if (code === "1" || code === "X" || code === "2") return "1X2";
+  if (code.startsWith("DC")) return "Double Chance";
+  if (code.startsWith("DNB")) return "Draw No Bet";
+  if (code.startsWith("BTTS")) return "BTTS";
+  if (code[0] === "H" || code[0] === "A") return "Team Goals";
+  return "Over/Under";
+}
+
+/**
+ * Extra per-match research: since we now pull every fixture's Double Chance,
+ * BTTS, Over/Under and team-goal prices, we can surface supporting signals that
+ * a seasoned analyst would check before backing a pick — e.g. "goals expected"
+ * or "safest cover: Home or Draw". Derived from the same de-vigged odds, so
+ * they're real market reads, not invented. Corner/card markets are NOT offered
+ * by SportyBet's feed, so those are honestly not shown.
+ */
+function matchInsights(ev: SbEvent, pickCode: string): string[] {
+  const out: string[] = [];
+  const p = (code: string) => {
+    const o = ev.outcomes[code];
+    return o && o > 1 ? Math.round(devig(ev.outcomes, code) * 100) : 0;
+  };
+  // Goals lean (Over/Under 2.5)
+  const o25 = p("O25");
+  const u25 = p("U25");
+  if (o25 || u25) {
+    out.push(o25 >= u25 ? `Goals likely — Over 2.5 ${o25}%` : `Tight game — Under 2.5 ${u25}%`);
+  }
+  // Both teams to score
+  const by = p("BTTSY");
+  const bn = p("BTTSN");
+  if (by || bn) out.push(by >= bn ? `Both to score ${by}%` : `A clean sheet likely (BTTS No ${bn}%)`);
+  // Safest cover for a straight win pick = the matching double chance
+  if (pickCode === "1" && p("DC1X")) out.push(`Safer cover: ${ev.home} or Draw ${p("DC1X")}%`);
+  if (pickCode === "2" && p("DCX2")) out.push(`Safer cover: Draw or ${ev.away} ${p("DCX2")}%`);
+  // Each team to score at least once (supports over/BTTS picks)
+  const ho = p("HO05");
+  const ao = p("AO05");
+  if ((pickCode.startsWith("O") || pickCode.startsWith("BTTS")) && ho && ao) {
+    out.push(`${ev.home} score ${ho}% · ${ev.away} score ${ao}%`);
+  }
+  return out.slice(0, 3);
+}
 
 export interface ExpertOptions {
   count: number; // how many picks the user wants (1..50)
@@ -95,7 +156,7 @@ const round = (n: number, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
 
 /** The N highest-confidence, GUARANTEED-BOOKABLE picks within the window. */
 export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertResult> {
-  const count = Math.max(1, Math.min(50, Math.floor(opts.count) || 5));
+  const count = Math.max(1, Math.min(70, Math.floor(opts.count) || 5));
   const days = Math.max(1, Math.min(30, Math.floor(opts.days) || 5)); // up to a month out
   const gameType = opts.gameType ?? "result";
   const codes = CODE_SETS[gameType] ?? CODE_SETS.result;
@@ -146,7 +207,6 @@ export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertResult>
     }
 
     const label = (PICK_LABEL[fav.code] ?? (() => fav.code))(ev.home, ev.away);
-    const isGoals = fav.code.startsWith("O") || fav.code.startsWith("U");
     scored.push({
       home: ev.home,
       away: ev.away,
@@ -157,10 +217,11 @@ export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertResult>
       confidence: round(Math.min(0.95, confidence)),
       odds: fav.odds.toFixed(2),
       reasons,
+      signals: matchInsights(ev, fav.code),
       source: tip ? `SportyBet + ${tip.source}` : "SportyBet odds",
       eventId: ev.eventId,
       pickCode: fav.code,
-      market: isGoals ? "Over/Under" : "1X2",
+      market: marketOf(fav.code),
     });
   }
 
@@ -286,6 +347,36 @@ function settlePick(pickCode: string, score: string): boolean | null {
       return total <= 2;
     case "U35":
       return total <= 3;
+    // Double Chance
+    case "DC1X":
+      return h >= a;
+    case "DC12":
+      return h !== a;
+    case "DCX2":
+      return h <= a;
+    // Draw No Bet (a draw → null = VOID / stake refunded)
+    case "DNBH":
+      return h === a ? null : h > a;
+    case "DNBA":
+      return h === a ? null : h < a;
+    // Both Teams To Score
+    case "BTTSY":
+      return h > 0 && a > 0;
+    case "BTTSN":
+      return h === 0 || a === 0;
+    // Per-team goals
+    case "HO05":
+      return h >= 1;
+    case "HO15":
+      return h >= 2;
+    case "HU15":
+      return h <= 1;
+    case "AO05":
+      return a >= 1;
+    case "AO15":
+      return a >= 2;
+    case "AU15":
+      return a <= 1;
     default:
       return null;
   }

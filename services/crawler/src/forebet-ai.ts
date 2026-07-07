@@ -12,23 +12,46 @@ import { config } from "./config.js";
  * placed — a booking code only saves selections.
  */
 
+// Markets scanned from SportyBet's bulk feed: 1X2, Double Chance, Draw No Bet,
+// Over/Under goals, per-team Over/Under, and Both Teams To Score — all verified
+// present across the feed, so every pick built from them is bookable.
 const EVENTS_API =
-  "https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents?sportId=sr%3Asport%3A1&marketId=1%2C18&pageSize=100&option=1&pageNum=";
+  "https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents?sportId=sr%3Asport%3A1&marketId=1%2C10%2C11%2C18%2C19%2C20%2C29&pageSize=100&option=1&pageNum=";
 
 /** How each pick code books on SportyBet (market/specifier/outcome + label). */
-const PICKS: Record<
+export const PICKS: Record<
   string,
   { marketId: string; specifier: string; outcomeId: string; label: string; market: string }
 > = {
+  // Match result (1X2)
   "1": { marketId: "1", specifier: "", outcomeId: "1", label: "Home", market: "1X2" },
   X: { marketId: "1", specifier: "", outcomeId: "2", label: "Draw", market: "1X2" },
   "2": { marketId: "1", specifier: "", outcomeId: "3", label: "Away", market: "1X2" },
-  O15: { marketId: "18", specifier: "total=1.5", outcomeId: "12", label: "Over 1.5", market: "Over/Under" },
-  O25: { marketId: "18", specifier: "total=2.5", outcomeId: "12", label: "Over 2.5", market: "Over/Under" },
-  O35: { marketId: "18", specifier: "total=3.5", outcomeId: "12", label: "Over 3.5", market: "Over/Under" },
-  U15: { marketId: "18", specifier: "total=1.5", outcomeId: "13", label: "Under 1.5", market: "Over/Under" },
-  U25: { marketId: "18", specifier: "total=2.5", outcomeId: "13", label: "Under 2.5", market: "Over/Under" },
-  U35: { marketId: "18", specifier: "total=3.5", outcomeId: "13", label: "Under 3.5", market: "Over/Under" },
+  // Over/Under total match goals
+  O15: { marketId: "18", specifier: "total=1.5", outcomeId: "12", label: "Over 1.5 Goals", market: "Over/Under" },
+  O25: { marketId: "18", specifier: "total=2.5", outcomeId: "12", label: "Over 2.5 Goals", market: "Over/Under" },
+  O35: { marketId: "18", specifier: "total=3.5", outcomeId: "12", label: "Over 3.5 Goals", market: "Over/Under" },
+  U15: { marketId: "18", specifier: "total=1.5", outcomeId: "13", label: "Under 1.5 Goals", market: "Over/Under" },
+  U25: { marketId: "18", specifier: "total=2.5", outcomeId: "13", label: "Under 2.5 Goals", market: "Over/Under" },
+  U35: { marketId: "18", specifier: "total=3.5", outcomeId: "13", label: "Under 3.5 Goals", market: "Over/Under" },
+  // Double Chance
+  DC1X: { marketId: "10", specifier: "", outcomeId: "9", label: "Home or Draw (1X)", market: "Double Chance" },
+  DC12: { marketId: "10", specifier: "", outcomeId: "10", label: "Home or Away (12)", market: "Double Chance" },
+  DCX2: { marketId: "10", specifier: "", outcomeId: "11", label: "Draw or Away (X2)", market: "Double Chance" },
+  // Draw No Bet
+  DNBH: { marketId: "11", specifier: "", outcomeId: "4", label: "Home (Draw No Bet)", market: "Draw No Bet" },
+  DNBA: { marketId: "11", specifier: "", outcomeId: "5", label: "Away (Draw No Bet)", market: "Draw No Bet" },
+  // Both Teams To Score
+  BTTSY: { marketId: "29", specifier: "", outcomeId: "74", label: "Both Teams To Score", market: "BTTS" },
+  BTTSN: { marketId: "29", specifier: "", outcomeId: "76", label: "Both Teams NOT To Score", market: "BTTS" },
+  // Per-team goals (home)
+  HO05: { marketId: "19", specifier: "total=0.5", outcomeId: "12", label: "Home Over 0.5 Goals", market: "Team Goals" },
+  HO15: { marketId: "19", specifier: "total=1.5", outcomeId: "12", label: "Home Over 1.5 Goals", market: "Team Goals" },
+  HU15: { marketId: "19", specifier: "total=1.5", outcomeId: "13", label: "Home Under 1.5 Goals", market: "Team Goals" },
+  // Per-team goals (away)
+  AO05: { marketId: "20", specifier: "total=0.5", outcomeId: "12", label: "Away Over 0.5 Goals", market: "Team Goals" },
+  AO15: { marketId: "20", specifier: "total=1.5", outcomeId: "12", label: "Away Over 1.5 Goals", market: "Team Goals" },
+  AU15: { marketId: "20", specifier: "total=1.5", outcomeId: "13", label: "Away Under 1.5 Goals", market: "Team Goals" },
 };
 
 interface SbEvent {
@@ -135,15 +158,43 @@ const round = (n: number, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
 // gets booked always matches what was shown — never independently re-derived.
 export const RESULT_CODES = ["1", "X", "2"] as const;
 export const GOALS_CODES = ["O15", "U15", "O25", "U25", "O35", "U35"] as const;
-export type GameType = "result" | "goals" | "both";
+export const DC_CODES = ["DC1X", "DC12", "DCX2"] as const;
+export const DNB_CODES = ["DNBH", "DNBA"] as const;
+export const BTTS_CODES = ["BTTSY", "BTTSN"] as const;
+export const TEAMGOALS_CODES = ["HO05", "HO15", "HU15", "AO05", "AO15", "AU15"] as const;
+// "Safe" = a curated high strike-rate mix (short-priced markets that hit
+// often): double chance, over 1.5, each team to score 1+, both teams to score.
+export const SAFE_CODES = ["DC1X", "DCX2", "DC12", "O15", "HO05", "AO05", "BTTSY"] as const;
+
+export type GameType =
+  | "result"
+  | "goals"
+  | "double"
+  | "dnb"
+  | "btts"
+  | "teamgoals"
+  | "safe"
+  | "both";
 export const CODE_SETS: Record<GameType, readonly string[]> = {
   result: RESULT_CODES,
   goals: GOALS_CODES,
-  both: [...RESULT_CODES, ...GOALS_CODES],
+  double: DC_CODES,
+  dnb: DNB_CODES,
+  btts: BTTS_CODES,
+  teamgoals: TEAMGOALS_CODES,
+  safe: SAFE_CODES,
+  both: [
+    ...RESULT_CODES,
+    ...GOALS_CODES,
+    ...DC_CODES,
+    ...DNB_CODES,
+    ...BTTS_CODES,
+    ...TEAMGOALS_CODES,
+  ],
 };
 // Each pick's market group — needed to remove the bookmaker's margin (see
 // devig() below): 1X2 is a 3-way group, each Over/Under LINE is its own 2-way
-// group (O2.5 devigs against U2.5, not against O1.5).
+// group. Codes not listed here (or listed alone) use the raw implied prob.
 const MARKET_GROUP: Record<string, readonly string[]> = {
   "1": RESULT_CODES,
   X: RESULT_CODES,
@@ -154,6 +205,15 @@ const MARKET_GROUP: Record<string, readonly string[]> = {
   U25: ["O25", "U25"],
   O35: ["O35", "U35"],
   U35: ["O35", "U35"],
+  DNBH: DNB_CODES,
+  DNBA: DNB_CODES,
+  BTTSY: BTTS_CODES,
+  BTTSN: BTTS_CODES,
+  HO15: ["HO15", "HU15"],
+  HU15: ["HO15", "HU15"],
+  AO15: ["AO15", "AU15"],
+  AU15: ["AO15", "AU15"],
+  // DC codes overlap (not a clean partition) so they use raw implied.
 };
 
 /**
@@ -170,6 +230,7 @@ export function devig(outcomes: Record<string, number>, code: string): number {
   if (!odds || odds <= 1) return 0;
   const raw = 1 / odds;
   const group = MARKET_GROUP[code] ?? [code];
+  if (group.length < 2) return raw; // no sibling to devig against — use raw
   let overround = 0;
   let complete = true;
   for (const c of group) {

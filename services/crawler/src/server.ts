@@ -12,6 +12,10 @@ import { verifyCode } from "./verifier.js";
 import { telegramClientEnabled } from "./adapters/telegram-client.js";
 import { getExpertPicks, getExpertRecord, type GameType } from "./analyst.js";
 
+const GAME_TYPES: GameType[] = ["result", "goals", "double", "dnb", "btts", "teamgoals", "safe", "both"];
+const validGameType = (v: unknown): GameType =>
+  GAME_TYPES.includes(v as GameType) ? (v as GameType) : "result";
+
 /** Read a request body with a hard size cap (default 10 MB for images). */
 function readBody(req: http.IncomingMessage, maxBytes = 10 * 1024 * 1024): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -54,7 +58,7 @@ async function renderDashboard(
   expertOpts: { count: number; days: number; gameType: GameType; minConfidence: number } = {
     count: 5,
     days: 5,
-    gameType: "result",
+    gameType: "safe",
     minConfidence: 0,
   },
 ): Promise<string> {
@@ -561,9 +565,10 @@ async function renderDashboard(
         <div class="xrank">#${i + 1}</div>
         <div class="xmain">
           <div class="xmatch">${esc(p.home)} <span class="muted">v</span> ${esc(p.away)}</div>
-          <div class="xmeta">${esc(p.league ?? "Football")} · ⏰ ${esc(kick)} WAT · <span class="muted">${esc(p.source)}</span></div>
+          <div class="xmeta">${esc(p.league ?? "Football")} · ⏰ ${esc(kick)} WAT · ${p.market ? `<b>${esc(p.market)}</b> · ` : ""}<span class="muted">${esc(p.source)}</span></div>
           <div class="xpick">🎯 ${esc(p.pick)}${p.odds ? ` <span class="xodds">@ ${esc(p.odds)}</span>` : ""}</div>
           <div class="xwhy">${p.reasons.map((r) => `<span>${esc(r)}</span>`).join("")}</div>
+          ${p.signals && p.signals.length ? `<div class="xsignals">🔎 ${p.signals.map((s) => `<span>${esc(s)}</span>`).join("")}</div>` : ""}
         </div>
         <div class="xconf ${confClass(p.confidence)}">
           <div class="xconf-n">${pct}%</div><div class="xconf-l">confidence</div>
@@ -622,13 +627,13 @@ async function renderDashboard(
     ${recordCard}
     <div class="xhead card">
       <div>
-        <h3 style="margin:0">🎯 Expert Picks — confidence-ranked</h3>
-        <div class="muted small">Scanned every fixture we have a read on across your window and ranked by model probability + market odds + source agreement. These are estimates ranked by confidence — <b>not guarantees</b>.</div>
+        <h3 style="margin:0">🎯 Expert Picks — daily recommendations</h3>
+        <div class="muted small">Scans every bookable fixture across your window over multiple markets — 1X2, Double Chance, Draw No Bet, Over/Under, BTTS, Team Goals — ranks by de-vigged probability + source agreement, and adds an extra read of each match's other markets (🔎 goals lean, BTTS, safest cover). Estimates ranked by confidence — <b>not guarantees</b>. Corners/cards aren't offered by SportyBet's feed, so they're honestly not shown.</div>
       </div>
       <form class="xform" method="get" action="/">
         <input type="hidden" name="mode" value="expert"/>
         <label>Games
-          <select name="n">${[1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 25, 30, 40, 50]
+          <select name="n">${[1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 25, 30, 40, 50, 60, 70]
             .map((n) => `<option value="${n}"${n === expertOpts.count ? " selected" : ""}>${n}</option>`)
             .join("")}</select>
         </label>
@@ -643,9 +648,14 @@ async function renderDashboard(
         <label>Game type
           <select name="type" id="xtype">${(
             [
+              ["safe", "🛡️ Safe picks (daily mix)"],
               ["result", "Match Result (1X2)"],
+              ["double", "Double Chance"],
+              ["dnb", "Draw No Bet"],
               ["goals", "Over/Under Goals"],
-              ["both", "Both"],
+              ["btts", "Both Teams To Score"],
+              ["teamgoals", "Team Goals"],
+              ["both", "All markets"],
             ] as [GameType, string][]
           )
             .map(([v, label]) => `<option value="${v}"${v === expertOpts.gameType ? " selected" : ""}>${label}</option>`)
@@ -881,6 +891,8 @@ async function renderDashboard(
   .xodds{color:var(--indigo);font-weight:800}
   .xwhy{display:flex;flex-wrap:wrap;gap:6px}
   .xwhy span{font-size:11px;color:#59617a;background:#f7f9fc;border:1px solid var(--line);padding:3px 9px;border-radius:999px}
+  .xsignals{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}
+  .xsignals span{font-size:11px;color:#0f6b8a;background:#eaf6fb;border:1px solid #cce8f2;padding:3px 9px;border-radius:999px}
   .xconf{flex-shrink:0;text-align:center;width:92px}
   .xconf-n{font-size:22px;font-weight:800;line-height:1.1}
   .xconf-l{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px}
@@ -1292,7 +1304,7 @@ async function renderDashboard(
   async function genCode(btn){
     var keys = Object.keys(SEL);
     if(keys.length < 1){ showToast('Pick at least 1 match first','warn'); return; }
-    if(keys.length > 50){ showToast('Maximum 50 matches per code — remove some','warn'); return; }
+    if(keys.length > 70){ showToast('Maximum 70 matches per code — remove some','warn'); return; }
     // Capture the generator's name (remembered per browser). Prompt once if unset.
     var nameEl = document.getElementById('genname');
     var name = (nameEl && nameEl.value.trim()) || '';
@@ -1645,14 +1657,14 @@ export function startServer() {
         try {
           const body = JSON.parse((await readBody(req, 64 * 1024)) || "{}");
           keys = Array.isArray(body.keys) ? body.keys.map((k: unknown) => String(k)) : [];
-          if (body.gameType === "goals" || body.gameType === "both") gameType = body.gameType;
+          gameType = validGameType(body.gameType);
           if (body.name) generatorName = String(body.name).trim().slice(0, 60) || "Anonymous";
           if (body.origin === "expert") origin = "expert";
         } catch {
           return json(400, { error: "Bad request body." });
         }
         if (keys.length < 1) return json(400, { error: "Select at least 1 match." });
-        if (keys.length > 50) return json(400, { error: "Maximum 50 matches per booking code." });
+        if (keys.length > 70) return json(400, { error: "Maximum 70 matches per booking code." });
 
         // Path 1: keys backed by an external tip (Predictions tab cards).
         const preds = await getPredictions();
@@ -1775,10 +1787,11 @@ export function startServer() {
         return json(200, { text: text.slice(0, 400), codes: results });
       }
       const dateStr = url.searchParams.get("date") ?? "";
-      const expertCount = Math.max(1, Math.min(50, Number(url.searchParams.get("n")) || 5));
+      const expertCount = Math.max(1, Math.min(70, Number(url.searchParams.get("n")) || 5));
       const expertDays = Math.max(1, Math.min(30, Number(url.searchParams.get("days")) || 5));
       const typeParam = url.searchParams.get("type");
-      const expertGameType: GameType = typeParam === "goals" ? "goals" : typeParam === "both" ? "both" : "result";
+      // Default view = the daily "safe picks" mix (high strike-rate markets).
+      const expertGameType: GameType = typeParam ? validGameType(typeParam) : "safe";
       const expertMinConf = Math.max(0, Math.min(90, Number(url.searchParams.get("minconf")) || 0));
       const html = await renderDashboard(mode, tier, dateStr, {
         count: expertCount,

@@ -34,7 +34,7 @@ export async function createBookingCode(legs: BookableLeg[]): Promise<BookingRes
       specifier: l.specifier ?? "",
       outcomeId: l.outcomeId,
     }))
-    .slice(0, 50); // SportyBet slip cap
+    .slice(0, 70); // SportyBet slip cap
   if (selections.length < 1) return { error: "no bookable selections" };
 
   const controller = new AbortController();
