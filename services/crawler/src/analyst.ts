@@ -471,10 +471,13 @@ const comboWinProb = (legs: ComboLeg[]) =>
  * several combos across odds tiers. Sparse inputs simply yield fewer combos.
  */
 export async function getCombos(seed = 0): Promise<Combo[]> {
-  const [safe, value, result] = await Promise.all([
+  const [safe, value, result, boostSafe] = await Promise.all([
     getExpertPicks({ count: 30, days: 21, gameType: "safe", minConfidence: 0.7, seed }),
     getValuePicks({ count: 25, days: 21, seed }),
     getExpertPicks({ count: 40, days: 21, gameType: "result", minConfidence: 0.55, seed }),
+    // Large safe pool (Double Chance / Over 0.5 / etc.) — the building blocks
+    // for SAFE odds boosters: each leg wins ~75-90% of the time.
+    getExpertPicks({ count: 70, days: 21, gameType: "safe", minConfidence: 0.6, seed }),
   ]);
   const combos: Combo[] = [];
   const push = (
@@ -524,11 +527,14 @@ export async function getCombos(seed = 0): Promise<Combo[]> {
   if (bigLegs.length >= 4)
     push("big4", "Big-Odds Four", "🚀", "big", "4 confident but higher-priced results — for a bigger payout", bigLegs);
 
-  // ---- Odds Boosters: reach big payout tiers the SMART way ----
-  // For each target payout, greedily stack the highest-confidence picks until
-  // the combined odds reach it — i.e. the most probable accumulator that pays
-  // ~N×. Each is labelled with its honest combined win chance.
-  const boostPool = result.picks
+  // ---- Odds Boosters: reach big payout tiers the SAFE way ----
+  // Built from the SAFE pool (mostly Double Chance — covers two outcomes, so
+  // ~75-90% per leg). For each target payout, greedily stack the highest-
+  // confidence safe legs until the combined odds reach it — the most probable
+  // accumulator that pays ~N×. Each shows its honest combined win chance;
+  // because every leg is a high-probability Double-Chance-style pick, that
+  // chance is far better than stacking 1X2 favourites for the same odds.
+  const boostPool = boostSafe.picks
     .filter((p) => Number(p.odds) > 1) // any real price
     .sort((a, b) => b.confidence - a.confidence);
   const usedTargets = new Set<string>();
@@ -537,7 +543,7 @@ export async function getCombos(seed = 0): Promise<Combo[]> {
     let prod = 1;
     for (const p of boostPool) {
       if (prod >= target) break;
-      if (legs.length >= 40) break;
+      if (legs.length >= 50) break; // safe legs are short-priced → allow more
       legs.push(asLeg(p));
       prod *= Number(p.odds) || 1;
     }
@@ -559,10 +565,10 @@ export async function getCombos(seed = 0): Promise<Combo[]> {
     const wp = comboWinProb(legs);
     push(
       `boost${target}`,
-      `Odds Booster ${label}`,
+      `Safe Booster ${label}`,
       "🔥",
       "boost",
-      `${legs.length} legs to reach ~${target}× — the most likely way to that payout. Win chance ≈ ${wp !== null ? Math.round(wp * 100) : "?"}% (big payout = big risk).`,
+      `${legs.length} Double-Chance / safe legs to reach ~${target}× — the safest way to that payout (each leg ~75-90%). Win chance ≈ ${wp !== null ? Math.round(wp * 100) : "?"}% — still a long shot; every leg must land.`,
       legs,
     );
   }

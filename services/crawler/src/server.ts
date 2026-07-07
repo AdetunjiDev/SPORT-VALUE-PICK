@@ -969,7 +969,7 @@ async function renderDashboard(
     <div class="xhead card">
       <div>
         <h3 style="margin:0">🎰 Value Combos — ready-made accumulators</h3>
-        <div class="muted small">Auto-assembled every ~10 min from the current Value and Expert picks into ready combos across odds tiers — pick one and book it in a single click. 🏦 bankers combine short-priced high-hit-rate picks; 💎 value combos combine model-edge overlays; 🔥 Odds Boosters chase big payouts (~5× to ~100×) built the smartest way — each shows its honest combined win chance, because a big odds number means a small chance. All football (the only sport we can model). Estimates, not guarantees — every leg must land.</div>
+        <div class="muted small">Auto-assembled every ~10 min from the current Value and Expert picks into ready combos across odds tiers — pick one and book it in a single click. 🏦 bankers combine short-priced high-hit-rate picks; 💎 value combos combine model-edge overlays; 🔥 Odds Boosters chase big payouts built mostly from <b>Double Chance</b> (covers two of three outcomes, ~75-90% per leg) — the safest way to stack big odds — each showing its honest combined win chance. On large boosters the shown odds are an estimate; the exact odds are locked when you generate the code (odds move). All football. Estimates, not guarantees — every leg must land.</div>
       </div>
     </div>
     <div class="cmb-list">${
