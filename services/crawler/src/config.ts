@@ -12,6 +12,10 @@ export const config = {
   // viewers can't see any page (or its source) without it. Empty ⇒ open (local
   // dev). Set APP_PASSWORD in .env before exposing the app anywhere.
   appPassword: process.env.APP_PASSWORD ?? "",
+  // Admin unlock: only admins see source-revealing info (which Telegram channel
+  // a code came from, crawl activity). Regular signed-in users don't. Visit
+  // /admin?key=<ADMIN_KEY> to become admin on this browser.
+  adminKey: process.env.ADMIN_KEY ?? "",
   // --- Monetization (demo gate; real billing = Stripe/Paystack later) ---
   premiumKey: process.env.PREMIUM_ACCESS_KEY ?? "vip2026",
   freeDelayMin: Number(process.env.FREE_CODE_DELAY_MIN ?? 20), // free tier sees codes this many min late

@@ -74,6 +74,9 @@ services:
       DEFAULT_TIER: premium
       # Password gate for the whole dashboard (from .env). Empty = open.
       APP_PASSWORD: ${APP_PASSWORD:-}
+      # Admin key — only admins see the code Source column / crawl activity.
+      # Empty = everyone is admin (owner not locked out by default).
+      ADMIN_KEY: ${ADMIN_KEY:-}
       # API-Football (api-sports.io) premium feed — inherited from .env if set.
       # Leave APIFOOTBALL_KEY empty and the adapter stays off (no cost, app runs).
       APIFOOTBALL_KEY: ${APIFOOTBALL_KEY:-}

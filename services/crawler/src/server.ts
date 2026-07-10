@@ -108,6 +108,7 @@ async function renderDashboard(
     gameType: "safe",
     minConfidence: 0,
   },
+  isAdmin = false,
 ): Promise<string> {
   const preds = mode === "pred" ? await getPredictions() : [];
   // Expert picks: highest-confidence selections across the chosen day window.
@@ -219,7 +220,7 @@ async function renderDashboard(
             : `<button class="btn" onclick="cp(this,'${esc(latest.code)}')">Copy code</button>
                <a class="btn ghost" href="https://www.sportybet.com/ng/?shareCode=${esc(latest.code)}" target="_blank" rel="noopener">Open ↗</a>`
         }
-        <div class="hero-src">${esc(latest.source?.name ?? "—")} · ${new Date(latest.foundAt).toLocaleTimeString()}</div>
+        <div class="hero-src">${isAdmin ? `${esc(latest.source?.name ?? "—")} · ` : ""}${new Date(latest.foundAt).toLocaleTimeString()}</div>
       </div>
     </div>`
     : "";
@@ -241,7 +242,7 @@ async function renderDashboard(
         <td class="muted">${esc(c.league ?? "—")}</td>
         <td class="muted">${new Date(c.foundAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</td>
         <td class="muted">${c.expiresAt ? new Date(c.expiresAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—"}</td>
-        <td class="muted">${esc(c.source?.name ?? "—")}</td>
+        ${isAdmin ? `<td class="muted">${esc(c.source?.name ?? "—")}</td>` : ""}
         <td><span class="pill status s-${esc(c.status)}">${esc(c.status)}</span></td>
       </tr>`;
     })
@@ -1032,7 +1033,7 @@ async function renderDashboard(
         ${dayGroupsHtml || analystHtml ? dayGroupsHtml + analystHtml : '<div class="card empty">No predictions available right now — the source may be updating. Check back shortly.</div>'}${slipBar}`
       : mode === "ai"
         ? `<div class="cards">${aiCards || '<div class="card empty">No AI slips right now — not enough upcoming matches (common late at night). Fresh slips generate automatically as new fixtures and codes come in.</div>'}</div>`
-        : `<div class="split">
+        : `<div class="split${isAdmin ? "" : " full"}">
           <div class="col-main">
             ${heroCard}
             <div class="card">
@@ -1045,14 +1046,16 @@ async function renderDashboard(
                 <table class="grid-table">
                   <thead><tr>
                     <th>Code</th><th>Type</th><th>Score</th><th>Odds</th><th>Games</th>
-                    <th>League</th><th>Found</th><th>Expires</th><th>Source</th><th>Status</th>
+                    <th>League</th><th>Found</th><th>Expires</th>${isAdmin ? "<th>Source</th>" : ""}<th>Status</th>
                   </tr></thead>
-                  <tbody id="rows">${rows || `<tr><td colspan="10" class="muted" style="text-align:center;padding:24px">No codes for ${showAll ? "any date yet" : dayLabel(day) + " yet"} — new codes appear as channels post them. Try “ALL” or an earlier date above.</td></tr>`}</tbody>
+                  <tbody id="rows">${rows || `<tr><td colspan="${isAdmin ? 10 : 9}" class="muted" style="text-align:center;padding:24px">No codes for ${showAll ? "any date yet" : dayLabel(day) + " yet"} — new codes appear as channels post them. Try “ALL” or an earlier date above.</td></tr>`}</tbody>
                 </table>
               </div>
             </div>
           </div>
-          <div class="col-side">
+          ${
+            isAdmin
+              ? `<div class="col-side">
             <div class="card">
               <div class="card-head"><h3>Data sources</h3></div>
               <div class="src-status">
@@ -1071,7 +1074,9 @@ async function renderDashboard(
               <ul class="runs">${runRows || '<li class="muted">No runs yet.</li>'}</ul>
               <div class="muted small mono">${esc(lastSummary)}</div>
             </div>
-          </div>
+          </div>`
+              : ""
+          }
         </div>`;
 
   return `<!doctype html>
@@ -1392,6 +1397,7 @@ async function renderDashboard(
   .day-card.pick{border-style:dashed;cursor:pointer;justify-content:center}
   .dc-input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
   .split{display:grid;grid-template-columns:1fr 320px;gap:18px;align-items:start}
+  .split.full{grid-template-columns:1fr}
   .col-side .card{position:sticky;top:90px}
   /* Hero */
   .hero{background:linear-gradient(120deg,var(--indigo),#7b4bd6 55%,var(--primary));color:#fff;
@@ -1496,6 +1502,7 @@ async function renderDashboard(
     <a class="nav-item" href="/api/ai-slips" target="_blank"><span class="ni">🧠</span>AI Slips API</a>
     <a class="nav-item" href="/health" target="_blank"><span class="ni">💓</span>Health</a>
     <div class="side-foot">
+      ${config.adminKey && isAdmin ? `<div style="margin-bottom:8px"><span style="background:#3a2a06;color:#f6c453;font-weight:800;font-size:10px;padding:2px 8px;border-radius:6px">👑 ADMIN</span> <a href="/admin/off" style="color:var(--muted);font-size:11px">exit</a></div>` : ""}
       <span class="live-dot"></span>Live · scans every ${Math.round(intervalSec / 60)} min<br/>
       <span style="opacity:.8">18+ · Bet responsibly</span>
     </div>
@@ -1954,6 +1961,32 @@ export function startServer() {
           ? "premium"
           : "free";
 
+      // Admin sees source-revealing info (which channel a code came from,
+      // crawl activity). If no ADMIN_KEY is configured, treat everyone as admin
+      // so the owner isn't locked out of their own data by default.
+      const isAdmin =
+        !config.adminKey ||
+        new RegExp(`(?:^|;\\s*)admin=${sha256Hex(config.adminKey)}(?:;|$)`).test(req.headers.cookie ?? "");
+
+      // Admin unlock / lock routes.
+      if (url.pathname === "/admin") {
+        if (config.adminKey && url.searchParams.get("key") === config.adminKey) {
+          res.writeHead(303, {
+            "Set-Cookie": `admin=${sha256Hex(config.adminKey)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax`,
+            Location: "/",
+          });
+        } else {
+          res.writeHead(303, { Location: "/" });
+        }
+        res.end();
+        return;
+      }
+      if (url.pathname === "/admin/off") {
+        res.writeHead(303, { "Set-Cookie": "admin=; Path=/; Max-Age=0; SameSite=Lax", Location: "/" });
+        res.end();
+        return;
+      }
+
       if (req.method === "POST" && url.pathname === "/scan") {
         // Fire in the background so the button returns instantly; the dashboard
         // polls /health and refreshes when the scan completes.
@@ -2204,12 +2237,18 @@ export function startServer() {
       // Default view = the daily "safe picks" mix (high strike-rate markets).
       const expertGameType: GameType = typeParam ? validGameType(typeParam) : "safe";
       const expertMinConf = Math.max(0, Math.min(90, Number(url.searchParams.get("minconf")) || 0));
-      const html = await renderDashboard(mode, tier, dateStr, {
-        count: expertCount,
-        days: expertDays,
-        gameType: expertGameType,
-        minConfidence: expertMinConf, // plain percentage (0/50/60/70/80/90) — kept for form state
-      });
+      const html = await renderDashboard(
+        mode,
+        tier,
+        dateStr,
+        {
+          count: expertCount,
+          days: expertDays,
+          gameType: expertGameType,
+          minConfidence: expertMinConf, // plain percentage (0/50/60/70/80/90) — kept for form state
+        },
+        isAdmin,
+      );
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(html);
     } catch (err: any) {
