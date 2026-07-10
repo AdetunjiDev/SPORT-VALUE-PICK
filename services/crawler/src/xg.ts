@@ -105,6 +105,16 @@ export interface MatchAnalysis {
   pickCode: "1" | "X" | "2"; // model's result pick (for the slip)
   pickOdds?: string; // SportyBet odds for that result
   confidence: number; // model prob for the pick (0..1)
+  options: BetOption[]; // selectable markets from the analysis (result, O/U, BTTS, DC)
+}
+
+export interface BetOption {
+  code: string; // PICKS code (bookable)
+  label: string; // e.g. "Over 2.5 Goals"
+  market: string; // "Result" | "Goals" | "BTTS" | "Double Chance"
+  prob: number; // model probability 0..1
+  odds?: string; // SportyBet odds
+  key: string; // home|away|CODE (bookable key)
 }
 
 /** Full statistical analysis for one fixture, or null if not enough prices. */
@@ -140,6 +150,34 @@ export function analyzeEvent(ev: SbEvent): MatchAnalysis | null {
   const conf = Math.max(pHome, pDraw, pAway);
   const pickOdds = ev.outcomes[pickCode];
 
+  // Selectable bet options from the analysis: the result, the model-favoured
+  // Over/Under line, the model-favoured BTTS side, and the safest Double
+  // Chance. Each only included if SportyBet actually prices it.
+  const opt = (code: string, label: string, market: string, prob: number): BetOption | null => {
+    const o = ev.outcomes[code];
+    if (!o || o <= 1) return null;
+    return {
+      code,
+      label,
+      market,
+      prob: round(prob, 4),
+      odds: o.toFixed(2),
+      key: `${ev.home}|${ev.away}|${code}`.toLowerCase(),
+    };
+  };
+  const resultLabel = pickCode === "1" ? `${ev.home} Win` : pickCode === "2" ? `${ev.away} Win` : "Draw";
+  const dcs: [string, number, string][] = [
+    ["DC1X", pHome + pDraw, `${ev.home} or Draw`],
+    ["DC12", pHome + pAway, `${ev.home} or ${ev.away}`],
+    ["DCX2", pDraw + pAway, `Draw or ${ev.away}`],
+  ].sort((a, b) => (b[1] as number) - (a[1] as number)) as [string, number, string][];
+  const options = [
+    opt(pickCode, resultLabel, "Result", conf),
+    over25 >= 0.5 ? opt("O25", "Over 2.5 Goals", "Goals", over25) : opt("U25", "Under 2.5 Goals", "Goals", 1 - over25),
+    btts >= 0.5 ? opt("BTTSY", "Both Teams To Score", "BTTS", btts) : opt("BTTSN", "Both NOT To Score", "BTTS", 1 - btts),
+    opt(dcs[0][0], `${dcs[0][2]} (DC)`, "Double Chance", dcs[0][1]),
+  ].filter((o): o is BetOption => o !== null);
+
   return {
     eventId: ev.eventId,
     home: ev.home,
@@ -160,6 +198,7 @@ export function analyzeEvent(ev: SbEvent): MatchAnalysis | null {
     pickCode,
     pickOdds: pickOdds ? pickOdds.toFixed(2) : undefined,
     confidence: round(conf, 4),
+    options,
   };
 }
 

@@ -1059,7 +1059,6 @@ async function renderDashboard(
             `<div class="an-score"><b>${esc(s.score)}</b><span>${Math.round(s.prob * 100)}%</span></div>`,
         )
         .join("");
-      const selKey = `${m.home}|${m.away}|${m.pickCode}`.toLowerCase();
       return `
       <div class="an-card">
         <div class="an-head">
@@ -1085,7 +1084,13 @@ async function renderDashboard(
             <div class="an-lbl">Most likely scores</div>
             <div class="an-scores">${scores}</div>
             <div class="an-verdict">🧮 Model verdict: <b>${esc(m.verdict)}</b> · likeliest <b>${esc(m.likeliest)}</b> · ${Math.round(m.confidence * 100)}% confidence</div>
-            <label class="selbox" title="Add the model's result pick to your slip"><input type="checkbox" data-key="${esc(selKey)}" onchange="selTog(this)"/><span>➕ Add ${esc(m.verdict)}${m.pickOdds ? " @" + esc(m.pickOdds) : ""} to slip</span></label>
+            <div class="an-lbl">Pick a market to add (one per match)</div>
+            <div class="an-opts">${m.options
+              .map(
+                (o) =>
+                  `<label class="an-opt" title="${esc(o.market)} · model ${Math.round(o.prob * 100)}%"><input type="checkbox" data-key="${esc(o.key)}" data-match="${esc(m.home + "|" + m.away)}" onchange="anTog(this)"/><span class="an-opt-l">${esc(o.label)}</span><span class="an-opt-o">${o.odds ? "@" + esc(o.odds) : ""}</span><span class="an-opt-p">${Math.round(o.prob * 100)}%</span></label>`,
+              )
+              .join("")}</div>
           </div>
         </div>
       </div>`;
@@ -1344,6 +1349,15 @@ async function renderDashboard(
   .an-score{background:#f4f6fb;border:1px solid var(--line);border-radius:9px;padding:6px 10px;text-align:center;min-width:52px}
   .an-score b{display:block;font-size:15px} .an-score span{font-size:11px;color:var(--muted)}
   .an-verdict{font-size:12.5px;background:#e9f1fe;border:1px solid #cfe2fb;border-radius:9px;padding:8px 10px;margin-bottom:8px}
+  .an-opts{display:flex;flex-direction:column;gap:6px}
+  .an-opt{display:grid;grid-template-columns:auto 1fr auto auto;gap:8px;align-items:center;
+    border:1px solid var(--line);border-radius:9px;padding:7px 10px;cursor:pointer;font-size:12.5px}
+  .an-opt:hover{background:#f7f9fc}
+  .an-opt.on{border-color:var(--green);background:#eafaf1}
+  .an-opt input{accent-color:var(--green);cursor:pointer}
+  .an-opt-l{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .an-opt-o{color:var(--indigo);font-weight:800}
+  .an-opt-p{color:var(--muted);font-size:11px;min-width:34px;text-align:right}
   @media(max-width:640px){ .an-grid{grid-template-columns:1fr} .an-head{flex-direction:column} }
   .cmb-foot{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
   .cmb-res{display:flex;align-items:center;gap:8px}
@@ -1742,6 +1756,21 @@ async function renderDashboard(
     var card = cb.closest('.slip') || cb.closest('.xcard');
     if(card) card.classList.toggle('picked', cb.checked);
     updBar();
+  }
+  // AI Analysis options: only ONE market per match can be booked (same event),
+  // so ticking one option unticks the others in that match.
+  function anTog(cb){
+    if(cb.checked){
+      var match = cb.getAttribute('data-match');
+      document.querySelectorAll('input[type=checkbox][data-match="'+match+'"]').forEach(function(o){
+        if(o !== cb && o.checked){ o.checked = false; delete SEL[o.getAttribute('data-key')]; }
+      });
+    }
+    var lab = cb.closest('.an-opt'); if(lab) lab.classList.toggle('on', cb.checked);
+    document.querySelectorAll('input[type=checkbox][data-match="'+cb.getAttribute('data-match')+'"]').forEach(function(o){
+      var l=o.closest('.an-opt'); if(l) l.classList.toggle('on', o.checked);
+    });
+    selTog(cb);
   }
   function updBar(){
     var n = Object.keys(SEL).length;
