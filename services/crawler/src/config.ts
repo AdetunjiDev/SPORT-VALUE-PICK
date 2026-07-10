@@ -7,6 +7,11 @@ export const config = {
     "sportybet-ai-crawler/0.1 (+compliant research; contact admin@sportybet-ai.local)",
   // Per-source fetch timeout.
   fetchTimeoutMs: Number(process.env.CRAWLER_FETCH_TIMEOUT_MS ?? 15000),
+  // --- App access gate ---
+  // When set, the WHOLE dashboard requires this password to load — external
+  // viewers can't see any page (or its source) without it. Empty ⇒ open (local
+  // dev). Set APP_PASSWORD in .env before exposing the app anywhere.
+  appPassword: process.env.APP_PASSWORD ?? "",
   // --- Monetization (demo gate; real billing = Stripe/Paystack later) ---
   premiumKey: process.env.PREMIUM_ACCESS_KEY ?? "vip2026",
   freeDelayMin: Number(process.env.FREE_CODE_DELAY_MIN ?? 20), // free tier sees codes this many min late

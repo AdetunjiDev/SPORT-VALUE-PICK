@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { prisma } from "@sportybet/db";
 import { RESPONSIBLE_GAMBLING_DISCLAIMER } from "@sportybet/shared";
 import { config } from "./config.js";
@@ -48,6 +49,45 @@ function esc(s: unknown): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function sha256Hex(s: string): string {
+  return createHash("sha256").update(s).digest("hex");
+}
+
+/** Full-page password gate shown when APP_PASSWORD is set and the visitor isn't authed. */
+function renderLogin(err: boolean): string {
+  return `<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>SportyBet AI · Sign in</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1424;
+    font-family:'Inter',ui-sans-serif,system-ui,'Segoe UI',Roboto,sans-serif;color:#eef1f7}
+  .box{width:340px;max-width:90vw;background:#161c2e;border:1px solid #263049;border-radius:16px;
+    padding:30px 26px;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+  .logo{width:44px;height:44px;border-radius:12px;background:linear-gradient(135deg,#f2683c,#5b4bd6);
+    display:grid;place-items:center;font-size:22px;margin:0 auto 14px}
+  h1{font-size:18px;text-align:center;margin:0 0 4px}
+  p{text-align:center;color:#8b94ad;font-size:13px;margin:0 0 20px}
+  input{width:100%;padding:12px 14px;border:1px solid #2c3854;border-radius:10px;background:#0f1424;
+    color:#fff;font-size:15px;outline:none;margin-bottom:12px}
+  input:focus{border-color:#f2683c}
+  button{width:100%;padding:12px;border:0;border-radius:10px;font-weight:800;font-size:15px;cursor:pointer;
+    background:linear-gradient(135deg,#f2683c,#f7864f);color:#fff}
+  .err{color:#ff8a8a;font-size:13px;text-align:center;margin:-4px 0 12px}
+  .foot{text-align:center;font-size:11px;margin-top:16px;color:#5c667e}
+</style></head><body>
+  <form class="box" method="post" action="/login">
+    <div class="logo">⚽</div>
+    <h1>SportyBet AI</h1>
+    <p>Private dashboard — enter the password to continue</p>
+    ${err ? '<div class="err">Wrong password. Try again.</div>' : ""}
+    <input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password"/>
+    <button type="submit">Sign in</button>
+    <div class="foot">Authorized access only</div>
+  </form>
+</body></html>`;
 }
 
 function stars(n: number): string {
@@ -1856,6 +1896,43 @@ export function startServer() {
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
+
+      // ---- App access gate ----
+      // If APP_PASSWORD is set, every route requires a valid auth cookie except
+      // the login page/handler and /health (kept open for uptime monitors).
+      // External viewers can't load any page — or its source — without it.
+      if (config.appPassword) {
+        const authToken = sha256Hex(config.appPassword);
+        const cookies = req.headers.cookie ?? "";
+        const authed = new RegExp(`(?:^|;\\s*)app_auth=${authToken}(?:;|$)`).test(cookies);
+        const open = url.pathname === "/login" || url.pathname === "/health";
+        if (url.pathname === "/logout") {
+          res.writeHead(303, { "Set-Cookie": "app_auth=; Path=/; Max-Age=0; SameSite=Lax", Location: "/login" });
+          res.end();
+          return;
+        }
+        if (url.pathname === "/login" && req.method === "POST") {
+          const body = new URLSearchParams((await readBody(req, 4096)) || "");
+          if (body.get("password") === config.appPassword) {
+            res.writeHead(303, {
+              // 30-day session; HttpOnly so page scripts can't read it.
+              "Set-Cookie": `app_auth=${authToken}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax`,
+              Location: "/",
+            });
+            res.end();
+          } else {
+            res.writeHead(401, { "Content-Type": "text/html; charset=utf-8" });
+            res.end(renderLogin(true));
+          }
+          return;
+        }
+        if (!authed && !open) {
+          res.writeHead(url.pathname === "/login" ? 200 : 401, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(renderLogin(false));
+          return;
+        }
+      }
+
       const modeParam = url.searchParams.get("mode");
       const mode: Mode =
         modeParam === "ai"
