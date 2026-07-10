@@ -1105,13 +1105,13 @@ async function renderDashboard(
       <form class="xform" method="get" action="/">
         <input type="hidden" name="mode" value="analysis"/>
         <label>Matches
-          <select name="n">${[6, 8, 10, 12, 15, 20, 30]
+          <select name="n">${[6, 8, 10, 12, 15, 20, 30, 40, 50, 70]
             .map((n) => `<option value="${n}"${n === expertOpts.count ? " selected" : ""}>${n}</option>`)
             .join("")}</select>
         </label>
         <label>Within
-          <select name="days">${[1, 2, 3, 5, 7, 14]
-            .map((d) => `<option value="${d}"${d === expertOpts.days ? " selected" : ""}>${d === 1 ? "1 day" : d + " days"}</option>`)
+          <select name="days">${[1, 2, 3, 5, 7, 14, 21, 30]
+            .map((d) => `<option value="${d}"${d === expertOpts.days ? " selected" : ""}>${d === 30 ? "1 month" : d === 1 ? "1 day" : d + " days"}</option>`)
             .join("")}</select>
         </label>
         <button class="btn" type="submit">Analyse</button>

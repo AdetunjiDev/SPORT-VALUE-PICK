@@ -171,12 +171,35 @@ export function analyzeEvent(ev: SbEvent): MatchAnalysis | null {
     ["DC12", pHome + pAway, `${ev.home} or ${ev.away}`],
     ["DCX2", pDraw + pAway, `Draw or ${ev.away}`],
   ].sort((a, b) => (b[1] as number) - (a[1] as number)) as [string, number, string][];
-  const options = [
+  const pHomeScore = 1 - Math.exp(-lh); // P(home scores ≥ 1)
+  const pAwayScore = 1 - Math.exp(-la);
+  const dnbH = pHome / (pHome + pAway || 1);
+
+  // Candidate markets in priority order; we take the first FOUR that SportyBet
+  // actually prices, so nearly every match gets a full set of 4 options even if
+  // one market (e.g. BTTS) is missing for a small-league fixture.
+  const candidates: (BetOption | null)[] = [
     opt(pickCode, resultLabel, "Result", conf),
     over25 >= 0.5 ? opt("O25", "Over 2.5 Goals", "Goals", over25) : opt("U25", "Under 2.5 Goals", "Goals", 1 - over25),
     btts >= 0.5 ? opt("BTTSY", "Both Teams To Score", "BTTS", btts) : opt("BTTSN", "Both NOT To Score", "BTTS", 1 - btts),
     opt(dcs[0][0], `${dcs[0][2]} (DC)`, "Double Chance", dcs[0][1]),
-  ].filter((o): o is BetOption => o !== null);
+    // Fallbacks to guarantee 4 when a primary market isn't priced:
+    over15 >= 0.5 ? opt("O15", "Over 1.5 Goals", "Goals", over15) : opt("U15", "Under 1.5 Goals", "Goals", 1 - over15),
+    dnbH >= 0.5
+      ? opt("DNBH", `${ev.home} (Draw No Bet)`, "Draw No Bet", dnbH)
+      : opt("DNBA", `${ev.away} (Draw No Bet)`, "Draw No Bet", 1 - dnbH),
+    opt("HO05", `${ev.home} Over 0.5`, "Team Goals", pHomeScore),
+    opt("AO05", `${ev.away} Over 0.5`, "Team Goals", pAwayScore),
+    opt("DC12", `${ev.home} or ${ev.away}`, "Double Chance", pHome + pAway),
+  ];
+  const seen = new Set<string>();
+  const options: BetOption[] = [];
+  for (const o of candidates) {
+    if (!o || seen.has(o.code)) continue;
+    seen.add(o.code);
+    options.push(o);
+    if (options.length >= 4) break;
+  }
 
   return {
     eventId: ev.eventId,
@@ -211,8 +234,8 @@ export interface AnalysisResult {
 
 /** Analyse the soonest upcoming fixtures (that have usable prices). */
 export async function getMatchAnalyses(count = 12, days = 5): Promise<AnalysisResult> {
-  const n = Math.max(1, Math.min(60, Math.floor(count) || 12));
-  const d = Math.max(1, Math.min(14, Math.floor(days) || 5));
+  const n = Math.max(1, Math.min(70, Math.floor(count) || 12));
+  const d = Math.max(1, Math.min(30, Math.floor(days) || 5));
   const now = Date.now();
   const maxT = now + d * 86_400_000;
 
@@ -222,13 +245,27 @@ export async function getMatchAnalyses(count = 12, days = 5): Promise<AnalysisRe
     .sort((a, b) => a.kickoff - b.kickoff);
 
   const out: MatchAnalysis[] = [];
+  const spare: MatchAnalysis[] = []; // fixtures with < 4 options, used only to backfill
   let scanned = 0;
   for (const ev of inWindow) {
     const a = analyzeEvent(ev);
     if (!a) continue;
     scanned += 1;
-    out.push(a);
-    if (out.length >= n) break;
+    // Prefer matches with a full set of 4 options so the UI is consistent;
+    // there are hundreds of fixtures, so we can afford to skip thin ones.
+    if (a.options.length >= 4) {
+      out.push(a);
+      if (out.length >= n) break;
+    } else if (spare.length < n) {
+      spare.push(a);
+    }
   }
+  // If we couldn't find enough 4-option matches, backfill with the best of the
+  // rest rather than under-deliver on the requested count.
+  for (const a of spare) {
+    if (out.length >= n) break;
+    out.push(a);
+  }
+  out.sort((x, y) => new Date(x.kickoff).getTime() - new Date(y.kickoff).getTime());
   return { matches: out, requested: n, windowDays: d, scanned };
 }
