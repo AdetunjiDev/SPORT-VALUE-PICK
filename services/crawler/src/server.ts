@@ -19,6 +19,7 @@ import {
   getCombos,
   type GameType,
 } from "./analyst.js";
+import { getMatchAnalyses } from "./xg.js";
 
 const GAME_TYPES: GameType[] = ["result", "goals", "double", "dnb", "btts", "teamgoals", "safe", "both"];
 const validGameType = (v: unknown): GameType =>
@@ -53,6 +54,11 @@ function esc(s: unknown): string {
 
 function sha256Hex(s: string): string {
   return createHash("sha256").update(s).digest("hex");
+}
+
+/** Trim a team name for compact labels (first two words, capped length). */
+function shortName(name: string): string {
+  return name.split(/\s+/).slice(0, 2).join(" ").slice(0, 16);
 }
 
 /** Full-page password gate shown when APP_PASSWORD is set and the visitor isn't authed. */
@@ -95,7 +101,7 @@ function stars(n: number): string {
   return "★".repeat(v) + "☆".repeat(5 - v);
 }
 
-type Mode = "human" | "ai" | "pred" | "expert" | "value" | "combo" | "saved";
+type Mode = "human" | "ai" | "pred" | "expert" | "value" | "combo" | "analysis" | "saved";
 type Tier = "free" | "premium";
 
 async function renderDashboard(
@@ -137,6 +143,15 @@ async function renderDashboard(
     mode === "combo"
       ? await getCombos(Math.floor(Date.now() / (10 * 60_000))).catch(() => [])
       : [];
+  const analysis =
+    mode === "analysis"
+      ? await getMatchAnalyses(expertOpts.count, expertOpts.days).catch(() => ({
+          matches: [],
+          requested: 0,
+          windowDays: 0,
+          scanned: 0,
+        }))
+      : { matches: [], requested: 0, windowDays: 0, scanned: 0 };
   const savedCodes =
     mode === "saved"
       ? await prisma.generatedCode
@@ -574,7 +589,13 @@ async function renderDashboard(
     : 0;
   const bestCombo = combos.length ? Math.max(...combos.map((c) => c.combinedOdds)) : 0;
   const kpis =
-    mode === "combo"
+    mode === "analysis"
+      ? `
+      ${kpi("📊", analysis.matches.length, "matches modelled", "indigo")}
+      ${kpi("🥅", analysis.matches.length ? (analysis.matches.reduce((a, m) => a + m.xgHome + m.xgAway, 0) / analysis.matches.length).toFixed(2) : "—", "avg total xG", "green")}
+      ${kpi("🎯", analysis.matches.filter((m) => m.confidence >= 0.6).length, "strong verdicts (60%+)", "orange")}
+      ${kpi("🔢", "Poisson", "model", "blue")}`
+      : mode === "combo"
       ? `
       ${kpi("🎰", combos.length, "combos ready", "indigo")}
       ${kpi("💎", combos.filter((c) => c.kind === "value").length, "value combos", "green")}
@@ -1018,8 +1039,88 @@ async function renderDashboard(
       '<div class="card empty">No combos available right now — not enough qualifying picks in the current window. They rebuild automatically as fixtures and model coverage come in (busiest mid-day WAT).</div>'
     }</div>`;
 
+  // ---- AI Analysis: Poisson model calibrated to live odds ----
+  const bar = (label: string, pct: number, cls: string) =>
+    `<div class="an-bar"><span class="an-bl">${label}</span><div class="an-bt"><div class="an-bf ${cls}" style="width:${Math.round(pct * 100)}%"></div></div><span class="an-bv">${Math.round(pct * 100)}%</span></div>`;
+  const analysisCards = analysis.matches
+    .map((m) => {
+      const kick = new Date(m.kickoff).toLocaleString("en", {
+        weekday: "short",
+        day: "numeric",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: "Africa/Lagos",
+      });
+      const scores = m.topScores
+        .slice(0, 5)
+        .map(
+          (s) =>
+            `<div class="an-score"><b>${esc(s.score)}</b><span>${Math.round(s.prob * 100)}%</span></div>`,
+        )
+        .join("");
+      const selKey = `${m.home}|${m.away}|${m.pickCode}`.toLowerCase();
+      return `
+      <div class="an-card">
+        <div class="an-head">
+          <div>
+            <div class="an-match">${esc(m.home)} <span class="muted">v</span> ${esc(m.away)}</div>
+            <div class="muted small">${esc(m.league ?? "Football")} · ⏰ ${esc(kick)} WAT</div>
+          </div>
+          <div class="an-xg" title="Model expected goals">
+            <b>${m.xgHome.toFixed(2)} – ${m.xgAway.toFixed(2)}</b><small>expected goals (xG-model)</small>
+          </div>
+        </div>
+        <div class="an-grid">
+          <div class="an-col">
+            <div class="an-lbl">Match result</div>
+            ${bar("1 " + esc(shortName(m.home)), m.pHome, "h")}
+            ${bar("X Draw", m.pDraw, "d")}
+            ${bar("2 " + esc(shortName(m.away)), m.pAway, "a")}
+            <div class="an-lbl" style="margin-top:8px">Goals</div>
+            ${bar("Over 2.5", m.over25, "g")}
+            ${bar("Both score", m.btts, "g")}
+          </div>
+          <div class="an-col">
+            <div class="an-lbl">Most likely scores</div>
+            <div class="an-scores">${scores}</div>
+            <div class="an-verdict">🧮 Model verdict: <b>${esc(m.verdict)}</b> · likeliest <b>${esc(m.likeliest)}</b> · ${Math.round(m.confidence * 100)}% confidence</div>
+            <label class="selbox" title="Add the model's result pick to your slip"><input type="checkbox" data-key="${esc(selKey)}" onchange="selTog(this)"/><span>➕ Add ${esc(m.verdict)}${m.pickOdds ? " @" + esc(m.pickOdds) : ""} to slip</span></label>
+          </div>
+        </div>
+      </div>`;
+    })
+    .join("");
+  const analysisBody = `
+    <div class="xhead card">
+      <div>
+        <h3 style="margin:0">📊 AI Match Analysis — statistical model</h3>
+        <div class="muted small">A <b>Poisson goals model</b> calibrated to live SportyBet prices: it solves each team's expected goals from the market, then computes the full correct-score matrix — giving match probabilities, correct-score probabilities, BTTS and over/under, the honest data-driven way. <b>Not</b> shot-based Opta xG (that needs event data we don't have); this is the market-calibrated model real prediction sites use. Estimates, not guarantees.</div>
+      </div>
+      <form class="xform" method="get" action="/">
+        <input type="hidden" name="mode" value="analysis"/>
+        <label>Matches
+          <select name="n">${[6, 8, 10, 12, 15, 20, 30]
+            .map((n) => `<option value="${n}"${n === expertOpts.count ? " selected" : ""}>${n}</option>`)
+            .join("")}</select>
+        </label>
+        <label>Within
+          <select name="days">${[1, 2, 3, 5, 7, 14]
+            .map((d) => `<option value="${d}"${d === expertOpts.days ? " selected" : ""}>${d === 1 ? "1 day" : d + " days"}</option>`)
+            .join("")}</select>
+        </label>
+        <button class="btn" type="submit">Analyse</button>
+      </form>
+    </div>
+    <div class="an-list">${
+      analysisCards ||
+      '<div class="card empty">No fixtures with enough live prices to model right now — try a wider window, or check back as odds populate (busiest mid-day WAT).</div>'
+    }</div>${slipBar}`;
+
   const body =
-    mode === "combo"
+    mode === "analysis"
+      ? analysisBody
+      : mode === "combo"
       ? comboBody
       : mode === "saved"
       ? savedBody
@@ -1223,6 +1324,27 @@ async function renderDashboard(
   .cmb-m{font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .cmb-p{white-space:nowrap} .cmb-p b{color:var(--indigo)}
   .cmb-k{font-size:11px;white-space:nowrap}
+  /* AI Analysis */
+  .an-list{display:flex;flex-direction:column;gap:14px}
+  .an-card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px;box-shadow:var(--shadow);border-left:4px solid var(--blue)}
+  .an-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:12px}
+  .an-match{font-weight:800;font-size:16px}
+  .an-xg{text-align:right;flex-shrink:0}
+  .an-xg b{font-size:22px;line-height:1;color:var(--blue)} .an-xg small{display:block;font-size:10px;color:var(--muted)}
+  .an-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .an-col{min-width:0}
+  .an-lbl{font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px}
+  .an-bar{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:12px}
+  .an-bl{width:96px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+  .an-bt{flex:1;height:10px;background:#eef1f8;border-radius:999px;overflow:hidden}
+  .an-bf{height:100%;border-radius:999px}
+  .an-bf.h{background:var(--green)} .an-bf.a{background:var(--primary)} .an-bf.d{background:var(--muted)} .an-bf.g{background:var(--blue)}
+  .an-bv{width:34px;text-align:right;font-weight:700;flex-shrink:0}
+  .an-scores{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .an-score{background:#f4f6fb;border:1px solid var(--line);border-radius:9px;padding:6px 10px;text-align:center;min-width:52px}
+  .an-score b{display:block;font-size:15px} .an-score span{font-size:11px;color:var(--muted)}
+  .an-verdict{font-size:12.5px;background:#e9f1fe;border:1px solid #cfe2fb;border-radius:9px;padding:8px 10px;margin-bottom:8px}
+  @media(max-width:640px){ .an-grid{grid-template-columns:1fr} .an-head{flex-direction:column} }
   .cmb-foot{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
   .cmb-res{display:flex;align-items:center;gap:8px}
   @media(max-width:640px){ .cmb-leg{grid-template-columns:1fr auto} .cmb-k{display:none} }
@@ -1495,6 +1617,7 @@ async function renderDashboard(
     ${nav("pred", "📈", "Predictions", mode === "pred")}
     ${nav("expert", "🎯", "Expert Picks", mode === "expert")}
     ${nav("value", "💎", "Value Picks", mode === "value")}
+    ${nav("analysis", "📊", "AI Analysis", mode === "analysis")}
     ${nav("combo", "🎰", "Value Combos", mode === "combo")}
     ${nav("saved", "💾", "Saved Codes", mode === "saved")}
     <div class="nav-label">Data</div>
@@ -1510,8 +1633,8 @@ async function renderDashboard(
   <div class="app">
     <div class="topbar">
       <div>
-        <h1>${mode === "combo" ? "Value Combos" : mode === "value" ? "Value Picks" : mode === "saved" ? "Saved Codes" : mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
-        <div class="sub">${mode === "combo" ? "Ready-made accumulators auto-built from the best picks — book one in a click" : mode === "value" ? "Higher-odds opportunities where a model beats the market price — EV-ranked, estimates not guarantees" : mode === "saved" ? "Every generated code — with the day, time and who made it" : mode === "expert" ? "Confidence-ranked picks across your chosen window — estimates, never guarantees" : mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
+        <h1>${mode === "analysis" ? "AI Match Analysis" : mode === "combo" ? "Value Combos" : mode === "value" ? "Value Picks" : mode === "saved" ? "Saved Codes" : mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
+        <div class="sub">${mode === "analysis" ? "Poisson model calibrated to live odds — match & correct-score probabilities" : mode === "combo" ? "Ready-made accumulators auto-built from the best picks — book one in a click" : mode === "value" ? "Higher-odds opportunities where a model beats the market price — EV-ranked, estimates not guarantees" : mode === "saved" ? "Every generated code — with the day, time and who made it" : mode === "expert" ? "Confidence-ranked picks across your chosen window — estimates, never guarantees" : mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
       </div>
       <div class="search"><input id="search" placeholder="Search codes, leagues, sources…" oninput="flt(this.value)"/></div>
       <div class="top-right">
@@ -1952,9 +2075,11 @@ export function startServer() {
                 ? "value"
                 : modeParam === "combo"
                   ? "combo"
-                  : modeParam === "saved"
-                    ? "saved"
-                    : "human";
+                  : modeParam === "analysis"
+                    ? "analysis"
+                    : modeParam === "saved"
+                      ? "saved"
+                      : "human";
       const tier: Tier =
         config.defaultTier === "premium" ||
         /(?:^|;\s*)tier=premium(?:;|$)/.test(req.headers.cookie ?? "")
@@ -2228,7 +2353,8 @@ export function startServer() {
         return json(200, { text: text.slice(0, 400), codes: results });
       }
       const dateStr = url.searchParams.get("date") ?? "";
-      const expertCount = Math.max(1, Math.min(70, Number(url.searchParams.get("n")) || 5));
+      const countDefault = mode === "analysis" ? 12 : 5;
+      const expertCount = Math.max(1, Math.min(70, Number(url.searchParams.get("n")) || countDefault));
       // Value mode defaults to a wider window (14d) since overlays are sparse;
       // other modes default to 5 days.
       const daysDefault = mode === "value" ? 14 : 5;
