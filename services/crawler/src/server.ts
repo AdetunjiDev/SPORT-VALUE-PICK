@@ -1634,10 +1634,14 @@ async function renderDashboard(
     ${nav("analysis", "📊", "AI Analysis", mode === "analysis")}
     ${nav("combo", "🎰", "Value Combos", mode === "combo")}
     ${nav("saved", "💾", "Saved Codes", mode === "saved")}
-    <div class="nav-label">Data</div>
+    ${
+      isAdmin
+        ? `<div class="nav-label">Data</div>
     <a class="nav-item" href="/api/codes" target="_blank"><span class="ni">🔗</span>Codes API</a>
     <a class="nav-item" href="/api/ai-slips" target="_blank"><span class="ni">🧠</span>AI Slips API</a>
-    <a class="nav-item" href="/health" target="_blank"><span class="ni">💓</span>Health</a>
+    <a class="nav-item" href="/health" target="_blank"><span class="ni">💓</span>Health</a>`
+        : ""
+    }
     <div class="side-foot">
       ${config.adminKey && isAdmin ? `<div style="margin-bottom:8px"><span style="background:#3a2a06;color:#f6c453;font-weight:800;font-size:10px;padding:2px 8px;border-radius:6px">👑 ADMIN</span> <a href="/admin/off" style="color:var(--muted);font-size:11px">exit</a></div>` : ""}
       <span class="live-dot"></span>Live · scans every ${Math.round(intervalSec / 60)} min<br/>
@@ -2200,6 +2204,22 @@ export function startServer() {
         );
         return;
       }
+      // Raw data dumps are admin-only — they expose codes, sources and internal
+      // data. Blocking the endpoints (not just hiding the menu links) so nobody
+      // can reach them by typing the URL.
+      const adminOnlyApi = new Set([
+        "/api/codes",
+        "/api/ai-slips",
+        "/api/predictions",
+        "/api/expert/record",
+        "/api/expert/roi",
+      ]);
+      if (adminOnlyApi.has(url.pathname) && !isAdmin) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Forbidden" }));
+        return;
+      }
+
       if (url.pathname === "/api/codes") {
         const data = await prisma.humanCode.findMany({
           orderBy: { foundAt: "desc" },
