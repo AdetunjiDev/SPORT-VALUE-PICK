@@ -1579,7 +1579,7 @@ async function renderDashboard(
   const analysisBody = `
     <div class="xhead card">
       <div>
-        <h3 style="margin:0">📊 AI Match Analysis — statistical model</h3>
+        <h3 style="margin:0">📊 AI Match Analysis — statistical model <span class="an-live">🔄 auto-scans every 10 min · next in <b id="an-countdown">10:00</b></span></h3>
         <div class="muted small">A <b>Poisson goals model</b> calibrated to live SportyBet prices: it solves each team's expected goals from the market, then computes the full correct-score matrix — giving match probabilities, correct-score probabilities, BTTS and over/under, the honest data-driven way. <b>Not</b> shot-based Opta xG (that needs event data we don't have); this is the market-calibrated model real prediction sites use. Estimates, not guarantees.</div>
       </div>
       <form class="xform" method="get" action="/">
@@ -1926,6 +1926,9 @@ async function renderDashboard(
   .cmb-p{white-space:nowrap} .cmb-p b{color:#c4b5fd}
   .cmb-k{font-size:11px;white-space:nowrap}
   /* AI Analysis */
+  .an-live{display:inline-block;margin-left:8px;font-size:11px;font-weight:700;color:#0f8a52;
+    background:#eafaf1;border:1px solid #c8ecd8;border-radius:999px;padding:3px 10px;vertical-align:middle}
+  .an-live b{font-variant-numeric:tabular-nums}
   .an-list{display:flex;flex-direction:column;gap:14px}
   .an-card{background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.01)),var(--card);
     border:1px solid var(--line);border-radius:16px;padding:16px 18px;box-shadow:var(--shadow);border-left:4px solid var(--blue);
@@ -2914,6 +2917,7 @@ async function renderDashboard(
   (function(){
     var NEXT = ${nextMs};
     var LASTRUN = "${lastRunIso}";
+    var IS_ANALYSIS = ${mode === "analysis" ? "true" : "false"};
     var el = document.getElementById('countdown');
     // Show a toast for a scan that completed just before this page (re)loaded.
     try{ var done=sessionStorage.getItem('scanDone'); if(done){ sessionStorage.removeItem('scanDone'); showToast(done,'ok'); } }catch(e){}
@@ -2932,12 +2936,29 @@ async function renderDashboard(
         var h = await (await fetch('/health',{cache:'no-store'})).json();
         if(h.nextRunAt){ NEXT = new Date(h.nextRunAt).getTime(); }
         if(h.lastRunAt && LASTRUN && h.lastRunAt !== LASTRUN){
+          // AI Analysis has its own 10-min auto-scan below — don't let the
+          // frequent scan-completion reload interrupt it.
+          if(IS_ANALYSIS){ LASTRUN = h.lastRunAt; return; }
           try{ sessionStorage.setItem('scanDone', niceSummary(h.lastSummary||'')); }catch(e){}
           location.reload();
         } else if(h.lastRunAt && !LASTRUN){ LASTRUN = h.lastRunAt; }
       }catch(e){}
     }
     setInterval(poll, 5000);
+
+    // ---- AI Analysis: auto-scan every 10 minutes ----
+    // The SportyBet odds feed refreshes on a ~10-min clock, so we re-run the
+    // analysis on the same cadence with a visible countdown.
+    if(IS_ANALYSIS){
+      var anEl = document.getElementById('an-countdown');
+      var target = Date.now() + 10*60*1000;
+      function anTick(){
+        var r = Math.round((target - Date.now())/1000);
+        if(r <= 0){ if(anEl) anEl.textContent='refreshing…'; location.reload(); return; }
+        if(anEl){ var m=Math.floor(r/60), s=r%60; anEl.textContent = m+':'+(s<10?'0':'')+s; }
+      }
+      anTick(); setInterval(anTick, 1000);
+    }
   })();
   /* ---- Hero card: interactive 3D tilt (desktop pointers only) ---- */
   (function(){

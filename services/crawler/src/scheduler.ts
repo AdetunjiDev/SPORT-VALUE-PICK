@@ -3,6 +3,7 @@ import { verifyPending } from "./verifier.js";
 import { generateAiSlips } from "./ai.js";
 import { getPredictions } from "./predictions.js";
 import { logExpertPicks, settleExpertPicks } from "./analyst.js";
+import { getSportyFixtures } from "./forebet-ai.js";
 import { config } from "./config.js";
 
 let running = false;
@@ -70,6 +71,14 @@ export async function runCycle(trigger: string): Promise<string> {
     }
     try {
       settled = await settleExpertPicks(12);
+    } catch {
+      /* keep going */
+    }
+    // Keep SportyBet fixtures + odds warm so AI Analysis is always fresh in the
+    // background (the feed self-caches ~10 min, so this refreshes on that clock)
+    // — the analysis "auto-scans every 10 minutes" without anyone loading it.
+    try {
+      await getSportyFixtures();
     } catch {
       /* keep going */
     }
