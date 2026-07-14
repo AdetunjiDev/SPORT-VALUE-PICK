@@ -2921,9 +2921,10 @@ async function renderDashboard(
     var el = document.getElementById('countdown');
     // Show a toast for a scan that completed just before this page (re)loaded.
     try{ var done=sessionStorage.getItem('scanDone'); if(done){ sessionStorage.removeItem('scanDone'); showToast(done,'ok'); } }catch(e){}
-    // Countdown display (updates every second).
+    // Countdown display (updates every second). On the AI Analysis tab the
+    // 10-min auto-scan below drives this instead, so skip the 3-min crawl clock.
     function tick(){
-      if(!el) return;
+      if(!el || IS_ANALYSIS) return;
       if(!NEXT){ el.textContent='—'; return; }
       var r = Math.round((NEXT - Date.now())/1000);
       if(r > 0){ var m=Math.floor(r/60), s=r%60; el.textContent = m+':'+(s<10?'0':'')+s; }
@@ -2954,8 +2955,10 @@ async function renderDashboard(
       var target = Date.now() + 10*60*1000;
       function anTick(){
         var r = Math.round((target - Date.now())/1000);
-        if(r <= 0){ if(anEl) anEl.textContent='refreshing…'; location.reload(); return; }
-        if(anEl){ var m=Math.floor(r/60), s=r%60; anEl.textContent = m+':'+(s<10?'0':'')+s; }
+        var txt = r <= 0 ? 'refreshing…' : (Math.floor(r/60)+':'+((r%60)<10?'0':'')+(r%60));
+        if(anEl) anEl.textContent = txt;
+        if(el) el.textContent = txt; // also drive the top-bar "Next scan" chip
+        if(r <= 0){ location.reload(); }
       }
       anTick(); setInterval(anTick, 1000);
     }
