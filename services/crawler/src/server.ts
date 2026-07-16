@@ -1841,6 +1841,11 @@ async function renderDashboard(
     --shadow:inset 0 1px 0 rgba(255,255,255,.04),0 10px 30px rgba(3,0,20,.45);
   }
   *{box-sizing:border-box}
+  /* The browser hides [hidden] via its own stylesheet, but ANY author rule that
+     sets display (e.g. .anchat{display:flex}) beats it — so a class like that
+     silently defeats the hidden attribute and pins the panel open, with its
+     close button unable to do anything. Make hidden authoritative everywhere. */
+  [hidden]{display:none!important}
   ::selection{background:rgba(139,92,246,.45);color:#fff}
   body{margin:0;font-family:'Inter',ui-sans-serif,system-ui,'Segoe UI',Roboto,sans-serif;
     background:
