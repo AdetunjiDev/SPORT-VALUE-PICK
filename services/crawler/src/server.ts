@@ -432,11 +432,16 @@ function renderAuth(
   if (cf) cf.addEventListener('input', paintCf);
 
   // Submit: spinner + double-submit guard.
+  // NOTE: never disable the submit button here — disabling it while the submit
+  // is in flight can cancel the form navigation in Chrome (the POST never
+  // fires). Guard with a flag and show the spinner visually instead.
   var forms = document.querySelectorAll('form.af');
   for (var k = 0; k < forms.length; k++) {
-    forms[k].addEventListener('submit', function(){
+    forms[k].addEventListener('submit', function(e){
+      if (this.dataset.sent === '1') { e.preventDefault(); return; } // double-submit guard
+      this.dataset.sent = '1';
       var b = this.querySelector('.btn');
-      if (b) { b.classList.add('busy'); setTimeout(function(){ b.disabled = true; }, 0); }
+      if (b) b.classList.add('busy');
     });
   }
 
@@ -2847,6 +2852,10 @@ async function renderDashboard(
     CHAT.home = btn.getAttribute('data-home') || '';
     CHAT.away = btn.getAttribute('data-away') || '';
     var modal = document.getElementById('anchat'); if(!modal) return;
+    // Also persist the match on the modal itself, so an ask can never lose it
+    // even if this script re-runs and resets CHAT.
+    modal.setAttribute('data-home', CHAT.home);
+    modal.setAttribute('data-away', CHAT.away);
     document.getElementById('anchat-title').textContent = '🧠 ' + CHAT.home + ' v ' + CHAT.away;
     var wa = document.getElementById('anchat-wa');
     if(wa) wa.href = 'https://wa.me/?text=' + (btn.getAttribute('data-wa') || '');
@@ -2875,11 +2884,21 @@ async function renderDashboard(
   }
   function anChatAsk(q){
     if(CHAT.busy) return;
+    // The modal element is the source of truth for which match is open — CHAT is
+    // only a convenience mirror. Reading the DOM makes an ask impossible to send
+    // without a match, even if this script re-ran and reset CHAT.
+    var modal = document.getElementById('anchat');
+    var home = (modal && modal.getAttribute('data-home')) || CHAT.home || '';
+    var away = (modal && modal.getAttribute('data-away')) || CHAT.away || '';
+    if(!home || !away){
+      anChatBubble('ai', 'I lost track of which match this is — please close this box and tap “Deep-dive” on the match card again.');
+      return;
+    }
     if(q !== 'overview') anChatBubble('me', q);
     CHAT.busy = true;
     var wait = anChatBubble('ai', '…thinking');
     fetch('/api/analysis/chat', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({home: CHAT.home, away: CHAT.away, q: q})})
+      body: JSON.stringify({home: home, away: away, q: q})})
       .then(function(r){ return r.json(); })
       .then(function(j){ wait.remove(); anChatBubble('ai', j.answer || j.error || 'No answer — try again.'); CHAT.busy = false; })
       .catch(function(){ wait.remove(); anChatBubble('ai', 'Network error — try again.'); CHAT.busy = false; });
