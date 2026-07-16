@@ -5,7 +5,7 @@ import { RESPONSIBLE_GAMBLING_DISCLAIMER } from "@sportybet/shared";
 import { config } from "./config.js";
 import { runCycle, lastRunAt, nextRunAt, lastSummary, intervalSec } from "./scheduler.js";
 import { getPredictions } from "./predictions.js";
-import { planForTips, legsForFixtureKeys } from "./forebet-ai.js";
+import { planForTips, legsForFixtureKeys, getSportyFixtures, fuzzyTeamsMatch } from "./forebet-ai.js";
 import { createBookingCode } from "./booker.js";
 import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
@@ -22,7 +22,9 @@ import {
   getCombos,
   type GameType,
 } from "./analyst.js";
-import { getMatchAnalyses } from "./xg.js";
+import { getMatchAnalyses, analyzeEvent } from "./xg.js";
+import { getFormsForMatches, getMatchForm, type MatchForm } from "./form.js";
+import { analystAnswer } from "./analyst-chat.js";
 import { BOOKMAKERS, getBookmaker, activeBookmaker } from "./bookmakers.js";
 
 const GAME_TYPES: GameType[] = ["result", "goals", "double", "dnb", "btts", "teamgoals", "safe", "both"];
@@ -314,7 +316,7 @@ function renderAuth(
   <section class="brand">
     <img class="ph${tab === "login" ? " on" : ""}" id="phLogin" alt="" aria-hidden="true" loading="lazy" decoding="async" fetchpriority="low" onerror="this.remove()"
       src="https://images.unsplash.com/photo-1560272564-c83b66b1ad12?q=80&amp;w=1100&amp;auto=format&amp;fit=crop"/>
-    <img class="ph${tab === "signup" ? " on" : ""}" id="phSignup" alt="" aria-hidden="true" loading="lazy" decoding="async" fetchpriority="low" onerror="this.remove()"
+    <img class="ph${tab === "signup" ? " on" : ""}" id="phSignup" alt="" aria-hidden="true" decoding="async" fetchpriority="low" onerror="this.remove()"
       src="https://images.unsplash.com/photo-1600250395178-40fe752e5189?q=80&amp;w=1100&amp;auto=format&amp;fit=crop"/>
     <i class="veil" aria-hidden="true"></i>
     <div class="mark"><i>⚽</i>Sporty Value Pick AI</div>
@@ -529,6 +531,16 @@ async function renderDashboard(
           scanned: 0,
         }))
       : { matches: [], requested: 0, windowDays: 0, scanned: 0 };
+  // Real past results (actual final scores) for the analysed fixtures — served
+  // from a long-lived cache; misses keep resolving in the background and appear
+  // on the next auto-refresh, so coverage grows without slowing the page.
+  const analysisForms: Map<string, MatchForm> =
+    mode === "analysis" && analysis.matches.length
+      ? await getFormsForMatches(
+          analysis.matches.map((m) => ({ home: m.home, away: m.away })),
+          6000,
+        ).catch(() => new Map())
+      : new Map();
   const savedCodes =
     mode === "saved"
       ? await prisma.generatedCode
@@ -1486,6 +1498,33 @@ async function renderDashboard(
   // ---- AI Analysis: Poisson model calibrated to live odds ----
   const bar = (label: string, pct: number, cls: string) =>
     `<div class="an-bar"><span class="an-bl">${label}</span><div class="an-bt"><div class="an-bf ${cls}" style="width:${Math.round(pct * 100)}%"></div></div><span class="an-bv">${Math.round(pct * 100)}%</span></div>`;
+  // Traffic-light signal for a market option, driven by WIN LIKELIHOOD (what
+  // "safe" means to a user). Every bookmaker price carries a margin, so pure
+  // value would paint nearly everything red — the click-time alert handles
+  // genuinely bad prices instead.
+  const sigClass = (prob: number, _odds?: string) => {
+    if (prob >= 0.7) return "sig-hi";
+    if (prob >= 0.55) return "sig-mid";
+    return "sig-lo";
+  };
+  // Compact W/D/L pills for a team's real recent results (newest first).
+  const formPills = (f: { matches: { result: string }[] } | null | undefined) =>
+    f && f.matches.length
+      ? f.matches.map((x) => `<i class="fp fp-${x.result.toLowerCase()}">${x.result}</i>`).join("")
+      : `<i class="fp fp-na">—</i>`;
+  const formRows = (f: { team: string; matches: { date: string; home: string; away: string; homeScore: number; awayScore: number; result: string }[] } | null | undefined, name: string) => {
+    if (!f || !f.matches.length)
+      return `<div class="an-form-col"><b>${esc(shortName(name))}</b><div class="muted small">No verified past results in the database for this team (common for minor/SRL leagues).</div></div>`;
+    const rows = f.matches
+      .map((x) => {
+        const d = x.date
+          ? new Date(`${x.date}T12:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "short" })
+          : "";
+        return `<div class="an-form-row"><i class="fp fp-${x.result.toLowerCase()}">${x.result}</i><span class="afr-d">${esc(d)}</span><span class="afr-m">${esc(x.home)} <b>${x.homeScore}-${x.awayScore}</b> ${esc(x.away)}</span></div>`;
+      })
+      .join("");
+    return `<div class="an-form-col"><b>${esc(f.team)}</b>${rows}</div>`;
+  };
   const analysisCards = analysis.matches
     .map((m) => {
       const kick = new Date(m.kickoff).toLocaleString("en", {
@@ -1503,12 +1542,18 @@ async function renderDashboard(
             `<div class="an-score"><b>${esc(s.score)}</b><span>${Math.round(s.prob * 100)}%</span></div>`,
         )
         .join("");
+      const mf = analysisForms.get(`${m.home}|${m.away}`.toLowerCase());
+      const hasForm = !!(mf && (mf.home?.matches.length || mf.away?.matches.length));
+      const waText = encodeURIComponent(
+        `🧮 ${m.home} v ${m.away} (${m.league ?? "Football"})\nAI verdict: ${m.verdict} — ${Math.round(m.confidence * 100)}% · likeliest score ${m.likeliest}\nOver 2.5: ${Math.round(m.over25 * 100)}% · BTTS: ${Math.round(m.btts * 100)}%\nWhat do you think — worth backing? (via Sporty Value Pick AI · estimates, not guarantees, 18+)`,
+      );
       return `
       <div class="an-card">
         <div class="an-head">
           <div>
             <div class="an-match">${esc(m.home)} <span class="muted">v</span> ${esc(m.away)}</div>
             <div class="muted small">${esc(m.league ?? "Football")} · ⏰ ${esc(kick)} WAT</div>
+            <div class="an-formline" title="Real recent results, newest first (W win · D draw · L loss)">${formPills(mf?.home)}<span class="afl-vs">vs</span>${formPills(mf?.away)}</div>
           </div>
           <div class="an-xg" title="Model expected goals">
             <b>${m.xgHome.toFixed(2)} – ${m.xgAway.toFixed(2)}</b><small>expected goals (xG-model)</small>
@@ -1529,14 +1574,25 @@ async function renderDashboard(
             <div class="an-lbl">Most likely scores</div>
             <div class="an-scores">${scores}</div>
             <div class="an-verdict">🧮 Model verdict: <b>${esc(m.verdict)}</b> · likeliest <b>${esc(m.likeliest)}</b> · ${Math.round(m.confidence * 100)}% confidence</div>
-            <div class="an-lbl">Pick a market to add (one per match)</div>
+            <div class="an-lbl">Pick a market to add — choose any (one per match)</div>
+            <div class="an-siglegend"><span><i class="sdot sd-hi"></i>strong</span><span><i class="sdot sd-mid"></i>decent</span><span><i class="sdot sd-lo"></i>risky</span></div>
             <div class="an-opts">${m.options
               .map(
                 (o) =>
-                  `<label class="an-opt" title="${esc(o.market)} · model ${Math.round(o.prob * 100)}%"><input type="checkbox" data-key="${esc(o.key)}" data-match="${esc(m.home + "|" + m.away)}" data-odds="${o.odds ?? ""}" data-prob="${o.prob}" onchange="anTog(this)"/><span class="an-opt-l">${esc(o.label)}</span><span class="an-opt-o">${o.odds ? "@" + esc(o.odds) : ""}</span><span class="an-opt-p">${Math.round(o.prob * 100)}%</span></label>`,
+                  `<label class="an-opt ${sigClass(o.prob, o.odds)}" title="${esc(o.market)} · model ${Math.round(o.prob * 100)}%"><input type="checkbox" data-key="${esc(o.key)}" data-match="${esc(m.home + "|" + m.away)}" data-odds="${o.odds ?? ""}" data-prob="${o.prob}" data-label="${esc(o.label)}" onchange="anTog(this)"/><i class="sdot"></i><span class="an-opt-l">${esc(o.label)}</span><span class="an-opt-o">${o.odds ? "@" + esc(o.odds) : ""}</span><span class="an-opt-p">${Math.round(o.prob * 100)}%</span></label>`,
               )
               .join("")}</div>
           </div>
+        </div>
+        ${
+          hasForm
+            ? `<details class="an-formbox"><summary>📜 Last ${(mf!.home?.matches.length ?? 0) + (mf!.away?.matches.length ?? 0)} real results — form guide (actual final scores)</summary>
+          <div class="an-form">${formRows(mf!.home, m.home)}${formRows(mf!.away, m.away)}</div></details>`
+            : ""
+        }
+        <div class="an-actions">
+          <button class="btn ghost sm" data-home="${esc(m.home)}" data-away="${esc(m.away)}" data-league="${esc(m.league ?? "Football")}" data-wa="${waText}" onclick="anChat(this)">🧠 Deep-dive · chat with AI</button>
+          <a class="btn ghost sm" href="https://wa.me/?text=${waText}" target="_blank" rel="noopener" title="Send this analysis to a friend on WhatsApp and decide together">📞 Ask a friend</a>
         </div>
       </div>`;
     })
@@ -1630,7 +1686,30 @@ async function renderDashboard(
     <div class="an-list">${
       analysisCards ||
       '<div class="card empty">No fixtures with enough live prices to model right now — try a wider window, or check back as odds populate (busiest mid-day WAT).</div>'
-    }</div>${slipBar}`;
+    }</div>
+    <div id="anchat" class="anchat" hidden onclick="if(event.target===this)anChatClose()">
+      <div class="anchat-panel">
+        <div class="anchat-head"><b id="anchat-title">Deep-dive analysis</b><span class="anchat-hint">Esc or tap outside to close</span><button class="anchat-x" onclick="anChatClose()" aria-label="Close" title="Close (Esc)">✕</button></div>
+        <div class="anchat-log" id="anchat-log"></div>
+        <div class="anchat-chips">
+          <button onclick="anChatAsk('Safest pick?')">🛡️ Safest pick?</button>
+          <button onclick="anChatAsk('Over or under 2.5 goals?')">🥅 Over/Under?</button>
+          <button onclick="anChatAsk('Both teams to score?')">⚽ BTTS?</button>
+          <button onclick="anChatAsk('Most likely correct score?')">🎯 Likely score?</button>
+          <button onclick="anChatAsk('Recent form and past results?')">📜 Form?</button>
+          <button onclick="anChatAsk('Are the odds good value?')">💰 Value check</button>
+        </div>
+        <form class="anchat-form" onsubmit="return anChatSend(event)">
+          <input id="anchat-q" placeholder="Ask the AI analyst about this match…" maxlength="200" autocomplete="off"/>
+          <button class="btn sm" type="submit">Send</button>
+        </form>
+        <div class="anchat-foot">
+          <a id="anchat-wa" class="btn ghost sm" target="_blank" rel="noopener">📞 Ask a friend on WhatsApp</a>
+          <span class="muted small">Answers come from the live statistical model — estimates, not guarantees · 18+</span>
+        </div>
+        <button class="anchat-done" onclick="anChatClose()">Close</button>
+      </div>
+    </div>${slipBar}`;
 
   // ---- Owner Metrics page (admin only) ----
   const mxPlan = (label: string, n: number) =>
@@ -1960,8 +2039,10 @@ async function renderDashboard(
   .an-score{background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:9px;padding:6px 10px;text-align:center;min-width:52px}
   .an-score b{display:block;font-size:15px} .an-score span{font-size:11px;color:var(--muted)}
   .an-verdict{font-size:12.5px;background:rgba(56,189,248,.10);border:1px solid rgba(56,189,248,.28);border-radius:9px;padding:8px 10px;margin-bottom:8px}
-  .an-opts{display:flex;flex-direction:column;gap:6px}
-  .an-opt{display:grid;grid-template-columns:auto 1fr auto auto;gap:8px;align-items:center;
+  .an-opts{display:flex;flex-direction:column;gap:6px;max-height:340px;overflow-y:auto;padding-right:4px}
+  .an-opts::-webkit-scrollbar{width:6px}
+  .an-opts::-webkit-scrollbar-thumb{background:rgba(139,92,246,.35);border-radius:3px}
+  .an-opt{display:grid;grid-template-columns:auto auto 1fr auto auto;gap:8px;align-items:center;
     border:1px solid var(--line);border-radius:9px;padding:7px 10px;cursor:pointer;font-size:12.5px;transition:background .12s,border-color .12s}
   .an-opt:hover{background:rgba(255,255,255,.045)}
   .an-opt.on{border-color:var(--green);background:rgba(52,211,153,.10)}
@@ -1969,6 +2050,67 @@ async function renderDashboard(
   .an-opt-l{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .an-opt-o{color:#c4b5fd;font-weight:800}
   .an-opt-p{color:var(--muted);font-size:11px;min-width:34px;text-align:right}
+  /* Traffic-light signal dots on each market option: green pulse = strong,
+     amber = decent, red = risky (low probability or badly-priced odds). */
+  .sdot{width:9px;height:9px;border-radius:50%;flex-shrink:0;display:inline-block}
+  .an-opt.sig-hi .sdot{background:var(--green);animation:sigpulse-g 1.6s ease-in-out infinite}
+  .an-opt.sig-mid .sdot{background:var(--warn);animation:sigpulse-a 2.2s ease-in-out infinite}
+  .an-opt.sig-lo .sdot{background:var(--bad);animation:sigpulse-r 1.1s ease-in-out infinite}
+  .an-opt.sig-hi{border-left:3px solid rgba(52,211,153,.6)}
+  .an-opt.sig-mid{border-left:3px solid rgba(251,191,36,.55)}
+  .an-opt.sig-lo{border-left:3px solid rgba(251,113,133,.6)}
+  @keyframes sigpulse-g{0%,100%{box-shadow:0 0 0 0 rgba(52,211,153,.55)}50%{box-shadow:0 0 0 5px rgba(52,211,153,0)}}
+  @keyframes sigpulse-a{0%,100%{box-shadow:0 0 0 0 rgba(251,191,36,.5)}50%{box-shadow:0 0 0 5px rgba(251,191,36,0)}}
+  @keyframes sigpulse-r{0%,100%{box-shadow:0 0 0 0 rgba(251,113,133,.6)}50%{box-shadow:0 0 0 6px rgba(251,113,133,0)}}
+  .an-siglegend{display:flex;gap:12px;font-size:11px;color:var(--muted);margin:-2px 0 6px}
+  .an-siglegend span{display:inline-flex;align-items:center;gap:5px}
+  .an-siglegend .sd-hi{background:var(--green)}.an-siglegend .sd-mid{background:var(--warn)}.an-siglegend .sd-lo{background:var(--bad)}
+  /* Real recent-form guide (actual final scores) */
+  .an-formline{display:flex;align-items:center;gap:3px;margin-top:6px}
+  .afl-vs{font-size:10px;color:var(--muted);margin:0 5px;font-weight:700}
+  .fp{display:inline-flex;align-items:center;justify-content:center;width:17px;height:17px;border-radius:5px;
+    font-size:10px;font-weight:800;font-style:normal;color:#fff}
+  .fp-w{background:#16a06b}.fp-d{background:#8b8fa3}.fp-l{background:#e35d6a}.fp-na{background:rgba(255,255,255,.12);color:var(--muted)}
+  .an-formbox{margin-top:10px;border-top:1px dashed var(--line);padding-top:8px}
+  .an-formbox summary{cursor:pointer;font-size:12.5px;font-weight:700;color:#c4b5fd;list-style:none}
+  .an-formbox summary::-webkit-details-marker{display:none}
+  .an-formbox summary:hover{text-decoration:underline}
+  .an-form{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:8px}
+  .an-form-col b{display:block;font-size:12px;margin-bottom:5px}
+  .an-form-row{display:flex;align-items:center;gap:7px;font-size:11.5px;padding:3px 0;color:var(--muted)}
+  .afr-d{flex-shrink:0;min-width:44px}
+  .afr-m{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .afr-m b{color:var(--ink)}
+  .an-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;border-top:1px dashed var(--line);padding-top:10px}
+  /* Deep-dive analyst chat modal */
+  .anchat{position:fixed;inset:0;z-index:60;background:rgba(5,2,16,.66);backdrop-filter:blur(3px);
+    display:flex;align-items:flex-end;justify-content:center;padding:14px}
+  @media(min-width:640px){ .anchat{align-items:center} }
+  .anchat-panel{width:100%;max-width:560px;max-height:86vh;display:flex;flex-direction:column;
+    background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 24px 60px rgba(3,0,20,.6)}
+  .anchat-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line)}
+  .anchat-x{background:var(--card);border:1px solid var(--line);border-radius:9px;color:var(--ink);
+    font-size:18px;line-height:1;cursor:pointer;padding:7px 12px;font-weight:800;transition:all .12s}
+  .anchat-x:hover{background:#fdeee7;border-color:var(--primary);color:var(--primary)}
+  .anchat-done{width:100%;margin-top:8px;padding:11px;border:1px solid var(--line);border-radius:10px;
+    background:var(--card);color:var(--ink);font-weight:700;font-size:13px;cursor:pointer}
+  .anchat-done:hover{background:#f4f6fb}
+  .anchat-hint{font-size:11px;color:var(--muted);font-weight:600}
+  .anchat-x:hover{color:var(--ink)}
+  .anchat-log{flex:1;min-height:180px;max-height:46vh;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+  .anchat-msg{max-width:88%;padding:9px 12px;border-radius:12px;font-size:12.5px;line-height:1.55}
+  .anchat-msg.ai{align-self:flex-start;background:rgba(139,92,246,.14);border:1px solid rgba(139,92,246,.3)}
+  .anchat-msg.me{align-self:flex-end;background:rgba(56,189,248,.13);border:1px solid rgba(56,189,248,.3)}
+  .anchat-chips{display:flex;gap:6px;flex-wrap:wrap;padding:0 16px 10px}
+  .anchat-chips button{background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:999px;
+    color:var(--ink);font-size:11.5px;font-weight:600;padding:5px 11px;cursor:pointer}
+  .anchat-chips button:hover{border-color:var(--primary);color:#c4b5fd}
+  .anchat-form{display:flex;gap:8px;padding:0 16px 12px}
+  .anchat-form input{flex:1;padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px;
+    background:rgba(255,255,255,.04);color:var(--ink);outline:none}
+  .anchat-form input:focus{border-color:var(--primary)}
+  .anchat-foot{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:0 16px 14px}
+  @media(max-width:640px){ .an-form{grid-template-columns:1fr} }
   @media(max-width:640px){ .an-grid{grid-template-columns:1fr} .an-head{flex-direction:column} }
   .cmb-foot{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
   .cmb-res{display:flex;align-items:center;gap:8px}
@@ -2429,6 +2571,12 @@ async function renderDashboard(
   html[data-theme="light"] .an-verdict{background:rgba(56,189,248,.09)}
   html[data-theme="light"] .an-opt:hover{background:rgba(24,12,60,.03)}
   html[data-theme="light"] .an-opt.on{background:rgba(16,150,90,.08)}
+  html[data-theme="light"] .fp-na{background:rgba(24,12,60,.08)}
+  html[data-theme="light"] .anchat{background:rgba(26,19,51,.35)}
+  html[data-theme="light"] .anchat-msg.ai{background:rgba(124,58,237,.07)}
+  html[data-theme="light"] .anchat-msg.me{background:rgba(56,189,248,.08)}
+  html[data-theme="light"] .anchat-chips button{background:rgba(24,12,60,.04)}
+  html[data-theme="light"] .anchat-form input{background:#fff}
   html[data-theme="light"] .selbox{color:#0f8a52;border-color:rgba(16,150,90,.4)}
   html[data-theme="light"] .selbox:hover{background:rgba(16,150,90,.07)}
   html[data-theme="light"] .sb-note{color:#0f8a52}
@@ -2672,7 +2820,76 @@ async function renderDashboard(
     document.querySelectorAll('input[type=checkbox][data-match="'+cb.getAttribute('data-match')+'"]').forEach(function(o){
       var l=o.closest('.an-opt'); if(l) l.classList.toggle('on', o.checked);
     });
+    // AI pick-guard: when the user ticks a weak or badly-priced market, say so
+    // immediately (model probability + value vs the live odds).
+    if(cb.checked){
+      var prob = parseFloat(cb.getAttribute('data-prob'));
+      var odds = parseFloat(cb.getAttribute('data-odds'));
+      var label = cb.getAttribute('data-label') || 'This pick';
+      if(prob > 0){
+        // EV multiplier: prob × odds. 1.0 = break-even; every bookie price is a
+        // bit below 1 (their margin) — only flag prices that are truly bad.
+        var ev = odds > 1 ? prob * odds - 1 : 0;
+        if(prob < 0.5){
+          showToast('⚠️ Risky: the model gives "'+label+'" only '+Math.round(prob*100)+'% — it loses more often than it wins. Consider a safer market.','warn');
+        } else if(odds > 1 && ev < -0.15){
+          showToast('⚠️ Poor value: "'+label+'" pays @'+odds.toFixed(2)+' but the model rates it '+Math.round(prob*100)+'% (fair ≈ @'+(1/prob).toFixed(2)+'). The odd doesn\\'t cover the risk.','warn');
+        } else if(prob >= 0.7){
+          showToast('✅ Solid pick: "'+label+'" — '+Math.round(prob*100)+'% model chance'+(odds>1?' @'+odds.toFixed(2):'')+'.','ok');
+        }
+      }
+    }
     selTog(cb);
+  }
+  /* ---- Deep-dive AI analyst chat (AI Analysis cards) ---- */
+  var CHAT = { home:'', away:'', busy:false };
+  function anChat(btn){
+    CHAT.home = btn.getAttribute('data-home') || '';
+    CHAT.away = btn.getAttribute('data-away') || '';
+    var modal = document.getElementById('anchat'); if(!modal) return;
+    document.getElementById('anchat-title').textContent = '🧠 ' + CHAT.home + ' v ' + CHAT.away;
+    var wa = document.getElementById('anchat-wa');
+    if(wa) wa.href = 'https://wa.me/?text=' + (btn.getAttribute('data-wa') || '');
+    document.getElementById('anchat-log').innerHTML = '';
+    modal.hidden = false;
+    anChatAsk('overview');
+  }
+  function anChatClose(){ var m = document.getElementById('anchat'); if(m) m.hidden = true; }
+  // Esc closes the deep-dive modal (backdrop click and ✕ / Close also work).
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'Escape'){
+      var m = document.getElementById('anchat');
+      if(m && !m.hidden){ e.preventDefault(); anChatClose(); }
+    }
+  });
+  function anChatBubble(kind, text){
+    var log = document.getElementById('anchat-log');
+    var b = document.createElement('div');
+    b.className = 'anchat-msg ' + kind;
+    // Render **bold** and newlines from the analyst answers.
+    var safe = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    b.innerHTML = safe.replace(/\\*\\*([^*]+)\\*\\*/g,'<b>$1</b>').replace(/\\n/g,'<br/>');
+    log.appendChild(b);
+    log.scrollTop = log.scrollHeight;
+    return b;
+  }
+  function anChatAsk(q){
+    if(CHAT.busy) return;
+    if(q !== 'overview') anChatBubble('me', q);
+    CHAT.busy = true;
+    var wait = anChatBubble('ai', '…thinking');
+    fetch('/api/analysis/chat', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({home: CHAT.home, away: CHAT.away, q: q})})
+      .then(function(r){ return r.json(); })
+      .then(function(j){ wait.remove(); anChatBubble('ai', j.answer || j.error || 'No answer — try again.'); CHAT.busy = false; })
+      .catch(function(){ wait.remove(); anChatBubble('ai', 'Network error — try again.'); CHAT.busy = false; });
+  }
+  function anChatSend(ev){
+    ev.preventDefault();
+    var inp = document.getElementById('anchat-q');
+    var q = (inp.value || '').trim();
+    if(q){ inp.value=''; anChatAsk(q); }
+    return false;
   }
   function updBar(){
     var n = Object.keys(SEL).length;
@@ -3639,6 +3856,43 @@ export function startServer() {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(data));
         return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/analysis/chat") {
+        // Deep-dive analyst chat: answers grounded in the SAME live model the
+        // Analysis cards show (Poisson + live odds + real past results).
+        const json = (s: number, o: unknown) => {
+          res.writeHead(s, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(o));
+        };
+        let home = "";
+        let away = "";
+        let q = "";
+        try {
+          const body = JSON.parse((await readBody(req, 16 * 1024)) || "{}");
+          home = String(body.home ?? "").slice(0, 80);
+          away = String(body.away ?? "").slice(0, 80);
+          q = String(body.q ?? "").slice(0, 300);
+        } catch {
+          return json(400, { error: "Bad request body." });
+        }
+        if (!home || !away) return json(400, { error: "Missing match." });
+        const events = await getSportyFixtures().catch(() => []);
+        const now = Date.now();
+        const ev = events.find(
+          (e) => e.kickoff > now && fuzzyTeamsMatch(e.home, home) && fuzzyTeamsMatch(e.away, away),
+        );
+        if (!ev)
+          return json(200, {
+            answer:
+              "I can't find that fixture on SportyBet any more — it may have kicked off or been withdrawn. Refresh the page for the current list.",
+          });
+        const a = analyzeEvent(ev);
+        if (!a)
+          return json(200, {
+            answer: "Not enough live prices remain to model this match honestly — check back as odds populate.",
+          });
+        const form = await getMatchForm(ev.home, ev.away).catch(() => null);
+        return json(200, { answer: analystAnswer(q, a, form) });
       }
       if (req.method === "POST" && url.pathname === "/api/predictions/book") {
         // Book the user's selected predictions into a REAL SportyBet code.
