@@ -23,8 +23,10 @@ import {
   type GameType,
 } from "./analyst.js";
 import { getMatchAnalyses, analyzeEvent } from "./xg.js";
-import { getFormsForMatches, getMatchForm, type MatchForm } from "./form.js";
+import { getFormsForMatches, getMatchForm, teamRating, type MatchForm } from "./form.js";
 import { analystAnswer } from "./analyst-chat.js";
+import { placeDemoBet, getDemoWallet, resetDemoWallet, DEMO_START_BALANCE, resultsExpectedAt, type WalletView } from "./demo.js";
+import { randomBytes } from "node:crypto";
 import { BOOKMAKERS, getBookmaker, activeBookmaker } from "./bookmakers.js";
 
 const GAME_TYPES: GameType[] = ["result", "goals", "double", "dnb", "btts", "teamgoals", "safe", "both"];
@@ -476,7 +478,7 @@ function stars(n: number): string {
   return "★".repeat(v) + "☆".repeat(5 - v);
 }
 
-type Mode = "human" | "ai" | "pred" | "expert" | "value" | "combo" | "analysis" | "saved" | "metrics";
+type Mode = "human" | "ai" | "pred" | "expert" | "value" | "combo" | "analysis" | "saved" | "metrics" | "demo";
 type Tier = "free" | "premium";
 
 async function renderDashboard(
@@ -492,6 +494,7 @@ async function renderDashboard(
   isAdmin = false,
   account: { email: string; premiumUntil: Date | null } | null = null,
   bookieId = "sportybet",
+  demoOwner: string | null = null,
 ): Promise<string> {
   const bookie = getBookmaker(bookieId);
   const liveBookie = activeBookmaker();
@@ -515,6 +518,9 @@ async function renderDashboard(
   // Owner business metrics (users / subscribers / revenue) — admin only.
   const metrics: BusinessMetrics | null =
     mode === "metrics" && isAdmin ? await getBusinessMetrics().catch(() => null) : null;
+  // Demo simulator wallet (virtual money, real results).
+  const demoWallet: WalletView | null =
+    mode === "demo" && demoOwner ? await getDemoWallet(demoOwner).catch(() => null) : null;
   const valueResult =
     mode === "value"
       ? await getValuePicks({
@@ -1102,6 +1108,7 @@ async function renderDashboard(
         ₦<input id="stake" type="number" min="0" step="100" placeholder="Stake" oninput="updPayout(true)"/> → <b id="payout">—</b>
       </span>
       <input id="genname" class="sb-name" placeholder="Your name" maxlength="60" title="Saved with the generated code"/>
+      <button class="btn ghost" id="demobtn" onclick="demoBet(this)" title="Stake DEMO money on this slip — settled against real final scores, nothing real at risk">🎮 Demo bet</button>
       <button class="btn" id="genbtn" onclick="genCode(this)">⚡ Generate SportyBet Code</button>
       <span id="slipres"></span>
       <button class="btn ghost sm" onclick="clearSel()">Clear</button>
@@ -1549,6 +1556,33 @@ async function renderDashboard(
         .join("");
       const mf = analysisForms.get(`${m.home}|${m.away}`.toLowerCase());
       const hasForm = !!(mf && (mf.home?.matches.length || mf.away?.matches.length));
+      // Team "excellence now" badges — real recent results blended with market
+      // strength (see teamRating). Shown even without form data (market-only).
+      const rateBadge = (f: typeof mf extends undefined ? never : any, prob: number, name: string) => {
+        const r = teamRating(f ?? null, prob);
+        return `<span class="an-rate-t ${r.score >= 6.5 ? "rt-hi" : r.score >= 4.5 ? "rt-mid" : "rt-lo"}" title="${r.basis === "form+market" ? "From real recent results (points per game) + current market strength" : "No recent results in the database — market strength only"}"><b>${esc(shortName(name))}</b> ★${r.score.toFixed(1)}<small>/10</small> <em>${r.trend}</em></span>`;
+      };
+      // Who leads the head-to-head: W/D/L tally from the HOME team's side.
+      const h2h = mf?.h2h ?? [];
+      const h2hW = h2h.filter((x) => x.result === "W").length;
+      const h2hD = h2h.filter((x) => x.result === "D").length;
+      const h2hL = h2h.length - h2hW - h2hD;
+      const h2hLeader = !h2h.length
+        ? ""
+        : h2hW > h2hL
+          ? `<div class="an-h2h-lead lead-h">🏅 <b>${esc(shortName(m.home))}</b> lead the H2H: <b>${h2hW}W – ${h2hD}D – ${h2hL}L</b> in the last ${h2h.length} meeting${h2h.length === 1 ? "" : "s"}</div>`
+          : h2hL > h2hW
+            ? `<div class="an-h2h-lead lead-a">🏅 <b>${esc(shortName(m.away))}</b> lead the H2H: <b>${h2hL}W – ${h2hD}D – ${h2hW}L</b> in the last ${h2h.length} meeting${h2h.length === 1 ? "" : "s"}</div>`
+            : `<div class="an-h2h-lead lead-d">⚖️ Even H2H: <b>${h2hW}W – ${h2hD}D – ${h2hL}L</b> across the last ${h2h.length} meeting${h2h.length === 1 ? "" : "s"}</div>`;
+      // Real head-to-head meetings (actual scores, newest first, ≤10).
+      const h2hRows = (mf?.h2h ?? [])
+        .map((x) => {
+          const d = x.date
+            ? new Date(`${x.date}T12:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "2-digit" })
+            : "";
+          return `<div class="an-form-row"><i class="fp fp-${x.result.toLowerCase()}">${x.result}</i><span class="afr-d">${esc(d)}</span><span class="afr-m">${esc(x.home)} <b>${x.homeScore}-${x.awayScore}</b> ${esc(x.away)}</span></div>`;
+        })
+        .join("");
       const waText = encodeURIComponent(
         `🧮 ${m.home} v ${m.away} (${m.league ?? "Football"})\nAI verdict: ${m.verdict} — ${Math.round(m.confidence * 100)}% · likeliest score ${m.likeliest}\nOver 2.5: ${Math.round(m.over25 * 100)}% · BTTS: ${Math.round(m.btts * 100)}%\nWhat do you think — worth backing? (via Sporty Value Pick AI · estimates, not guarantees, 18+)`,
       );
@@ -1576,6 +1610,14 @@ async function renderDashboard(
             ${bar("Both score", m.btts, "g")}
           </div>
           <div class="an-col">
+            <div class="an-lbl">Team ratings — excellence now <span class="an-lbl-i" title="★/10 from real recent results (points per game, 55%) blended with current market strength (45%). Per-player ratings need licensed player data, so this is the honest team-level read.">ⓘ</span></div>
+            <div class="an-rate">${rateBadge(mf?.home, m.pHome, m.home)}<span class="an-rate-vs">vs</span>${rateBadge(mf?.away, m.pAway, m.away)}</div>
+            <div class="an-lbl">Head-to-head — last real meetings</div>
+            ${
+              h2hRows
+                ? `${h2hLeader}<div class="an-h2h">${h2hRows}</div>`
+                : `<div class="an-h2h-none muted small">No previous meetings between these two in the results database${hasForm ? "" : " (minor/SRL fixtures often aren't covered)"} — see each team's own last results below.</div>`
+            }
             <div class="an-lbl">Most likely scores</div>
             <div class="an-scores">${scores}</div>
             <div class="an-verdict">🧮 Model verdict: <b>${esc(m.verdict)}</b> · likeliest <b>${esc(m.likeliest)}</b> · ${Math.round(m.confidence * 100)}% confidence</div>
@@ -1702,6 +1744,7 @@ async function renderDashboard(
           <button onclick="anChatAsk('Both teams to score?')">⚽ BTTS?</button>
           <button onclick="anChatAsk('Most likely correct score?')">🎯 Likely score?</button>
           <button onclick="anChatAsk('Recent form and past results?')">📜 Form?</button>
+          <button onclick="anChatAsk('Head to head history?')">🤝 H2H?</button>
           <button onclick="anChatAsk('Are the odds good value?')">💰 Value check</button>
         </div>
         <form class="anchat-form" onsubmit="return anChatSend(event)">
@@ -1758,9 +1801,82 @@ async function renderDashboard(
     ${recordCard || '<div class="card empty">No settled picks yet — the track record fills in as fixtures finish and get scored.</div>'}
     ${roiCard}`;
 
+  // ---- Demo Bet Simulator: virtual money, settled against REAL scores ----
+  const demoBody = (() => {
+    const w = demoWallet;
+    const fmtN = (n: number) => `₦${Math.round(Math.abs(n)).toLocaleString()}`;
+    const head = `
+    <div class="xhead card">
+      <div>
+        <h3 style="margin:0">🎮 Demo Bet Simulator — practice with virtual money</h3>
+        <div class="muted small">Test the app before staking real cash: place bets with <b>demo ₦</b> on any picks (AI Analysis, Expert, Value, Predictions) and the app settles them automatically against the <b>real final scores</b> — the same source that settles the Expert track record. If the model performs, you see it here first: honest proof, not promises. Virtual money only, nothing to deposit or withdraw. 18+.</div>
+      </div>
+      ${w ? `<button class="btn ghost" onclick="demoReset(this)" title="Balance back to the starting bank — history is kept">↺ Reset wallet</button>` : ""}
+    </div>`;
+    if (!w || !w.bets.length) {
+      return `${head}
+      <div class="card empty">🎮 No demo bets yet — you start with a <b>${fmtN(DEMO_START_BALANCE)}</b> practice bank.<br/><br/>Go to <a href="/?mode=analysis" style="color:var(--indigo)"><b>📊 AI Analysis</b></a> (or Expert / Value Picks), tick some markets, type a stake in the slip bar and hit <b>🎮 Demo bet</b>.</div>`;
+    }
+    const st = w.stats;
+    const outIcon = (o: string) => (o === "WON" ? "✅" : o === "LOST" ? "❌" : o === "VOID" ? "➖" : "⏳");
+    const betCards = w.bets
+      .map((b) => {
+        const when = new Date(b.createdAt).toLocaleString("en-GB", {
+          day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos",
+        });
+        const legRows = b.legs
+          .map(
+            (l) =>
+              `<div class="dm-leg"><span class="dm-leg-o">${outIcon(l.outcome ?? "PENDING")}</span><span class="dm-leg-m">${esc(l.home)} v ${esc(l.away)}</span><span class="dm-leg-p">${esc(l.pick ?? l.pickCode)} @${l.odds.toFixed(2)}</span><span class="dm-leg-s">${l.finalScore ? esc(l.finalScore) : ""}</span></div>`,
+          )
+          .join("");
+        // When every match is over and the settler will have run: last kickoff
+        // + the same buffer settleDemoBets() waits for. Shown so users know
+        // exactly when to come back rather than guessing.
+        const dueAt = resultsExpectedAt(b.legs);
+        const lastKick = b.legs.length ? Math.max(...b.legs.map((l) => l.kickoff)) : 0;
+        const eta =
+          b.outcome !== "PENDING" || !dueAt
+            ? ""
+            : `<div class="dm-eta" data-due="${dueAt}" data-kick="${lastKick}">🕒 <b>Final result by ${esc(
+                new Date(dueAt).toLocaleString("en-GB", {
+                  day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos",
+                }),
+              )} WAT</b> <span class="dm-eta-cd"></span><br/><span class="muted small">Last match kicks off ${esc(
+                new Date(lastKick).toLocaleString("en-GB", {
+                  day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos",
+                }),
+              )} WAT — we wait until every game has ended, then settle against the real final scores. Nothing for you to do; check back then.</span></div>`;
+        const result =
+          b.outcome === "PENDING"
+            ? `<span class="dm-res pending">⏳ pending · potential ${fmtN(b.potential)}</span>`
+            : b.outcome === "WON"
+              ? `<span class="dm-res won">✅ WON ${fmtN(b.payout ?? 0)}</span>`
+              : b.outcome === "VOID"
+                ? `<span class="dm-res void">➖ VOID · stake refunded</span>`
+                : `<span class="dm-res lost">❌ LOST ${fmtN(b.stake)}</span>`;
+        return `<div class="dm-bet card">
+          <div class="dm-head"><b>${b.legs.length} leg${b.legs.length === 1 ? "" : "s"} @ ${b.totalOdds.toFixed(2)}</b><span class="muted small">stake ${fmtN(b.stake)} · ${esc(b.origin)} · ${esc(when)} WAT</span>${result}</div>
+          <div class="dm-legs">${legRows}</div>
+          ${eta}
+        </div>`;
+      })
+      .join("");
+    return `${head}
+    <div class="kpis">
+      ${kpi("💰", fmtN(w.balance), "demo balance", "indigo")}
+      ${kpi("📈", `${w.profit >= 0 ? "+" : "−"}${fmtN(w.profit)}`, "profit / loss (virtual)", w.profit >= 0 ? "green" : "orange")}
+      ${kpi("🎯", st.hitRate === null ? "—" : Math.round(st.hitRate * 100) + "%", `hit rate (${st.won}W/${st.lost}L)`, "blue")}
+      ${kpi("⏳", st.pending, "bets awaiting results", "orange")}
+    </div>
+    <div class="dm-list">${betCards}</div>`;
+  })();
+
   const body =
     mode === "metrics"
       ? metricsBody
+      : mode === "demo"
+      ? demoBody
       : mode === "analysis"
       ? analysisBody
       : mode === "combo"
@@ -2075,6 +2191,26 @@ async function renderDashboard(
   .an-siglegend{display:flex;gap:12px;font-size:11px;color:var(--muted);margin:-2px 0 6px}
   .an-siglegend span{display:inline-flex;align-items:center;gap:5px}
   .an-siglegend .sd-hi{background:var(--green)}.an-siglegend .sd-mid{background:var(--warn)}.an-siglegend .sd-lo{background:var(--bad)}
+  /* Team excellence ratings + head-to-head history */
+  .an-lbl-i{cursor:help;color:var(--muted);font-weight:400}
+  .an-rate{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+  .an-rate-t{display:inline-flex;align-items:baseline;gap:5px;border:1px solid var(--line);border-radius:9px;
+    padding:5px 10px;font-size:12px}
+  .an-rate-t b{font-weight:800}
+  .an-rate-t small{color:var(--muted);font-size:10px}
+  .an-rate-t em{font-style:normal;font-size:10.5px;color:var(--muted)}
+  .an-rate-t.rt-hi{border-color:rgba(52,211,153,.45);background:rgba(52,211,153,.08)}
+  .an-rate-t.rt-mid{border-color:rgba(251,191,36,.4);background:rgba(251,191,36,.06)}
+  .an-rate-t.rt-lo{border-color:rgba(251,113,133,.45);background:rgba(251,113,133,.07)}
+  .an-rate-vs{font-size:10px;color:var(--muted);font-weight:700}
+  .an-h2h-lead{font-size:12px;border-radius:9px;padding:6px 10px;margin-bottom:6px;border:1px solid var(--line)}
+  .an-h2h-lead.lead-h{background:rgba(52,211,153,.08);border-color:rgba(52,211,153,.35)}
+  .an-h2h-lead.lead-a{background:rgba(56,189,248,.08);border-color:rgba(56,189,248,.35)}
+  .an-h2h-lead.lead-d{background:rgba(251,191,36,.07);border-color:rgba(251,191,36,.3)}
+  .an-h2h{max-height:118px;overflow-y:auto;border:1px dashed var(--line);border-radius:9px;padding:6px 9px;margin-bottom:8px}
+  .an-h2h::-webkit-scrollbar{width:6px}
+  .an-h2h::-webkit-scrollbar-thumb{background:rgba(139,92,246,.35);border-radius:3px}
+  .an-h2h-none{margin-bottom:8px}
   /* Real recent-form guide (actual final scores) */
   .an-formline{display:flex;align-items:center;gap:3px;margin-top:6px}
   .afl-vs{font-size:10px;color:var(--muted);margin:0 5px;font-weight:700}
@@ -2120,6 +2256,27 @@ async function renderDashboard(
     background:rgba(255,255,255,.04);color:var(--ink);outline:none}
   .anchat-form input:focus{border-color:var(--primary)}
   .anchat-foot{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:0 16px 14px}
+  /* Demo Bet Simulator */
+  .dm-list{display:flex;flex-direction:column;gap:12px;margin-top:14px}
+  .dm-bet{padding:14px 16px}
+  .dm-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px}
+  .dm-res{font-size:12px;font-weight:800;padding:4px 10px;border-radius:999px;border:1px solid var(--line);margin-left:auto}
+  .dm-res.won{color:var(--green);border-color:rgba(52,211,153,.45);background:rgba(52,211,153,.08)}
+  .dm-res.lost{color:var(--bad);border-color:rgba(251,113,133,.45);background:rgba(251,113,133,.07)}
+  .dm-res.void{color:var(--muted)}
+  /* "Final result by …" panel on pending demo bets */
+  .dm-eta{margin-top:10px;padding:10px 12px;border-radius:10px;font-size:12px;line-height:1.5;
+    border:1px dashed rgba(139,92,246,.45);background:rgba(139,92,246,.06);color:var(--ink)}
+  .dm-eta-cd{font-weight:800;color:var(--indigo);white-space:nowrap}
+  .dm-eta.due{border-color:rgba(52,211,153,.5);background:rgba(52,211,153,.08)}
+  .dm-eta.due .dm-eta-cd{color:var(--green)}
+  .dm-res.pending{color:var(--warn);border-color:rgba(251,191,36,.4);background:rgba(251,191,36,.06)}
+  .dm-legs{display:flex;flex-direction:column;gap:4px}
+  .dm-leg{display:grid;grid-template-columns:auto 1fr auto auto;gap:10px;align-items:center;font-size:12px;
+    padding:5px 8px;border:1px solid var(--line);border-radius:8px}
+  .dm-leg-m{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+  .dm-leg-p{color:#c4b5fd;font-weight:700;white-space:nowrap}
+  .dm-leg-s{color:var(--muted);font-family:ui-monospace,Consolas,monospace;min-width:34px;text-align:right}
   @media(max-width:640px){ .an-form{grid-template-columns:1fr} }
   @media(max-width:640px){ .an-grid{grid-template-columns:1fr} .an-head{flex-direction:column} }
   .cmb-foot{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
@@ -2650,6 +2807,7 @@ async function renderDashboard(
     ${nav("analysis", "📊", "AI Analysis", mode === "analysis")}
     ${nav("combo", "🎰", "Value Combos", mode === "combo")}
     ${nav("saved", "💾", "Saved Codes", mode === "saved")}
+    ${nav("demo", "🎮", "Demo Wallet", mode === "demo")}
     ${
       isAdmin
         ? `<div class="nav-label">Owner</div>
@@ -2679,7 +2837,7 @@ async function renderDashboard(
   <div class="app">
     <div class="topbar">
       <div>
-        <h1>${mode === "metrics" ? "Owner Metrics" : mode === "analysis" ? "AI Match Analysis" : mode === "combo" ? "Value Combos" : mode === "value" ? "Value Picks" : mode === "saved" ? "Saved Codes" : mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
+        <h1>${mode === "metrics" ? "Owner Metrics" : mode === "demo" ? "Demo Bet Simulator" : mode === "analysis" ? "AI Match Analysis" : mode === "combo" ? "Value Combos" : mode === "value" ? "Value Picks" : mode === "saved" ? "Saved Codes" : mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
         <div class="sub">${mode === "analysis" ? "Poisson model calibrated to live odds — match & correct-score probabilities" : mode === "combo" ? "Ready-made accumulators auto-built from the best picks — book one in a click" : mode === "value" ? "Higher-odds opportunities where a model beats the market price — EV-ranked, estimates not guarantees" : mode === "saved" ? "Every generated code — with the day, time and who made it" : mode === "expert" ? "Confidence-ranked picks across your chosen window — estimates, never guarantees" : mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
       </div>
       <div class="search"><input id="search" placeholder="Search codes, leagues, sources…" oninput="flt(this.value)"/></div>
@@ -2914,6 +3072,81 @@ async function renderDashboard(
     var q = (inp.value || '').trim();
     if(q){ inp.value=''; anChatAsk(q); }
     return false;
+  }
+  /* ---- Demo Bet Simulator: stake virtual money on the current slip ---- */
+  async function demoBet(btn){
+    var keys = Object.keys(SEL);
+    if(keys.length < 1){ showToast('Pick at least 1 match first','warn'); return; }
+    var stakeEl = document.getElementById('stake');
+    var stake = parseFloat(stakeEl && stakeEl.value) || 0;
+    if(stake < 100){
+      stake = parseFloat(prompt('Demo stake (virtual ₦, min 100):', '500') || '0') || 0;
+      if(stake < 100){ showToast('Minimum demo stake is ₦100','warn'); return; }
+      if(stakeEl) stakeEl.value = stake;
+    }
+    var xtype = document.getElementById('xtype');
+    var mode = new URLSearchParams(location.search).get('mode') || 'human';
+    btn.disabled = true; var o = btn.textContent; btn.textContent = '🎮 Placing…';
+    try{
+      var r = await fetch('/api/demo/bet',{method:'POST',headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({keys:keys, stake:stake, gameType: xtype ? xtype.value : undefined, origin: mode})});
+      var j = await r.json();
+      if(j.ok){
+        var by = '';
+        if(j.resultsBy){
+          by = ' Final result by ' + new Date(j.resultsBy).toLocaleString('en-GB',
+            {day:'numeric',month:'short',hour:'2-digit',minute:'2-digit',timeZone:'Africa/Lagos'}) +
+            ' WAT — settles automatically, nothing to do.';
+        }
+        showToast('🎮 Demo bet placed: '+j.legs+' legs @ '+j.totalOdds+' — potential ₦'+Math.round(j.potential).toLocaleString()+'. Demo balance ₦'+Math.round(j.balance).toLocaleString()+'.'+by,'ok');
+        var res = document.getElementById('slipres');
+        if(res) res.innerHTML = '<a class="btn ghost sm" href="/?mode=demo">🎮 View demo wallet</a>';
+      } else {
+        showToast(j.error || 'Demo bet failed — try again','warn');
+      }
+    }catch(e){ showToast('Demo bet failed — network error','warn'); }
+    btn.disabled = false; btn.textContent = o;
+  }
+  // Live "final result by" countdown on pending demo bets. The absolute time is
+  // rendered server-side; this only keeps the relative part honest as it ticks.
+  (function(){
+    var boxes = document.querySelectorAll('.dm-eta');
+    if(!boxes.length) return;
+    function fmt(ms){
+      var s = Math.floor(ms/1000);
+      var d = Math.floor(s/86400); var h = Math.floor(s%86400/3600); var m = Math.floor(s%3600/60);
+      if(d > 0) return 'in ~' + d + 'd ' + h + 'h';
+      if(h > 0) return 'in ~' + h + 'h ' + m + 'm';
+      if(m > 0) return 'in ~' + m + 'm';
+      return 'any moment now';
+    }
+    function tick(){
+      var now = Date.now();
+      for(var i = 0; i < boxes.length; i++){
+        var due = Number(boxes[i].getAttribute('data-due')) || 0;
+        var cd = boxes[i].querySelector('.dm-eta-cd'); if(!cd) continue;
+        if(due - now > 0){
+          cd.textContent = '· ' + fmt(due - now);
+          boxes[i].classList.remove('due');
+        } else {
+          // Past the buffer: the next scan cycle settles it (runs every 3 min).
+          cd.textContent = '· settling on the next scan (within 3 min)';
+          boxes[i].classList.add('due');
+        }
+      }
+    }
+    tick(); setInterval(tick, 30000);
+  })();
+  async function demoReset(btn){
+    if(!confirm('Reset your demo balance back to the starting bank? Your bet history is kept.')) return;
+    btn.disabled = true;
+    try{
+      var r = await fetch('/api/demo/reset',{method:'POST'});
+      var j = await r.json();
+      if(j.ok){ showToast('Demo wallet reset to ₦'+Math.round(j.balance).toLocaleString(),'ok'); setTimeout(function(){ location.reload(); }, 800); }
+      else showToast(j.error || 'Reset failed','warn');
+    }catch(e){ showToast('Reset failed — network error','warn'); }
+    btn.disabled = false;
   }
   function updBar(){
     var n = Object.keys(SEL).length;
@@ -3674,8 +3907,10 @@ export function startServer() {
                     ? "analysis"
                     : modeParam === "saved"
                       ? "saved"
-                      : modeParam === "metrics"
-                        ? "metrics"
+                      : modeParam === "demo"
+                        ? "demo"
+                        : modeParam === "metrics"
+                          ? "metrics"
                         : "human";
       // Tier comes from the user's paid subscription window in the DB. The demo
       // unlock cookie must carry a hashed token (not the literal "premium"), so
@@ -3879,6 +4114,62 @@ export function startServer() {
         const data = await getExpertRoi();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(data));
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/demo/bet") {
+        // Demo Bet Simulator: VIRTUAL stake on the current slip, settled later
+        // against real final scores. No real money ever moves.
+        let keys: string[] = [];
+        let stake = 0;
+        let dGameType: GameType = "result";
+        let dOrigin = "human";
+        try {
+          const body = JSON.parse((await readBody(req, 64 * 1024)) || "{}");
+          keys = Array.isArray(body.keys) ? body.keys.map((k: unknown) => String(k)) : [];
+          stake = Number(body.stake) || 0;
+          dGameType = validGameType(body.gameType);
+          dOrigin = String(body.origin ?? "human").slice(0, 20);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Bad request body." }));
+          return;
+        }
+        // Wallet owner: the signed-in user, else a per-device guest id cookie
+        // (created on first demo bet) so anyone can try the simulator.
+        let owner = user ? `u:${user.id}` : null;
+        let setCookie: string | null = null;
+        if (!owner) {
+          let did = readCookie(cookies, "demo_id");
+          if (!did || !/^[a-f0-9]{16,64}$/.test(did)) {
+            did = randomBytes(16).toString("hex");
+            setCookie = `demo_id=${did}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`;
+          }
+          owner = `g:${did}`;
+        }
+        const result = await placeDemoBet(owner, keys, stake, dGameType, dOrigin).catch((e) => ({
+          ok: false as const,
+          error: `Demo bet failed: ${e?.message ?? e}`,
+        }));
+        const headers: Record<string, string | string[]> = { "Content-Type": "application/json" };
+        if (setCookie) headers["Set-Cookie"] = setCookie;
+        res.writeHead(result.ok ? 200 : 400, headers);
+        res.end(JSON.stringify(result));
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/demo/reset") {
+        const owner = user
+          ? `u:${user.id}`
+          : (() => {
+              const did = readCookie(cookies, "demo_id");
+              return did && /^[a-f0-9]{16,64}$/.test(did) ? `g:${did}` : null;
+            })();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        if (!owner) {
+          res.end(JSON.stringify({ ok: false, error: "No demo wallet yet — place a demo bet first." }));
+          return;
+        }
+        const balance = await resetDemoWallet(owner).catch(() => null);
+        res.end(balance === null ? JSON.stringify({ ok: false, error: "Reset failed." }) : JSON.stringify({ ok: true, balance }));
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/analysis/chat") {
@@ -4098,6 +4389,12 @@ export function startServer() {
         isAdmin,
         user ? { email: user.email, premiumUntil: premiumViaSub ? sub!.currentPeriodEnd : null } : null,
         (/(?:^|;\s*)bookie=([a-z0-9]+)/.exec(req.headers.cookie ?? "") || [])[1] || "sportybet",
+        user
+          ? `u:${user.id}`
+          : (() => {
+              const did = readCookie(cookies, "demo_id");
+              return did && /^[a-f0-9]{16,64}$/.test(did) ? `g:${did}` : null;
+            })(),
       );
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(html);
