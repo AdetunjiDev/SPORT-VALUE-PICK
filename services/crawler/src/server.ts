@@ -25,7 +25,7 @@ import {
 import { getMatchAnalyses, analyzeEvent } from "./xg.js";
 import { getFormsForMatches, getMatchForm, teamRating, type MatchForm } from "./form.js";
 import { analystAnswer } from "./analyst-chat.js";
-import { placeDemoBet, getDemoWallet, resetDemoWallet, DEMO_START_BALANCE, resultsExpectedAt, type WalletView } from "./demo.js";
+import { placeDemoBet, getDemoWallet, resetDemoWallet, deleteDemoBet, DEMO_START_BALANCE, resultsExpectedAt, type WalletView } from "./demo.js";
 import { randomBytes } from "node:crypto";
 import { BOOKMAKERS, getBookmaker, activeBookmaker } from "./bookmakers.js";
 
@@ -972,8 +972,10 @@ async function renderDashboard(
     </div>`
       : "";
 
-  const nav = (m: Mode, icon: string, label: string, active: boolean) =>
-    `<a class="nav-item${active ? " on" : ""}" href="/?mode=${m}"><span class="ni">${icon}</span>${label}</a>`;
+  const nav = (m: Mode, icon: string, label: string, active: boolean, flag = "") =>
+    `<a class="nav-item${active ? " on" : ""}" href="/?mode=${m}"><span class="ni">${icon}</span>${label}${
+      flag ? `<span class="nav-free">${flag}</span>` : ""
+    }</a>`;
 
   // ---- Date selector (browse codes by the day they were found) ----
   const dayLabel = (d: string) =>
@@ -1802,6 +1804,33 @@ async function renderDashboard(
     ${roiCard}`;
 
   // ---- Demo Bet Simulator: virtual money, settled against REAL scores ----
+  // --- Human-readable WAT times for the demo wallet ---
+  // Everything is Africa/Lagos: the calendar day is worked out IN Lagos, so
+  // "today"/"tomorrow" match the user's own clock rather than the server's.
+  const watClock = (ts: number) =>
+    new Date(ts).toLocaleTimeString("en-GB", {
+      hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos",
+    });
+  const watDate = (ts: number) => new Date(ts).toLocaleDateString("en-CA", { timeZone: "Africa/Lagos" });
+  // Whole calendar days between two instants, counted in Lagos (noon-anchored
+  // so daylight/offset shifts can never round a day up or down).
+  const watDayGap = (ts: number, from: number) =>
+    Math.round(
+      (Date.parse(`${watDate(ts)}T12:00:00Z`) - Date.parse(`${watDate(from)}T12:00:00Z`)) / 86_400_000,
+    );
+  /** "today at 15:30 WAT" · "tomorrow at 20:00 WAT" · "in 2 days — Sat 19 Jul, 18:00 WAT" */
+  const watWhen = (ts: number, at = false) => {
+    const gap = watDayGap(ts, Date.now());
+    const clock = watClock(ts);
+    const dayName = new Date(ts).toLocaleDateString("en-GB", {
+      weekday: "short", day: "numeric", month: "short", timeZone: "Africa/Lagos",
+    });
+    if (gap <= 0) return `${at ? "today at" : "today by"} ${clock} WAT`;
+    if (gap === 1) return `${at ? "tomorrow at" : "tomorrow by"} ${clock} WAT`;
+    if (gap <= 6) return `in ${gap} days — ${dayName}, ${clock} WAT`;
+    return `${dayName}, ${clock} WAT`;
+  };
+
   const demoBody = (() => {
     const w = demoWallet;
     const fmtN = (n: number) => `₦${Math.round(Math.abs(n)).toLocaleString()}`;
@@ -1812,6 +1841,17 @@ async function renderDashboard(
         <div class="muted small">Test the app before staking real cash: place bets with <b>demo ₦</b> on any picks (AI Analysis, Expert, Value, Predictions) and the app settles them automatically against the <b>real final scores</b> — the same source that settles the Expert track record. If the model performs, you see it here first: honest proof, not promises. Virtual money only, nothing to deposit or withdraw. 18+.</div>
       </div>
       ${w ? `<button class="btn ghost" onclick="demoReset(this)" title="Balance back to the starting bank — history is kept">↺ Reset wallet</button>` : ""}
+    </div>
+    <div class="dm-cta card">
+      <div class="dm-cta-t"><b>➕ Book a demo bet</b> <span class="dm-free">FREE · no card, no deposit</span>
+        <div class="muted small">Place as many as you like — pick your matches on any tab below, tick the markets you want, then hit <b>🎮 Demo bet</b> in the slip bar. Every bet settles itself against the real final scores, so you can prove the app works before paying for anything.</div>
+      </div>
+      <div class="dm-cta-b">
+        <a class="btn" href="/?mode=analysis">📊 AI Analysis</a>
+        <a class="btn ghost" href="/?mode=expert">🎓 Expert Picks</a>
+        <a class="btn ghost" href="/?mode=value">💎 Value Picks</a>
+        <a class="btn ghost" href="/?mode=pred">📅 Predictions</a>
+      </div>
     </div>`;
     if (!w || !w.bets.length) {
       return `${head}
@@ -1831,22 +1871,23 @@ async function renderDashboard(
           )
           .join("");
         // When every match is over and the settler will have run: last kickoff
-        // + the same buffer settleDemoBets() waits for. Shown so users know
-        // exactly when to come back rather than guessing.
+        // + the same buffer settleDemoBets() waits for. Say WHICH DAY, not just
+        // a clock time — "17 Jul, 15:30" makes the reader work out the date
+        // themselves, which is what made the old copy feel wrong.
         const dueAt = resultsExpectedAt(b.legs);
         const lastKick = b.legs.length ? Math.max(...b.legs.map((l) => l.kickoff)) : 0;
         const eta =
           b.outcome !== "PENDING" || !dueAt
             ? ""
-            : `<div class="dm-eta" data-due="${dueAt}" data-kick="${lastKick}">🕒 <b>Final result by ${esc(
-                new Date(dueAt).toLocaleString("en-GB", {
-                  day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos",
-                }),
-              )} WAT</b> <span class="dm-eta-cd"></span><br/><span class="muted small">Last match kicks off ${esc(
-                new Date(lastKick).toLocaleString("en-GB", {
-                  day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos",
-                }),
-              )} WAT — we wait until every game has ended, then settle against the real final scores. Nothing for you to do; check back then.</span></div>`;
+            : `<div class="dm-eta" data-due="${dueAt}" data-kick="${lastKick}">🕒 <b>Final result ${esc(
+                watWhen(dueAt),
+              )}</b> <span class="dm-eta-cd"></span><br/><span class="muted small">Last of your ${
+                b.legs.length
+              } match${b.legs.length === 1 ? "" : "es"} kicks off ${esc(
+                watWhen(lastKick, true),
+              )} and ends around ${esc(
+                watClock(lastKick + 110 * 60 * 1000),
+              )} — we wait until every game has ended, then settle against the real final scores. Nothing for you to do; check back then.</span></div>`;
         const result =
           b.outcome === "PENDING"
             ? `<span class="dm-res pending">⏳ pending · potential ${fmtN(b.potential)}</span>`
@@ -1855,8 +1896,18 @@ async function renderDashboard(
               : b.outcome === "VOID"
                 ? `<span class="dm-res void">➖ VOID · stake refunded</span>`
                 : `<span class="dm-res lost">❌ LOST ${fmtN(b.stake)}</span>`;
-        return `<div class="dm-bet card">
-          <div class="dm-head"><b>${b.legs.length} leg${b.legs.length === 1 ? "" : "s"} @ ${b.totalOdds.toFixed(2)}</b><span class="muted small">stake ${fmtN(b.stake)} · ${esc(b.origin)} · ${esc(when)} WAT</span>${result}</div>
+        // Delete: a true cancel (stake back) only while nothing has kicked off;
+        // afterwards it just clears the row. The button says which it is, so
+        // nobody expects a refund they aren't getting.
+        const del = `<button class="dm-del" title="${
+          b.cancellable
+            ? `Cancel this bet and put ${fmtN(b.stake)} back in your demo balance`
+            : "Remove this bet from your history (balance is not changed)"
+        }" data-id="${esc(b.id)}" data-cancel="${b.cancellable ? "1" : "0"}" data-stake="${b.stake}" onclick="demoDel(this)">🗑 ${
+          b.cancellable ? "Cancel" : "Delete"
+        }</button>`;
+        return `<div class="dm-bet card" data-bet="${esc(b.id)}">
+          <div class="dm-head"><b>${b.legs.length} leg${b.legs.length === 1 ? "" : "s"} @ ${b.totalOdds.toFixed(2)}</b><span class="muted small">stake ${fmtN(b.stake)} · ${esc(b.origin)} · ${esc(when)} WAT</span>${result}${del}</div>
           <div class="dm-legs">${legRows}</div>
           ${eta}
         </div>`;
@@ -2264,6 +2315,23 @@ async function renderDashboard(
   .dm-res.won{color:var(--green);border-color:rgba(52,211,153,.45);background:rgba(52,211,153,.08)}
   .dm-res.lost{color:var(--bad);border-color:rgba(251,113,133,.45);background:rgba(251,113,133,.07)}
   .dm-res.void{color:var(--muted)}
+  /* Per-bet delete / cancel */
+  .dm-del{margin-left:10px;padding:4px 10px;border-radius:999px;cursor:pointer;font-size:11px;
+    font-weight:800;color:var(--muted);background:transparent;border:1px solid var(--line)}
+  .dm-del:hover:not(:disabled){color:var(--bad);border-color:rgba(251,113,133,.55);background:rgba(251,113,133,.07)}
+  .dm-del:disabled{opacity:.5;cursor:default}
+  /* "Book a demo bet" call-to-action on the wallet page */
+  .dm-cta{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;
+    margin:0 0 16px;border:1px solid rgba(139,92,246,.4);
+    background:linear-gradient(135deg,rgba(139,92,246,.10),rgba(99,102,241,.05))}
+  .dm-cta-t{flex:1;min-width:260px}
+  .dm-cta-b{display:flex;gap:8px;flex-wrap:wrap}
+  .dm-free{display:inline-block;margin-left:6px;padding:2px 8px;border-radius:999px;font-size:10px;
+    font-weight:800;letter-spacing:.04em;color:#0f8a52;background:rgba(52,211,153,.14);
+    border:1px solid rgba(52,211,153,.45);vertical-align:middle}
+  /* "Free" flag on the Demo nav item — visible from every page */
+  .nav-free{margin-left:auto;padding:1px 6px;border-radius:999px;font-size:9px;font-weight:800;
+    color:#0f8a52;background:rgba(52,211,153,.16);border:1px solid rgba(52,211,153,.45)}
   /* "Final result by …" panel on pending demo bets */
   .dm-eta{margin-top:10px;padding:10px 12px;border-radius:10px;font-size:12px;line-height:1.5;
     border:1px dashed rgba(139,92,246,.45);background:rgba(139,92,246,.06);color:var(--ink)}
@@ -2807,7 +2875,7 @@ async function renderDashboard(
     ${nav("analysis", "📊", "AI Analysis", mode === "analysis")}
     ${nav("combo", "🎰", "Value Combos", mode === "combo")}
     ${nav("saved", "💾", "Saved Codes", mode === "saved")}
-    ${nav("demo", "🎮", "Demo Wallet", mode === "demo")}
+    ${nav("demo", "🎮", "Demo Wallet", mode === "demo", "FREE")}
     ${
       isAdmin
         ? `<div class="nav-label">Owner</div>
@@ -3094,9 +3162,15 @@ async function renderDashboard(
       if(j.ok){
         var by = '';
         if(j.resultsBy){
-          by = ' Final result by ' + new Date(j.resultsBy).toLocaleString('en-GB',
-            {day:'numeric',month:'short',hour:'2-digit',minute:'2-digit',timeZone:'Africa/Lagos'}) +
-            ' WAT — settles automatically, nothing to do.';
+          // Same today/tomorrow/in-N-days wording as the wallet, worked out in
+          // Lagos so the day matches the customer's own clock.
+          var dstr = function(t){ return new Date(t).toLocaleDateString('en-CA',{timeZone:'Africa/Lagos'}); };
+          var gap = Math.round((Date.parse(dstr(j.resultsBy)+'T12:00:00Z') - Date.parse(dstr(Date.now())+'T12:00:00Z'))/86400000);
+          var clock = new Date(j.resultsBy).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',timeZone:'Africa/Lagos'});
+          var day = gap <= 0 ? 'today' : gap === 1 ? 'tomorrow'
+            : gap <= 6 ? 'in ' + gap + ' days (' + new Date(j.resultsBy).toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short',timeZone:'Africa/Lagos'}) + ')'
+            : new Date(j.resultsBy).toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short',timeZone:'Africa/Lagos'});
+          by = ' Final result ' + day + ' by ' + clock + ' WAT — settles automatically, nothing to do.';
         }
         showToast('🎮 Demo bet placed: '+j.legs+' legs @ '+j.totalOdds+' — potential ₦'+Math.round(j.potential).toLocaleString()+'. Demo balance ₦'+Math.round(j.balance).toLocaleString()+'.'+by,'ok');
         var res = document.getElementById('slipres');
@@ -3115,9 +3189,9 @@ async function renderDashboard(
     function fmt(ms){
       var s = Math.floor(ms/1000);
       var d = Math.floor(s/86400); var h = Math.floor(s%86400/3600); var m = Math.floor(s%3600/60);
-      if(d > 0) return 'in ~' + d + 'd ' + h + 'h';
-      if(h > 0) return 'in ~' + h + 'h ' + m + 'm';
-      if(m > 0) return 'in ~' + m + 'm';
+      if(d > 0) return '~' + d + ' day' + (d===1?'':'s') + ' ' + h + 'h away';
+      if(h > 0) return '~' + h + 'h ' + m + 'm away';
+      if(m > 0) return '~' + m + 'm away';
       return 'any moment now';
     }
     function tick(){
@@ -3137,6 +3211,33 @@ async function renderDashboard(
     }
     tick(); setInterval(tick, 30000);
   })();
+  async function demoDel(btn){
+    var id = btn.getAttribute('data-id');
+    var canCancel = btn.getAttribute('data-cancel') === '1';
+    var stake = Math.round(Number(btn.getAttribute('data-stake')) || 0);
+    var msg = canCancel
+      ? 'Cancel this demo bet?\\n\\nNothing has kicked off yet, so your ₦' + stake.toLocaleString() + ' stake goes back to your demo balance.'
+      : 'Delete this bet from your history?\\n\\nIts matches have already started, so the ₦' + stake.toLocaleString() + ' stake is not refunded and your profit total stays as it is.';
+    if(!confirm(msg)) return;
+    btn.disabled = true; var o = btn.textContent; btn.textContent = '…';
+    try{
+      var r = await fetch('/api/demo/delete',{method:'POST',headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({id:id})});
+      var j = await r.json();
+      if(j.ok){
+        var card = document.querySelector('.dm-bet[data-bet="' + id + '"]');
+        if(card) card.remove();
+        showToast(j.refunded ? ('Bet cancelled — ₦' + Math.round(j.refunded).toLocaleString() + ' returned. Demo balance ₦' + Math.round(j.balance).toLocaleString()) : 'Bet deleted from your history', 'ok');
+        setTimeout(function(){ location.reload(); }, 900); // refresh KPIs
+      } else {
+        showToast(j.error || 'Delete failed','warn');
+        btn.disabled = false; btn.textContent = o;
+      }
+    }catch(e){
+      showToast('Delete failed — network error','warn');
+      btn.disabled = false; btn.textContent = o;
+    }
+  }
   async function demoReset(btn){
     if(!confirm('Reset your demo balance back to the starting bank? Your bet history is kept.')) return;
     btn.disabled = true;
@@ -4154,6 +4255,40 @@ export function startServer() {
         if (setCookie) headers["Set-Cookie"] = setCookie;
         res.writeHead(result.ok ? 200 : 400, headers);
         res.end(JSON.stringify(result));
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/demo/delete") {
+        // Remove one demo bet. Only the wallet's own owner can touch it —
+        // deleteDemoBet() scopes the lookup to this wallet, so a guessed id
+        // from another user is simply "not in your wallet".
+        const owner = user
+          ? `u:${user.id}`
+          : (() => {
+              const did = readCookie(cookies, "demo_id");
+              return did && /^[a-f0-9]{16,64}$/.test(did) ? `g:${did}` : null;
+            })();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        if (!owner) {
+          res.end(JSON.stringify({ ok: false, error: "No demo wallet yet." }));
+          return;
+        }
+        let betId = "";
+        try {
+          const body = JSON.parse((await readBody(req, 4 * 1024)) || "{}");
+          betId = String(body.id ?? "").slice(0, 40);
+        } catch {
+          res.end(JSON.stringify({ ok: false, error: "Bad request body." }));
+          return;
+        }
+        if (!betId) {
+          res.end(JSON.stringify({ ok: false, error: "Missing bet id." }));
+          return;
+        }
+        const out = await deleteDemoBet(owner, betId).catch((e) => ({
+          ok: false as const,
+          error: `Delete failed: ${e?.message ?? e}`,
+        }));
+        res.end(JSON.stringify(out));
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/demo/reset") {

@@ -177,6 +177,7 @@ export interface WalletView {
     createdAt: string;
     settledAt: string | null;
     legs: DemoLeg[];
+    cancellable: boolean; // nothing kicked off yet ⇒ deleting refunds the stake
   }[];
   stats: { pending: number; won: number; lost: number; voided: number; hitRate: number | null };
 }
@@ -197,19 +198,69 @@ export async function getDemoWallet(owner: string): Promise<WalletView | null> {
     staked: Math.round(wallet.staked * 100) / 100,
     returned: Math.round(wallet.returned * 100) / 100,
     profit: Math.round((wallet.returned - wallet.staked) * 100) / 100,
-    bets: bets.map((b) => ({
-      id: b.id,
-      stake: b.stake,
-      totalOdds: b.totalOdds,
-      potential: b.potential,
-      outcome: b.outcome,
-      payout: b.payout,
-      origin: b.origin,
-      createdAt: b.createdAt.toISOString(),
-      settledAt: b.settledAt ? b.settledAt.toISOString() : null,
-      legs: (b.legs as unknown as DemoLeg[]) ?? [],
-    })),
+    bets: bets.map((b) => {
+      const legs = (b.legs as unknown as DemoLeg[]) ?? [];
+      return {
+        id: b.id,
+        stake: b.stake,
+        totalOdds: b.totalOdds,
+        potential: b.potential,
+        outcome: b.outcome,
+        payout: b.payout,
+        origin: b.origin,
+        createdAt: b.createdAt.toISOString(),
+        settledAt: b.settledAt ? b.settledAt.toISOString() : null,
+        legs,
+        cancellable: b.outcome === "PENDING" && !legs.some((l) => l.kickoff <= Date.now()),
+      };
+    }),
     stats: { pending: by("PENDING"), won, lost, voided: by("VOID"), hitRate: won + lost ? won / (won + lost) : null },
+  };
+}
+
+export interface DeleteResult {
+  ok: boolean;
+  error?: string;
+  refunded?: number;
+  balance?: number;
+}
+
+/**
+ * Remove one demo bet.
+ *
+ * The stake is refunded ONLY when nothing has kicked off yet — that is a real
+ * cancellation. Once a match is under way the stake stays spent, because
+ * refunding an in-play bet would let anyone drop their losers and walk away
+ * with a fake profit, which would make the wallet's numbers worthless as proof
+ * the model works. Deleting a played bet is therefore just tidying the list:
+ * the wallet's lifetime staked/returned totals (and so the profit KPI) are
+ * left exactly as they were.
+ */
+export async function deleteDemoBet(owner: string, betId: string): Promise<DeleteResult> {
+  const wallet = await prisma.demoWallet.findUnique({ where: { owner } });
+  if (!wallet) return { ok: false, error: "No demo wallet yet." };
+  const bet = await prisma.demoBet.findFirst({ where: { id: betId, walletId: wallet.id } });
+  if (!bet) return { ok: false, error: "That bet isn't in your wallet." };
+
+  const legs = (bet.legs as unknown as DemoLeg[]) ?? [];
+  const started = legs.some((l) => l.kickoff <= Date.now());
+  const refund = bet.outcome === "PENDING" && !started ? bet.stake : 0;
+
+  const writes: any[] = [prisma.demoBet.delete({ where: { id: bet.id } })];
+  if (refund > 0)
+    writes.push(
+      prisma.demoWallet.update({
+        where: { id: wallet.id },
+        data: { balance: { increment: refund }, staked: { decrement: refund } },
+      }),
+    );
+  await prisma.$transaction(writes);
+
+  const after = await prisma.demoWallet.findUnique({ where: { id: wallet.id } });
+  return {
+    ok: true,
+    refunded: refund,
+    balance: after ? Math.round(after.balance * 100) / 100 : undefined,
   };
 }
 
