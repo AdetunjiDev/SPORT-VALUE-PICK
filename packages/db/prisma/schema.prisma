@@ -191,6 +191,8 @@ model User {
   payments      Payment[]
   favorites     Favorite[]
   notifications Notification[]
+  userPreference UserPreference?
+  savedPicks    SavedPick[]
   auditLogs     AuditLog[]     @relation("ActorAudit")
 
   @@index([provider, providerId])
@@ -578,6 +580,43 @@ model Notification {
   @@map("notifications")
 }
 
+model UserPreference {
+  id                 String   @id @default(cuid())
+  userId             String   @unique
+  preferredGameType  String   @default("safe")
+  minConfidence      Float    @default(0)
+  maxOdds            Float    @default(0)
+  favoriteLeagues    Json?    @default("[]")
+  notifyOnNewPicks   Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("user_preferences")
+}
+
+model SavedPick {
+  id          String   @id @default(cuid())
+  userId      String
+  home        String
+  away        String
+  league      String?
+  market      String
+  selection   String
+  odds        Float    @default(0)
+  confidence  Float    @default(0)
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("saved_picks")
+}
+
 model HistoricalResult {
   id          String     @id @default(cuid())
   humanCodeId String?
@@ -649,6 +688,83 @@ model GeneratedCode {
   @@index([generatorName, createdAt])
   @@index([createdAt])
   @@map("generated_codes")
+}
+
+// =====================================================
+// DEMO BET SIMULATOR (virtual money, real results)
+// =====================================================
+
+// A practice wallet holding DEMO money only. Lets anyone test the app's picks
+// risk-free: virtual stakes are settled against REAL final scores, producing
+// honest proof of performance before a user ever pays — and aggregate data
+// that shows which markets/confidence bands actually win.
+model DemoWallet {
+  id        String   @id @default(cuid())
+  owner     String   @unique // "u:<userId>" (signed in) or "g:<deviceId>" (guest)
+  balance   Float    @default(100000) // virtual ₦ — refreshed daily, never real money
+  staked    Float    @default(0) // lifetime staked (analytics)
+  returned  Float    @default(0) // lifetime returned (analytics)
+  resetDay  String   @default("") // WAT day (YYYY-MM-DD) the balance was last refreshed
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  bets DemoBet[]
+
+  @@map("demo_wallets")
+}
+
+// Permanent, compact results archive. When a live DemoBet is pruned (older
+// than the 3-month window) its result is copied here first, so the full study
+// history is kept forever without bloating the active betting table.
+model DemoArchive {
+  id        String     @id @default(cuid())
+  owner     String // wallet owner ("u:<id>" | "g:<device>")
+  origBetId String     @unique // the original DemoBet id (dedupe key)
+  createdAt DateTime // when the bet was placed
+  settledAt DateTime?
+  outcome   BetOutcome @default(PENDING)
+  stake     Float
+  totalOdds Float      @default(1)
+  potential Float      @default(0)
+  payout    Float?
+  origin    String     @default("analysis")
+  legs      Json // compact [{ home, away, league, pick, odds, outcome, finalScore }]
+  archivedAt DateTime  @default(now())
+
+  @@index([owner, settledAt])
+  @@map("demo_archive")
+}
+
+model DemoBet {
+  id        String     @id @default(cuid())
+  walletId  String
+  stake     Float
+  totalOdds Float      @default(1)
+  potential Float      @default(0) // stake × totalOdds at placement
+  outcome   BetOutcome @default(PENDING)
+  payout    Float? // credited on settlement (0 for LOST, stake for VOID)
+  origin    String     @default("analysis") // which tab the slip came from
+  legs      Json // [{ eventId, home, away, league, kickoff, market, pick, pickCode, odds, outcome?, finalScore? }]
+  createdAt DateTime   @default(now())
+  settledAt DateTime?
+
+  wallet DemoWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  @@index([outcome, createdAt])
+  @@index([walletId, createdAt])
+  @@map("demo_bets")
+}
+
+// Persistent cache for external results lookups (team form + head-to-head).
+// The free results API is rate-limited, so every conclusive answer is stored
+// here permanently — coverage COMPOUNDS across refreshes and restarts instead
+// of resetting with the process.
+model LookupCache {
+  key       String   @id // "form:<team>" | "h2h:<teamA>|<teamB>"
+  data      Json
+  fetchedAt DateTime @default(now())
+
+  @@map("lookup_cache")
 }
 
 // Track record for Expert Picks: each distinct recommendation the engine makes

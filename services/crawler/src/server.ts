@@ -5,7 +5,7 @@ import { RESPONSIBLE_GAMBLING_DISCLAIMER } from "@sportybet/shared";
 import { config } from "./config.js";
 import { runCycle, lastRunAt, nextRunAt, lastSummary, intervalSec } from "./scheduler.js";
 import { getPredictions } from "./predictions.js";
-import { planForTips, legsForFixtureKeys, getSportyFixtures, fuzzyTeamsMatch } from "./forebet-ai.js";
+import { planForTips, legsForFixtureKeys, getSportyFixtures, fetchEventById, fuzzyTeamsMatch, PICKS, devig, type SbEvent } from "./forebet-ai.js";
 import { createBookingCode } from "./booker.js";
 import { ocrBuffer } from "./ocr.js";
 import { extract } from "./extractor.js";
@@ -20,14 +20,17 @@ import {
   getExpertRoi,
   getValuePicks,
   getCombos,
+  fetchEventScore,
+  settlePick,
   type GameType,
 } from "./analyst.js";
-import { getMatchAnalyses, analyzeEvent } from "./xg.js";
+import { getMatchAnalyses, analyzeEvent, type MatchAnalysis } from "./xg.js";
 import { getFormsForMatches, getMatchForm, teamRating, type MatchForm } from "./form.js";
 import { analystAnswer } from "./analyst-chat.js";
-import { placeDemoBet, getDemoWallet, resetDemoWallet, deleteDemoBet, DEMO_START_BALANCE, resultsExpectedAt, type WalletView } from "./demo.js";
+import { placeDemoBet, placeDemoBetFromSelections, pickCodeForBooking, getDemoWallet, getDemoDailyStats, getDemoGamesLog, getDemoAllBets, getDemoLeaderboard, exportDemoCsv, resetDemoWallet, deleteDemoBet, DEMO_START_BALANCE, DEMO_RETENTION_DAYS, resultsExpectedAt, type WalletView, type DailyStat, type GameLogRow, type ArchiveBet, type LeaderboardEntry } from "./demo.js";
 import { randomBytes } from "node:crypto";
 import { BOOKMAKERS, getBookmaker, activeBookmaker } from "./bookmakers.js";
+import { normalizePreferences, normalizeSavedPick, preferenceSummary } from "./personalization.js";
 
 const GAME_TYPES: GameType[] = ["result", "goals", "double", "dnb", "btts", "teamgoals", "safe", "both"];
 const validGameType = (v: unknown): GameType =>
@@ -220,9 +223,11 @@ function renderAuth(
   .bshadow{position:absolute;left:50%;bottom:2px;width:90px;height:14px;margin-left:-45px;border-radius:50%;
     background:radial-gradient(ellipse,rgba(3,0,20,.65),transparent 70%);animation:shadowpulse 5s ease-in-out infinite}
   @keyframes shadowpulse{0%,100%{transform:scaleX(1);opacity:.8}50%{transform:scaleX(.78);opacity:.5}}
-  .brand h2{font-family:'Sora',sans-serif;font-size:24px;line-height:1.25;margin:0 0 8px;text-align:center;letter-spacing:.2px}
+  /* The brand panel stays dark violet, so its text must be explicitly LIGHT —
+     the page body's dark ink is invisible here. */
+  .brand h2{font-family:'Sora',sans-serif;font-size:24px;line-height:1.25;margin:0 0 8px;text-align:center;letter-spacing:.2px;color:#f5f2ff}
   .grad{background:linear-gradient(90deg,#c4b5fd,#a78bfa,#38bdf8);-webkit-background-clip:text;background-clip:text;color:transparent}
-  .sub{color:#9a91bd;font-size:13px;line-height:1.55;text-align:center;margin:0 0 20px}
+  .sub{color:#c0b6e2;font-size:13px;line-height:1.55;text-align:center;margin:0 0 20px}
   .feats{list-style:none;margin:0;padding:0;display:grid;gap:10px}
   .feats li{display:flex;gap:12px;align-items:center;padding:10px 12px;border-radius:14px;
     background:rgba(15,9,36,.5);border:1px solid rgba(255,255,255,.08);
@@ -232,9 +237,9 @@ function renderAuth(
   @keyframes featin{from{opacity:0;transform:translateX(-14px)}to{opacity:1;transform:none}}
   .fi{width:34px;height:34px;flex:0 0 34px;border-radius:10px;display:grid;place-items:center;font-size:16px;
     background:rgba(139,92,246,.16);border:1px solid rgba(139,92,246,.3)}
-  .feats b{display:block;font-size:13px}
-  .feats small{color:#9a91bd;font-size:11.5px}
-  .trust{margin-top:18px;text-align:center;font-size:11.5px;color:#8d84b3}
+  .feats b{display:block;font-size:13px;color:#efeaff}
+  .feats small{color:#b8addb;font-size:11.5px}
+  .trust{margin-top:18px;text-align:center;font-size:11.5px;color:#a89ecd}
 
   /* --- form panel --- */
   .side{padding:32px 32px 26px;display:flex;flex-direction:column}
@@ -333,7 +338,7 @@ function renderAuth(
     <ul class="feats">
       <li><span class="fi">⚡</span><div><b>Live verified codes</b><small>Fresh codes, checked in real time</small></div></li>
       <li><span class="fi">🧠</span><div><b>AI match analysis</b><small>Score model calibrated to live odds</small></div></li>
-      <li><span class="fi">🎯</span><div><b>4 markets per match</b><small>Result · Over/Under · BTTS · Double chance</small></div></li>
+      <li><span class="fi">🎯</span><div><b>5+ markets per match</b><small>Result · Over/Under (incl. 0.5) · BTTS · Double chance</small></div></li>
     </ul>
     <div class="trust">🔒 Secure Paystack checkout · Instant access</div>
   </section>
@@ -478,7 +483,7 @@ function stars(n: number): string {
   return "★".repeat(v) + "☆".repeat(5 - v);
 }
 
-type Mode = "human" | "ai" | "pred" | "expert" | "value" | "combo" | "analysis" | "saved" | "metrics" | "demo";
+type Mode = "human" | "ai" | "pred" | "expert" | "value" | "combo" | "analysis" | "saved" | "metrics" | "demo" | "leaderboard";
 type Tier = "free" | "premium";
 
 async function renderDashboard(
@@ -495,6 +500,8 @@ async function renderDashboard(
   account: { email: string; premiumUntil: Date | null } | null = null,
   bookieId = "sportybet",
   demoOwner: string | null = null,
+  editCode: string | null = null,
+  userId: string | null = null,
 ): Promise<string> {
   const bookie = getBookmaker(bookieId);
   const liveBookie = activeBookmaker();
@@ -518,9 +525,17 @@ async function renderDashboard(
   // Owner business metrics (users / subscribers / revenue) — admin only.
   const metrics: BusinessMetrics | null =
     mode === "metrics" && isAdmin ? await getBusinessMetrics().catch(() => null) : null;
-  // Demo simulator wallet (virtual money, real results).
+  // Demo simulator wallet (virtual money, real results) + per-day study stats.
   const demoWallet: WalletView | null =
     mode === "demo" && demoOwner ? await getDemoWallet(demoOwner).catch(() => null) : null;
+  const demoDaily: DailyStat[] =
+    mode === "demo" && demoOwner ? await getDemoDailyStats(demoOwner).catch(() => []) : [];
+  const demoGames: GameLogRow[] =
+    mode === "demo" && demoOwner ? await getDemoGamesLog(demoOwner).catch(() => []) : [];
+  const demoAllBets: ArchiveBet[] =
+    mode === "demo" && demoOwner ? await getDemoAllBets(demoOwner).catch(() => []) : [];
+  const leaderboard: LeaderboardEntry[] =
+    mode === "leaderboard" ? await getDemoLeaderboard(demoOwner).catch(() => []) : [];
   const valueResult =
     mode === "value"
       ? await getValuePicks({
@@ -533,15 +548,154 @@ async function renderDashboard(
     mode === "combo"
       ? await getCombos(Math.floor(Date.now() / (10 * 60_000))).catch(() => [])
       : [];
-  const analysis =
-    mode === "analysis"
+  let analysis =
+    mode === "analysis" && !editCode
       ? await getMatchAnalyses(expertOpts.count, expertOpts.days, expertOpts.onDate, expertOpts.onEnd).catch(() => ({
           matches: [],
           requested: 0,
           windowDays: 0,
           scanned: 0,
         }))
-      : { matches: [], requested: 0, windowDays: 0, scanned: 0 };
+      : { matches: [] as MatchAnalysis[], requested: 0, windowDays: 0, scanned: 0 };
+  // ---- Edit-a-code mode: /?mode=analysis&code=XYZ ----
+  // Load THAT code's games into the analysis view with the original picks
+  // pre-ticked, so the user can study each match, fix wrong selections and
+  // Generate a corrected code of their own.
+  interface EditRestRow {
+    eventId: string;
+    home: string;
+    away: string;
+    league?: string;
+    kickoff: number;
+    pick?: string;
+    odds?: number;
+    status: "LIVE" | "FT" | "PLAYED" | "UNPRICED";
+    score?: string; // "H:A" — live so far, or final
+    pickResult?: "WON" | "LOST" | "VOID"; // original pick vs final score (FT only)
+  }
+  let editInfo: { code: string; requested: number; loaded: number; rest: EditRestRow[] } | null = null;
+  const editPreKeys = new Set<string>();
+  if (mode === "analysis" && editCode) {
+    try {
+      // The same code can be discovered several times (dupes across sources) —
+      // pick the newest row that actually carries verified selections.
+      const hcRows = await prisma.humanCode.findMany({
+        where: { code: editCode },
+        orderBy: { foundAt: "desc" },
+        take: 10,
+      });
+      const hc = hcRows.find((r) => Array.isArray(r.selections) && (r.selections as any[]).length > 0) ?? hcRows[0];
+      const sels: any[] = Array.isArray(hc?.selections) ? (hc!.selections as any[]) : [];
+      const events = await getSportyFixtures().catch(() => []);
+      const now = Date.now();
+      const matches: MatchAnalysis[] = [];
+      const rest: EditRestRow[] = [];
+      // Register an editable card, pre-ticking the code's ORIGINAL pick (and
+      // guaranteeing it's a tickable option even when the model wouldn't have
+      // shortlisted it).
+      const addCard = (s: any, ev: SbEvent, a: MatchAnalysis) => {
+        const pc = pickCodeForBooking(
+          String(s?.marketId ?? ""),
+          String(s?.specifier ?? ""),
+          String(s?.outcomeId ?? ""),
+        );
+        if (pc && ev.outcomes[pc]) {
+          const key = `${ev.home}|${ev.away}|${pc}`.toLowerCase();
+          editPreKeys.add(key);
+          if (!a.options.some((o) => o.code === pc)) {
+            a.options.push({
+              code: pc,
+              label: PICKS[pc].label,
+              market: PICKS[pc].market,
+              prob: Math.round(devig(ev.outcomes, pc) * 10000) / 10000,
+              odds: ev.outcomes[pc].toFixed(2),
+              key,
+            });
+          }
+        }
+        matches.push(a);
+      };
+      const toRest = (s: any): EditRestRow => {
+        const kickoff = Number(s?.kickoff) || 0;
+        return {
+          eventId: String(s?.eventId ?? ""),
+          home: String(s?.home ?? "?"),
+          away: String(s?.away ?? "?"),
+          league: s?.league ? String(s.league) : undefined,
+          kickoff,
+          pick: s?.pick ? `${s?.market ? `${s.market}: ` : ""}${s.pick}` : undefined,
+          odds: Number(s?.odds) || undefined,
+          status: kickoff && kickoff <= now ? "PLAYED" : "UNPRICED",
+        };
+      };
+      // Pass 1: resolve legs from the bulk fixtures feed; queue future legs
+      // the feed doesn't carry for individual lookup.
+      const missing: any[] = [];
+      for (const s of sels) {
+        const ev = events.find((e) => e.eventId === String(s?.eventId ?? "") && e.kickoff > now);
+        const a = ev ? analyzeEvent(ev) : null;
+        if (ev && a) {
+          addCard(s, ev, a);
+          continue;
+        }
+        const kickoff = Number(s?.kickoff) || 0;
+        if (kickoff > now && s?.eventId) missing.push(s);
+        else rest.push(toRest(s));
+      }
+      // Pass 2: fetch each still-upcoming missing leg individually (full
+      // markets from the single-event endpoint) so EVERY future game in the
+      // code is editable — deep friendlies and small cups included. Bounded:
+      // 6 at a time, ≤4s per fetch.
+      let mi = 0;
+      const missWorker = async () => {
+        while (mi < missing.length) {
+          const s = missing[mi++];
+          const ev = await Promise.race([
+            fetchEventById(String(s.eventId)).catch(() => null),
+            new Promise<null>((r) => setTimeout(() => r(null), 4000)),
+          ]);
+          const a = ev && ev.kickoff > now ? analyzeEvent(ev) : null;
+          if (ev && a) addCard(s, ev, a);
+          else rest.push(toRest(s));
+        }
+      };
+      await Promise.all(Array.from({ length: 6 }, missWorker));
+      matches.sort((x, y) => new Date(x.kickoff).getTime() - new Date(y.kickoff).getTime());
+      // Live/final scores for the started legs (bounded: 8 at a time, ~8s cap).
+      const started = rest.filter((r) => r.status === "PLAYED" && r.eventId);
+      let cursor = 0;
+      const scoreWorker = async () => {
+        while (cursor < started.length) {
+          const row = started[cursor++];
+          const r = await fetchEventScore(row.eventId).catch(() => null);
+          if (!r) continue; // stays "PLAYED" — score unavailable right now
+          row.score = r.score;
+          if (r.ended) {
+            row.status = "FT";
+            const sel = sels.find((s) => String(s?.eventId ?? "") === row.eventId);
+            const pc2 = sel
+              ? pickCodeForBooking(String(sel.marketId ?? ""), String(sel.specifier ?? ""), String(sel.outcomeId ?? ""))
+              : null;
+            if (pc2 && r.score) {
+              const win = settlePick(pc2, r.score);
+              row.pickResult = win === null ? "VOID" : win ? "WON" : "LOST";
+            }
+          } else {
+            row.status = "LIVE";
+          }
+        }
+      };
+      await Promise.race([
+        Promise.all(Array.from({ length: 8 }, scoreWorker)),
+        new Promise((r) => setTimeout(r, 8000)),
+      ]);
+      rest.sort((a, b) => b.kickoff - a.kickoff);
+      analysis = { matches, requested: sels.length, windowDays: 0, scanned: matches.length };
+      editInfo = { code: editCode, requested: sels.length, loaded: matches.length, rest };
+    } catch {
+      editInfo = { code: editCode, requested: 0, loaded: 0, rest: [] };
+    }
+  }
   // Real past results (actual final scores) for the analysed fixtures — served
   // from a long-lived cache; misses keep resolving in the background and appear
   // on the next auto-refresh, so coverage grows without slowing the page.
@@ -558,6 +712,12 @@ async function renderDashboard(
           .findMany({ orderBy: { createdAt: "desc" }, take: 200 })
           .catch(() => [])
       : [];
+  const userPreferences = userId
+    ? await prisma.userPreference.findUnique({ where: { userId } }).catch(() => null)
+    : null;
+  const userSavedPicks = userId
+    ? await prisma.savedPick.findMany({ where: { userId }, orderBy: { createdAt: "desc" }, take: 8 }).catch(() => [])
+    : [];
   const isPremium = tier === "premium";
   const freshCut = Date.now() - config.freeDelayMin * 60_000;
 
@@ -689,6 +849,15 @@ async function renderDashboard(
       const codeCell = locked
         ? `<a class="lock" href="/upgrade" title="Fresh code — upgrade to unlock">🔒 Premium</a>`
         : `<span class="ccopy" title="Click to copy" onclick="cp(this,'${esc(c.code)}')">${esc(c.code)}</span>`;
+      // Per-code actions: 🎮 simulate it with demo money, ✏️ open its games in
+      // AI Analysis (original picks pre-ticked) to fix and regenerate. Only
+      // possible once the verifier has stored the code's actual selections.
+      const hasSel = Array.isArray(c.selections) && (c.selections as any[]).length > 0;
+      const actions =
+        !locked && hasSel
+          ? `<button class="mini-act" title="Test this code with DEMO money — settled against the real results, nothing real at risk" onclick="demoCode('${esc(c.code)}',this)">🎮</button>
+             <a class="mini-act" title="Edit this code: study its games in AI Analysis (original picks pre-ticked) and generate a corrected code" href="/?mode=analysis&code=${encodeURIComponent(c.code)}">✏️</a>`
+          : "";
       return `
       <tr class="frow${i === 0 ? " fresh" : ""}" data-f="${esc((c.code + " " + (c.league ?? "") + " " + (c.source?.name ?? "")).toLowerCase())}">
         <td class="code">${codeCell}${i === 0 && !locked ? ' <span class="tag new">NEW</span>' : ""}</td>
@@ -701,6 +870,7 @@ async function renderDashboard(
         <td class="muted">${c.expiresAt ? new Date(c.expiresAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—"}</td>
         ${isAdmin ? `<td class="muted">${esc(c.source?.name ?? "—")}</td>` : ""}
         <td><span class="pill status s-${esc(c.status)}">${esc(c.status)}</span></td>
+        <td class="actcol">${actions}</td>
       </tr>`;
     })
     .join("");
@@ -834,10 +1004,14 @@ async function renderDashboard(
       p.home && p.away
         ? `${esc(p.home)} <span class="muted">v</span> ${esc(p.away)}`
         : esc(p.title ?? "Prediction");
-    const badge = isTg ? p.source : (brand ?? p.league ?? "Football");
+    // Source concealment: only admins ever see WHERE an analyst tip came from
+    // (channel handle + outbound link). Regular users get a generic badge and
+    // no source link, so the supply of tips can't be traced or bypassed.
+    const badge = isTg ? (isAdmin ? p.source : "⭐ Pro Analyst") : (brand ?? p.league ?? "Football");
     const hasTip = !!p.tip;
     const hasOdds = !!p.odds;
-    const linkLabel = isTg ? "View on Telegram ↗" : "Full analysis ↗";
+    const showUrl = !!p.url && (isAdmin || !isTg);
+    const linkLabel = isTg ? "View source ↗" : "Full analysis ↗";
     const metrics = hasOdds
       ? `<div><b>${esc(p.odds)}</b><small>Odds</small></div>
          <div><b>${esc(p.probability ?? "—")}</b><small>Probability</small></div>
@@ -864,7 +1038,7 @@ async function renderDashboard(
       <div class="metrics">${metrics}</div>`
       }
       <div class="slip-foot">
-        ${p.url ? `<a class="btn ghost sm" href="${esc(p.url)}" target="_blank" rel="noopener">${linkLabel}</a>` : "<span></span>"}
+        ${showUrl ? `<a class="btn ghost sm" href="${esc(p.url!)}" target="_blank" rel="noopener">${linkLabel}</a>` : "<span></span>"}
         ${bookable ? `<label class="selbox" title="Add this match to your slip"><input type="checkbox" data-key="${esc(selKey)}" onchange="selTog(this)"/><span>➕ Add to slip</span></label>` : ""}
       </div>
     </div>`;
@@ -927,7 +1101,7 @@ async function renderDashboard(
     <section class="day-group" data-day="analysis">
       <header class="dg-head">
         <div class="dg-cal analyst"><span class="dg-dow">LIVE</span><span class="dg-num">📣</span><span class="dg-mon">feed</span></div>
-        <div class="dg-title"><b>Analyst posts</b><span>Latest written analysis from Telegram prediction channels</span></div>
+        <div class="dg-title"><b>Analyst posts</b><span>${isAdmin ? "Latest written analysis from Telegram prediction channels" : "Latest written analysis from our pro prediction analysts"}</span></div>
         <span class="dg-count">${analystPosts.length} post${analystPosts.length === 1 ? "" : "s"}</span>
       </header>
       <div class="cards">${analystPosts.map(predCard).join("")}</div>
@@ -972,8 +1146,35 @@ async function renderDashboard(
     </div>`
       : "";
 
+  // ---- Sidebar icon set ----
+  // One line-icon family (24-grid, 1.75 stroke, round caps) drawn in
+  // currentColor, so every item carries the same visual weight and inherits the
+  // item's colour on hover/active. Emoji can't do that: they render differently
+  // per platform, fight the palette, and two of ours were the same glyph.
+  const ICON: Record<string, string> = {
+    dashboard: `<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>`,
+    bot: `<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1.2"/><path d="M9 13v1.5M15 13v1.5"/><path d="M2 13v3M22 13v3"/>`,
+    calendar: `<rect x="3" y="5" width="18" height="16" rx="2.5"/><path d="M16 3v4M8 3v4M3 10h18"/>`,
+    target: `<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.4"/>`,
+    gem: `<path d="M6 3h12l3.5 6L12 21 2.5 9Z"/><path d="M2.5 9h19"/><path d="M12 21 8.5 9 11 3M12 21l3.5-12L13 3"/>`,
+    pulse: `<path d="M3 12h3.5l2.5-7 4 14 2.5-7H21"/>`,
+    layers: `<path d="m12 3 9 4.5-9 4.5-9-4.5Z"/><path d="m3 12.5 9 4.5 9-4.5"/><path d="m3 17 9 4.5 9-4.5"/>`,
+    bookmark: `<path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4.2L5 21V4a1 1 0 0 1 1-1Z"/>`,
+    wallet: `<path d="M21 11V7.5a1.5 1.5 0 0 0-1.5-1.5H5.5A2.5 2.5 0 0 1 5.5 1H19"/><path d="M3 3.5v15A2.5 2.5 0 0 0 5.5 21h14a1.5 1.5 0 0 0 1.5-1.5V16"/><path d="M17.5 11H21a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-3.5a2.5 2.5 0 0 1 0-5Z"/>`,
+    chart: `<path d="M4 20V10M10 20V4M16 20v-6M22 20H2"/>`,
+    link: `<path d="M10 13a5 5 0 0 0 7.1.1l3-3a5 5 0 0 0-7.1-7.1L11.3 4.7"/><path d="M14 11a5 5 0 0 0-7.1-.1l-3 3a5 5 0 0 0 7.1 7.1l1.7-1.7"/>`,
+    brain: `<path d="M9.5 3A3.5 3.5 0 0 0 6 6.5v.4A3 3 0 0 0 5 12a3 3 0 0 0 1 5.2v.3A3.5 3.5 0 0 0 9.5 21H12V3Z"/><path d="M14.5 3A3.5 3.5 0 0 1 18 6.5v.4a3 3 0 0 1 1 5.1 3 3 0 0 1-1 5.2v.3a3.5 3.5 0 0 1-3.5 3.5H12"/>`,
+    heart: `<path d="M3 12h3l2-4 3 8 2.5-5 1.5 3h6"/><path d="M20.8 6.6a4.4 4.4 0 0 0-6.3-.3L12 8.6 9.5 6.3A4.4 4.4 0 0 0 3.2 12"/>`,
+    trophy: `<path d="M8 21h8M12 17v4"/><path d="M7 4h10v5a5 5 0 0 1-10 0Z"/><path d="M7 6H4a2 2 0 0 0 2 4M17 6h3a2 2 0 0 1-2 4"/>`,
+  };
+  const ico = (k: string) =>
+    `<svg class="ni" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${
+      ICON[k] ?? ICON.dashboard
+    }</svg>`;
   const nav = (m: Mode, icon: string, label: string, active: boolean, flag = "") =>
-    `<a class="nav-item${active ? " on" : ""}" href="/?mode=${m}"><span class="ni">${icon}</span>${label}${
+    `<a class="nav-item${active ? " on" : ""}" href="/?mode=${m}"${
+      active ? ' aria-current="page"' : ""
+    }>${ico(icon)}<span class="nav-t">${label}</span>${
       flag ? `<span class="nav-free">${flag}</span>` : ""
     }</a>`;
 
@@ -1408,6 +1609,38 @@ async function renderDashboard(
     }</div>${slipBar}`;
 
   // ---- Saved Codes ledger: every generated code + who made it, when ----
+  const personalPanel = userId
+    ? `
+    <div class="card personal-panel">
+      <div class="card-head">
+        <h3>🧠 Your picks profile</h3>
+        <span class="muted">Saved for your account</span>
+      </div>
+      <div class="personal-grid">
+        <div class="personal-card">
+          <div class="muted small">Current preferences</div>
+          <div class="personal-value">${esc(preferenceSummary(normalizePreferences(userPreferences ? {
+            preferredGameType: userPreferences.preferredGameType,
+            minConfidence: userPreferences.minConfidence,
+            maxOdds: userPreferences.maxOdds,
+            favoriteLeagues: Array.isArray(userPreferences.favoriteLeagues) ? userPreferences.favoriteLeagues.map(String) : [],
+            notifyOnNewPicks: userPreferences.notifyOnNewPicks,
+          } : {})))}</div>
+          <div class="personal-actions">
+            <button class="btn ghost sm" onclick="savePrefs()">💾 Save current preferences</button>
+          </div>
+        </div>
+        <div class="personal-card">
+          <div class="muted small">Saved picks</div>
+          <div class="personal-value">${userSavedPicks.length ? userSavedPicks.map((p) => `<div class="personal-item">${esc(p.home)} v ${esc(p.away)} · ${esc(p.market)} · ${esc(p.selection)} · ${esc(String(p.odds))}</div>`).join("") : '<span class="muted">No saved picks yet — save one from the dashboard.</span>'}</div>
+          <div class="personal-actions">
+            <button class="btn ghost sm" onclick="saveCurrentPick()">➕ Save current slip</button>
+          </div>
+        </div>
+      </div>
+    </div>`
+    : "";
+
   const savedRows = savedCodes
     .map((c) => {
       const dt = new Date(c.createdAt);
@@ -1450,6 +1683,7 @@ async function renderDashboard(
     })
     .join("");
   const savedBody = `
+    ${personalPanel}
     <div class="sc-head card">
       <div>
         <h3 style="margin:0">💾 Saved Codes</h3>
@@ -1628,7 +1862,7 @@ async function renderDashboard(
             <div class="an-opts">${m.options
               .map(
                 (o) =>
-                  `<label class="an-opt ${sigClass(o.prob, o.odds)}" title="${esc(o.market)} · model ${Math.round(o.prob * 100)}%"><input type="checkbox" data-key="${esc(o.key)}" data-match="${esc(m.home + "|" + m.away)}" data-odds="${o.odds ?? ""}" data-prob="${o.prob}" data-label="${esc(o.label)}" onchange="anTog(this)"/><i class="sdot"></i><span class="an-opt-l">${esc(o.label)}</span><span class="an-opt-o">${o.odds ? "@" + esc(o.odds) : ""}</span><span class="an-opt-p">${Math.round(o.prob * 100)}%</span></label>`,
+                  `<label class="an-opt ${sigClass(o.prob, o.odds)}${editPreKeys.has(o.key) ? " on" : ""}" title="${esc(o.market)} · model ${Math.round(o.prob * 100)}%"><input type="checkbox"${editPreKeys.has(o.key) ? " checked" : ""} data-key="${esc(o.key)}" data-match="${esc(m.home + "|" + m.away)}" data-odds="${o.odds ?? ""}" data-prob="${o.prob}" data-label="${esc(o.label)}" onchange="anTog(this)"/><i class="sdot"></i><span class="an-opt-l">${esc(o.label)}</span><span class="an-opt-o">${o.odds ? "@" + esc(o.odds) : ""}</span><span class="an-opt-p">${Math.round(o.prob * 100)}%</span></label>`,
               )
               .join("")}</div>
           </div>
@@ -1708,6 +1942,15 @@ async function renderDashboard(
         <button class="btn" type="submit">Analyse</button>
       </form>
     </div>
+    ${
+      editInfo
+        ? `<div class="an-window card an-editing"><span>✏️ Editing code <b>${esc(editInfo.code)}</b> — all <b>${editInfo.requested}</b> game${editInfo.requested === 1 ? "" : "s"} loaded: <b>${editInfo.loaded}</b> editable below with the original picks <b>pre-ticked</b>${
+            editInfo.rest.length
+              ? `, <b>${editInfo.rest.length}</b> already live/finished or unpriced (listed at the bottom with real scores — a started match can't go into a new code)`
+              : ""
+          }. Fix any wrong selections, then hit <b>⚡ Generate</b> for your corrected code — or <b>🎮 Demo bet</b> to test it with virtual money first.</span><a class="btn ghost sm" href="/">← Back to dashboard</a></div>`
+        : ""
+    }
     <div class="an-chips">
       ${anChip("today", `${anBase}&on=${anToday}`, "Today")}
       ${anChip("tomorrow", `${anBase}&on=${anTomorrow}`, "Tomorrow")}
@@ -1734,8 +1977,41 @@ async function renderDashboard(
     }
     <div class="an-list">${
       analysisCards ||
-      '<div class="card empty">No fixtures with enough live prices to model right now — try a wider window, or check back as odds populate (busiest mid-day WAT).</div>'
+      (editInfo
+        ? `<div class="card empty">✏️ None of code <b>${esc(editInfo.code)}</b>'s games can be edited any more — they've all kicked off or finished (every one is listed below with its real score). <a href="/?mode=analysis" style="color:var(--indigo)">Open the normal analysis</a> to build a fresh code instead.</div>`
+        : '<div class="card empty">No fixtures with enough live prices to model right now — try a wider window, or check back as odds populate (busiest mid-day WAT).</div>')
     }</div>
+    ${
+      editInfo && editInfo.rest.length
+        ? `<div class="card ed-rest">
+      <div class="card-head"><h3>🎬 The code's other ${editInfo.rest.length} game${editInfo.rest.length === 1 ? "" : "s"} — live &amp; finished</h3><span class="muted small">real scores · a started match can't be added to a new booking code</span></div>
+      <div class="ed-rows">${editInfo.rest
+        .map((r) => {
+          const when = r.kickoff
+            ? new Date(r.kickoff).toLocaleString("en", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos" })
+            : "—";
+          const st =
+            r.status === "LIVE"
+              ? `<span class="ed-st ed-live">🔴 LIVE ${esc(r.score ?? "0:0")}</span>`
+              : r.status === "FT"
+                ? `<span class="ed-st ed-ft">FT ${esc(r.score ?? "—")}</span>`
+                : r.status === "PLAYED"
+                  ? `<span class="ed-st ed-na">⏱️ played — score updating</span>`
+                  : `<span class="ed-st ed-na">not priced on SportyBet</span>`;
+          const res =
+            r.pickResult === "WON"
+              ? ' <i class="ed-res ok">✅ pick won</i>'
+              : r.pickResult === "LOST"
+                ? ' <i class="ed-res bad">❌ pick lost</i>'
+                : r.pickResult === "VOID"
+                  ? ' <i class="ed-res">➖ void</i>'
+                  : "";
+          return `<div class="ed-row">${st}<span class="ed-m">${esc(r.home)} <span class="muted">v</span> ${esc(r.away)}</span><span class="ed-p">${esc(r.pick ?? "—")}${r.odds ? ` @${r.odds}` : ""}${res}</span><span class="ed-k muted">${esc(when)} WAT</span></div>`;
+        })
+        .join("")}</div>
+    </div>`
+        : ""
+    }
     <div id="anchat" class="anchat" hidden onclick="if(event.target===this)anChatClose()">
       <div class="anchat-panel">
         <div class="anchat-head"><b id="anchat-title">Deep-dive analysis</b><span class="anchat-hint">Esc or tap outside to close</span><button class="anchat-x" onclick="anChatClose()" aria-label="Close" title="Close (Esc)">✕</button></div>
@@ -1838,9 +2114,16 @@ async function renderDashboard(
     <div class="xhead card">
       <div>
         <h3 style="margin:0">🎮 Demo Bet Simulator — practice with virtual money</h3>
-        <div class="muted small">Test the app before staking real cash: place bets with <b>demo ₦</b> on any picks (AI Analysis, Expert, Value, Predictions) and the app settles them automatically against the <b>real final scores</b> — the same source that settles the Expert track record. If the model performs, you see it here first: honest proof, not promises. Virtual money only, nothing to deposit or withdraw. 18+.</div>
+        <div class="muted small">Test the app before staking real cash: place bets with <b>demo ₦</b> on any picks (AI Analysis, Expert, Value, Predictions) and the app settles them automatically against the <b>real final scores</b> — the same source that settles the Expert track record. You get a fresh <b>${fmtN(DEMO_START_BALANCE)}</b> practice bank that <b>refreshes every day</b>, so each day is a clean slate to test with — your full results history is kept below to study. Virtual money only, nothing to deposit or withdraw. 18+.</div>
       </div>
-      ${w ? `<button class="btn ghost" onclick="demoReset(this)" title="Balance back to the starting bank — history is kept">↺ Reset wallet</button>` : ""}
+      ${
+        w
+          ? `<div class="dm-head-btns">
+        <a class="btn ghost" href="/api/demo/export" title="Download your full results history as a spreadsheet (opens in Excel)">⬇ Export to Excel</a>
+        <button class="btn ghost" onclick="demoReset(this)" title="Reset today's balance to the fresh daily bank now — history is kept">↺ Reset wallet</button>
+      </div>`
+          : ""
+      }
     </div>
     <div class="dm-cta card">
       <div class="dm-cta-t"><b>➕ Book a demo bet</b> <span class="dm-free">FREE · no card, no deposit</span>
@@ -1859,68 +2142,195 @@ async function renderDashboard(
     }
     const st = w.stats;
     const outIcon = (o: string) => (o === "WON" ? "✅" : o === "LOST" ? "❌" : o === "VOID" ? "➖" : "⏳");
-    const betCards = w.bets
-      .map((b) => {
-        const when = new Date(b.createdAt).toLocaleString("en-GB", {
-          day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos",
-        });
-        const legRows = b.legs
-          .map(
-            (l) =>
-              `<div class="dm-leg"><span class="dm-leg-o">${outIcon(l.outcome ?? "PENDING")}</span><span class="dm-leg-m">${esc(l.home)} v ${esc(l.away)}</span><span class="dm-leg-p">${esc(l.pick ?? l.pickCode)} @${l.odds.toFixed(2)}</span><span class="dm-leg-s">${l.finalScore ? esc(l.finalScore) : ""}</span></div>`,
-          )
-          .join("");
-        // When every match is over and the settler will have run: last kickoff
-        // + the same buffer settleDemoBets() waits for. Say WHICH DAY, not just
-        // a clock time — "17 Jul, 15:30" makes the reader work out the date
-        // themselves, which is what made the old copy feel wrong.
-        const dueAt = resultsExpectedAt(b.legs);
-        const lastKick = b.legs.length ? Math.max(...b.legs.map((l) => l.kickoff)) : 0;
-        const eta =
-          b.outcome !== "PENDING" || !dueAt
-            ? ""
-            : `<div class="dm-eta" data-due="${dueAt}" data-kick="${lastKick}">🕒 <b>Final result ${esc(
-                watWhen(dueAt),
-              )}</b> <span class="dm-eta-cd"></span><br/><span class="muted small">Last of your ${
-                b.legs.length
-              } match${b.legs.length === 1 ? "" : "es"} kicks off ${esc(
-                watWhen(lastKick, true),
-              )} and ends around ${esc(
-                watClock(lastKick + 110 * 60 * 1000),
-              )} — we wait until every game has ended, then settle against the real final scores. Nothing for you to do; check back then.</span></div>`;
-        const result =
-          b.outcome === "PENDING"
-            ? `<span class="dm-res pending">⏳ pending · potential ${fmtN(b.potential)}</span>`
-            : b.outcome === "WON"
-              ? `<span class="dm-res won">✅ WON ${fmtN(b.payout ?? 0)}</span>`
-              : b.outcome === "VOID"
-                ? `<span class="dm-res void">➖ VOID · stake refunded</span>`
-                : `<span class="dm-res lost">❌ LOST ${fmtN(b.stake)}</span>`;
-        // Delete: a true cancel (stake back) only while nothing has kicked off;
-        // afterwards it just clears the row. The button says which it is, so
-        // nobody expects a refund they aren't getting.
-        const del = `<button class="dm-del" title="${
-          b.cancellable
-            ? `Cancel this bet and put ${fmtN(b.stake)} back in your demo balance`
-            : "Remove this bet from your history (balance is not changed)"
-        }" data-id="${esc(b.id)}" data-cancel="${b.cancellable ? "1" : "0"}" data-stake="${b.stake}" onclick="demoDel(this)">🗑 ${
-          b.cancellable ? "Cancel" : "Delete"
-        }</button>`;
-        return `<div class="dm-bet card" data-bet="${esc(b.id)}">
+    // readOnly cards (the full archive) show the same grouped ticket but no
+    // delete button or "final result by" ETA — they're settled history.
+    const betCard = (b: (typeof w.bets)[number] | ArchiveBet, readOnly = false) => {
+      const cancellable = "cancellable" in b ? b.cancellable : false;
+      const when = new Date(b.createdAt).toLocaleString("en-GB", {
+        day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos",
+      });
+      const legRows = b.legs
+        .map((l) => {
+          const oc = l.outcome ?? "PENDING";
+          const scoreCls = oc === "WON" ? "won" : oc === "LOST" ? "lost" : "";
+          return `<div class="dm-leg dm-leg-${oc.toLowerCase()}"><span class="dm-leg-o">${outIcon(oc)}</span><span class="dm-leg-m">${esc(l.home)} v ${esc(l.away)}</span><span class="dm-leg-p">${esc(l.pick ?? l.pickCode)} @${l.odds.toFixed(2)}</span><span class="dm-leg-s ${scoreCls}">${l.finalScore ? esc(l.finalScore) : ""}</span></div>`;
+        })
+        .join("");
+      // "Final result by …" ETA only on live pending cards (archived legs carry
+      // no kickoff). Skipped entirely in the read-only archive view.
+      const dueAt = readOnly ? null : resultsExpectedAt(b.legs);
+      const lastKick = !readOnly && b.legs.length ? Math.max(...b.legs.map((l) => l.kickoff)) : 0;
+      const eta =
+        readOnly || b.outcome !== "PENDING" || !dueAt
+          ? ""
+          : `<div class="dm-eta" data-due="${dueAt}" data-kick="${lastKick}">🕒 <b>Final result ${esc(
+              watWhen(dueAt),
+            )}</b> <span class="dm-eta-cd"></span><br/><span class="muted small">Last of your ${
+              b.legs.length
+            } match${b.legs.length === 1 ? "" : "es"} kicks off ${esc(
+              watWhen(lastKick, true),
+            )} and ends around ${esc(
+              watClock(lastKick + 110 * 60 * 1000),
+            )} — we wait until every game has ended, then settle against the real final scores. Nothing for you to do; check back then.</span></div>`;
+      const result =
+        b.outcome === "PENDING"
+          ? `<span class="dm-res pending">⏳ pending · potential ${fmtN(b.potential)}</span>`
+          : b.outcome === "WON"
+            ? `<span class="dm-res won">✅ WON ${fmtN(b.payout ?? 0)}</span>`
+            : b.outcome === "VOID"
+              ? `<span class="dm-res void">➖ VOID · stake refunded</span>`
+              : `<span class="dm-res lost">❌ LOST ${fmtN(b.stake)}</span>`;
+      // Delete only on live cards; the archive view is read-only history.
+      const del = readOnly
+        ? ""
+        : `<button class="dm-del" title="${
+            cancellable
+              ? `Cancel this bet and put ${fmtN(b.stake)} back in your demo balance`
+              : "Remove this bet from your history (balance is not changed)"
+          }" data-id="${esc(b.id)}" data-cancel="${cancellable ? "1" : "0"}" data-stake="${b.stake}" onclick="demoDel(this)">🗑 ${
+            cancellable ? "Cancel" : "Delete"
+          }</button>`;
+      return `<div class="dm-bet card" data-bet="${esc(b.id)}">
           <div class="dm-head"><b>${b.legs.length} leg${b.legs.length === 1 ? "" : "s"} @ ${b.totalOdds.toFixed(2)}</b><span class="muted small">stake ${fmtN(b.stake)} · ${esc(b.origin)} · ${esc(when)} WAT</span>${result}${del}</div>
           <div class="dm-legs">${legRows}</div>
           ${eta}
         </div>`;
-      })
-      .join("");
+    };
+    // Split the saved history: bets still waiting on results vs finished games
+    // (the study archive — every past game kept with its real result).
+    const pending = w.bets.filter((b) => b.outcome === "PENDING");
+    const settled = w.bets.filter((b) => b.outcome !== "PENDING");
+
+    // 📅 Daily results — the everyday study table over the FULL saved history.
+    const dailyTable = demoDaily.length
+      ? `<div class="card dm-daily">
+      <div class="card-head"><h3>📅 Daily simulation results</h3><span class="muted small">how the app's picks performed each day · kept for the last 3 months · ⬇ export anytime</span></div>
+      <div class="table-wrap">
+        <table class="grid-table dm-daily-t">
+          <thead><tr><th>Day (WAT)</th><th class="num">Bets</th><th class="num">Staked</th><th class="num">Returned</th><th class="num">Profit / Loss</th><th class="num">Hit rate</th><th class="num">ROI</th></tr></thead>
+          <tbody>${demoDaily
+            .map(
+              (d) =>
+                `<tr>
+                  <td><b>${esc(d.label)}</b></td>
+                  <td class="num">${d.bets}</td>
+                  <td class="num">${fmtN(d.staked)}</td>
+                  <td class="num">${fmtN(d.returned)}</td>
+                  <td class="num ${d.profit >= 0 ? "dm-up" : "dm-down"}">${d.profit >= 0 ? "+" : "−"}${fmtN(d.profit)}</td>
+                  <td class="num">${d.hitRate === null ? "—" : Math.round(d.hitRate * 100) + "%"} <span class="muted">(${d.won}/${d.won + d.lost})</span></td>
+                  <td class="num ${(d.roi ?? 0) >= 0 ? "dm-up" : "dm-down"}">${d.roi === null ? "—" : (d.roi >= 0 ? "+" : "") + Math.round(d.roi * 100) + "%"}</td>
+                </tr>`,
+            )
+            .join("")}</tbody>
+        </table>
+      </div>
+    </div>`
+      : "";
+
     return `${head}
     <div class="kpis">
-      ${kpi("💰", fmtN(w.balance), "demo balance", "indigo")}
+      ${kpi("💰", fmtN(w.balance), "demo balance · refreshes daily", "indigo")}
       ${kpi("📈", `${w.profit >= 0 ? "+" : "−"}${fmtN(w.profit)}`, "profit / loss (virtual)", w.profit >= 0 ? "green" : "orange")}
       ${kpi("🎯", st.hitRate === null ? "—" : Math.round(st.hitRate * 100) + "%", `hit rate (${st.won}W/${st.lost}L)`, "blue")}
+      ${kpi("✅", st.won + st.lost + st.voided, "games settled (saved)", "green")}
       ${kpi("⏳", st.pending, "bets awaiting results", "orange")}
     </div>
-    <div class="dm-list">${betCards}</div>`;
+    ${dailyTable}
+    ${
+      pending.length
+        ? `<div class="dm-section"><h3 class="dm-sec-h">⏳ Awaiting results <span class="muted small">(${pending.length})</span></h3><div class="dm-list">${pending.map((b) => betCard(b)).join("")}</div></div>`
+        : ""
+    }
+    ${
+      settled.length
+        ? `<div class="dm-section"><h3 class="dm-sec-h">🧾 Your bet slips — last 7 days <span class="muted small">(${settled.length} ticket${settled.length === 1 ? "" : "s"})</span></h3><div class="dm-list">${settled.map((b) => betCard(b)).join("")}</div></div>`
+        : ""
+    }
+    ${
+      demoAllBets.length
+        ? `<div class="dm-section dm-archive-cta card">
+      <div>
+        <b>📚 All past bet slips — ${demoAllBets.length} ticket${demoAllBets.length === 1 ? "" : "s"} · ${demoGames.length} game${demoGames.length === 1 ? "" : "s"}</b>
+        <div class="muted small">Every grouped bet you've ever placed, with real final scores — <b>saved permanently</b>. Slips stay here as live cards for 7 days, then move to this archive (they're never deleted). Open it to see them all together, search, and export.</div>
+      </div>
+      <div class="dm-archive-btns">
+        <button class="btn" onclick="demoArchiveOpen()">📖 Open full archive</button>
+        <a class="btn ghost" href="/api/demo/export">⬇ Export to Excel</a>
+      </div>
+    </div>`
+        : `<div class="dm-section"><div class="muted small" style="padding:8px 2px">No games have settled yet — finished bet slips and their real scores will build up here as a complete, permanently-saved study archive.</div></div>`
+    }
+    ${
+      demoAllBets.length
+        ? `<div id="dm-archive" class="dm-modal" hidden onclick="if(event.target===this)demoArchiveClose()">
+      <div class="dm-modal-panel">
+        <div class="dm-modal-head">
+          <b>📚 All past bet slips <span class="muted small">— ${demoAllBets.length} ticket${demoAllBets.length === 1 ? "" : "s"}, saved for the future</span></b>
+          <div class="dm-modal-actions">
+            <a class="btn ghost sm" href="/api/demo/export">⬇ Excel</a>
+            <button class="dm-modal-x" onclick="demoArchiveClose()" aria-label="Close">✕</button>
+          </div>
+        </div>
+        <div class="dm-modal-tools">
+          <input id="dm-arch-q" class="dm-arch-search" placeholder="🔎 Search team, league, market or score…" oninput="demoArchiveFilter()"/>
+          <span class="muted small" id="dm-arch-count">${demoAllBets.length} shown</span>
+        </div>
+        <div class="dm-modal-body dm-arch-list">${demoAllBets
+          .map((b) => {
+            const hay = b.legs
+              .map((l) => `${l.home} ${l.away} ${l.league ?? ""} ${l.pick ?? l.pickCode} ${l.finalScore ?? ""}`)
+              .join(" ")
+              .toLowerCase();
+            return `<div class="dm-arch-item" data-h="${esc(hay)} ${b.outcome.toLowerCase()}">${betCard(b, true)}</div>`;
+          })
+          .join("")}</div>
+        <div class="dm-modal-foot muted small">Real final scores only — never fabricated. Kept permanently for study; export to Excel for your own records. 18+.</div>
+      </div>
+    </div>`
+        : ""
+    }`;
+  })();
+
+  // ---- Leaderboard: demo-wallet performance ranked across every player ----
+  const leaderboardBody = (() => {
+    const medal = (r: number) => (r === 1 ? "🥇" : r === 2 ? "🥈" : r === 3 ? "🥉" : `#${r}`);
+    const head = `
+    <div class="xhead card">
+      <div>
+        <h3 style="margin:0">🏆 Demo Wallet Leaderboard</h3>
+        <div class="muted small">Ranked by ROI across every player's <b>settled demo bets</b> — virtual money only, so it's safe to compare. Players are shown anonymously (never your name or email). Needs at least 5 settled bets to qualify, so one lucky punt can't top the board.</div>
+      </div>
+    </div>`;
+    if (!leaderboard.length) {
+      return `${head}<div class="card empty">🏆 No one has qualified yet — place at least 5 demo bets and let them settle to appear here. <a href="/?mode=demo" style="color:var(--indigo)">Go to your Demo Wallet</a> to get started.</div>`;
+    }
+    const rows = leaderboard
+      .map(
+        (e) => `<tr class="${e.isYou ? "lb-you" : ""}">
+        <td class="lb-rank">${medal(e.rank)}</td>
+        <td>${esc(e.label)}${e.isYou ? ' <span class="tag new">YOU</span>' : ""}</td>
+        <td class="num">${e.bets}</td>
+        <td class="num">${e.hitRate === null ? "—" : Math.round(e.hitRate * 100) + "%"} <span class="muted small">(${e.won}/${e.won + e.lost})</span></td>
+        <td class="num ${e.profit >= 0 ? "dm-up" : "dm-down"}">${e.profit >= 0 ? "+" : "−"}₦${Math.round(Math.abs(e.profit)).toLocaleString()}</td>
+        <td class="num ${(e.roi ?? 0) >= 0 ? "dm-up" : "dm-down"}"><b>${e.roi === null ? "—" : (e.roi >= 0 ? "+" : "") + Math.round(e.roi * 100) + "%"}</b></td>
+        <td class="lb-badges">${e.badges.map((b) => `<span class="lb-badge">${esc(b)}</span>`).join("") || '<span class="muted small">—</span>'}</td>
+      </tr>`,
+      )
+      .join("");
+    const you = leaderboard.find((e) => e.isYou);
+    const youBanner =
+      demoOwner && !you
+        ? `<div class="card empty" style="margin-bottom:16px">Your demo wallet hasn't qualified yet (need 5+ settled bets to appear) — keep placing demo bets and check back. <a href="/?mode=demo" style="color:var(--indigo)">Go to your Demo Wallet</a>.</div>`
+        : "";
+    return `${head}${youBanner}
+    <div class="card">
+      <div class="table-wrap">
+        <table class="grid-table lb-table">
+          <thead><tr><th>Rank</th><th>Player</th><th class="num">Bets</th><th class="num">Hit rate</th><th class="num">Profit</th><th class="num">ROI</th><th>Badges</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>`;
   })();
 
   const body =
@@ -1928,6 +2338,8 @@ async function renderDashboard(
       ? metricsBody
       : mode === "demo"
       ? demoBody
+      : mode === "leaderboard"
+      ? leaderboardBody
       : mode === "analysis"
       ? analysisBody
       : mode === "combo"
@@ -1957,9 +2369,9 @@ async function renderDashboard(
                 <table class="grid-table">
                   <thead><tr>
                     <th>Code</th><th>Type</th><th>Score</th><th>Odds</th><th>Games</th>
-                    <th>League</th><th>Found</th><th>Expires</th>${isAdmin ? "<th>Source</th>" : ""}<th>Status</th>
+                    <th>League</th><th>Found</th><th>Expires</th>${isAdmin ? "<th>Source</th>" : ""}<th>Status</th><th title="🎮 demo-test the code · ✏️ edit its games in AI Analysis">Try</th>
                   </tr></thead>
-                  <tbody id="rows">${rows || `<tr><td colspan="${isAdmin ? 10 : 9}" class="muted" style="text-align:center;padding:24px">No codes for ${showAll ? "any date yet" : dayLabel(day) + " yet"} — new codes appear as channels post them. Try “ALL” or an earlier date above.</td></tr>`}</tbody>
+                  <tbody id="rows">${rows || `<tr><td colspan="${isAdmin ? 11 : 10}" class="muted" style="text-align:center;padding:24px">No codes for ${showAll ? "any date yet" : dayLabel(day) + " yet"} — new codes appear as soon as they're discovered. Try “ALL” or an earlier date above.</td></tr>`}</tbody>
                 </table>
               </div>
             </div>
@@ -2033,21 +2445,40 @@ async function renderDashboard(
   .sidebar{width:250px;background:rgba(15,10,32,.72);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
     border-right:1px solid var(--line);
     padding:22px 16px;position:sticky;top:0;height:100vh;flex-shrink:0;display:flex;flex-direction:column}
-  .brand{display:flex;align-items:center;gap:10px;padding:0 8px 20px;font-weight:800;font-size:17px}
-  .logo{width:36px;height:36px;border-radius:11px;background:linear-gradient(145deg,#a78bfa,#7c3aed 60%,#4c1d95);
-    display:grid;place-items:center;color:#fff;font-size:16px;
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.35),0 8px 20px rgba(124,58,237,.45)}
-  .brand span{background:linear-gradient(90deg,#c4b5fd,#818cf8);-webkit-background-clip:text;background-clip:text;color:transparent}
-  .nav-label{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);
-    padding:14px 10px 6px;font-weight:700}
-  .nav-item{display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:11px;
-    color:#b3aad4;font-weight:600;margin-bottom:2px;border:1px solid transparent;
-    transition:background .15s,color .15s,transform .15s}
-  .nav-item:hover{background:rgba(139,92,246,.10);color:var(--ink);transform:translateX(2px)}
-  .nav-item.on{background:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#fff;border-color:rgba(255,255,255,.14);
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.25),0 8px 22px rgba(124,58,237,.45)}
-  .nav-item.on .ni{filter:grayscale(0)}
-  .ni{width:20px;text-align:center}
+  .brand{display:flex;align-items:center;gap:10px;padding:2px 8px 18px;font-weight:800;font-size:16.5px;
+    letter-spacing:-.015em}
+  .logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(145deg,#a78bfa,#7c3aed 60%,#4c1d95);
+    display:grid;place-items:center;color:#fff;flex-shrink:0;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.35),0 6px 16px rgba(124,58,237,.38)}
+  .logo svg{width:17px;height:17px}
+  /* Only the "AI" text span gets the clipped gradient — NOT .logo, which is also
+     a span. The plain 'brand span' rule used to catch the logo too, forcing
+     color:transparent onto it; harmless when the logo was an emoji (emoji ignore
+     color) but it made the SVG mark (fill:currentColor) invisible. */
+  .brand span:not(.logo){background:linear-gradient(90deg,#c4b5fd,#818cf8);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .nav-label{font-size:10px;text-transform:uppercase;letter-spacing:.9px;color:var(--muted);
+    padding:18px 12px 7px;font-weight:800;opacity:.75}
+  .nav-label:first-of-type{padding-top:6px}
+  /* Rail item: the ::before is the active accent bar, kept in the layout at all
+     times (scaled to 0) so nothing shifts sideways when it appears. */
+  .nav-item{position:relative;display:flex;align-items:center;gap:12px;padding:9px 12px;
+    border-radius:10px;color:#b3aad4;font-weight:600;font-size:13.5px;letter-spacing:-.01em;
+    margin-bottom:1px;border:1px solid transparent;
+    transition:background .16s ease,color .16s ease,border-color .16s ease}
+  .nav-item::before{content:"";position:absolute;left:0;top:50%;width:3px;height:18px;border-radius:0 3px 3px 0;
+    background:var(--primary);transform:translateY(-50%) scaleY(0);transform-origin:center;
+    transition:transform .18s cubic-bezier(.4,0,.2,1);opacity:.9}
+  .nav-item:hover{background:rgba(139,92,246,.09);color:var(--ink)}
+  .nav-item:focus-visible{outline:2px solid var(--primary);outline-offset:-2px}
+  .nav-item.on{background:rgba(139,92,246,.14);color:var(--ink);font-weight:750;
+    border-color:rgba(139,92,246,.28)}
+  .nav-item.on::before{transform:translateY(-50%) scaleY(1)}
+  .nav-t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* Icons sit one notch quieter than the label, so the word leads and the icon
+     supports it — then both lift together on hover/active. */
+  svg.ni{width:18px;height:18px;flex-shrink:0;opacity:.72;transition:opacity .16s ease,color .16s ease}
+  .nav-item:hover svg.ni{opacity:1}
+  .nav-item.on svg.ni{opacity:1;color:var(--primary)}
   .side-foot{margin-top:auto;padding:12px 10px 0;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
   .src-status{display:flex;flex-direction:column;gap:8px}
   .src-pill{display:inline-flex;align-items:center;gap:6px;align-self:flex-start;padding:6px 12px;
@@ -2345,6 +2776,53 @@ async function renderDashboard(
   .dm-leg-m{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
   .dm-leg-p{color:#c4b5fd;font-weight:700;white-space:nowrap}
   .dm-leg-s{color:var(--muted);font-family:ui-monospace,Consolas,monospace;min-width:34px;text-align:right}
+  .dm-leg-s.won{color:var(--green);font-weight:800}
+  .dm-leg-s.lost{color:var(--bad);font-weight:800}
+  .dm-leg-won{border-color:rgba(52,211,153,.28)}
+  .dm-leg-lost{border-color:rgba(251,113,133,.28)}
+  /* Wallet history sections + daily study table */
+  .dm-head-btns{display:flex;gap:8px;flex-wrap:wrap}
+  .dm-section{margin-top:20px}
+  .dm-sec-h{font-size:14px;margin:0 0 8px}
+  .dm-daily{margin-top:16px}
+  .dm-daily-t th,.dm-daily-t td{white-space:nowrap}
+  .dm-up{color:var(--green);font-weight:800}
+  .dm-down{color:var(--bad);font-weight:800}
+  /* Complete games log table */
+  .dm-games-t td,.dm-games-t th{font-size:12px;white-space:nowrap}
+  .dm-games-t td:nth-child(2){white-space:normal;min-width:150px}
+  /* Results-archive CTA + modal */
+  .dm-archive-cta{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;
+    border:1px solid rgba(139,92,246,.4);background:linear-gradient(135deg,rgba(139,92,246,.10),rgba(56,189,248,.05))}
+  .dm-archive-btns{display:flex;gap:8px;flex-wrap:wrap}
+  .dm-modal{position:fixed;inset:0;z-index:70;background:rgba(5,2,16,.7);backdrop-filter:blur(3px);
+    display:flex;align-items:center;justify-content:center;padding:16px}
+  .dm-modal-panel{width:100%;max-width:1000px;max-height:90vh;display:flex;flex-direction:column;
+    background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 24px 60px rgba(3,0,20,.6);overflow:hidden}
+  .dm-modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line)}
+  .dm-modal-actions{display:flex;align-items:center;gap:8px}
+  .dm-modal-x{background:none;border:0;color:var(--muted);font-size:16px;cursor:pointer;padding:4px 8px}
+  .dm-modal-x:hover{color:var(--ink)}
+  .dm-modal-tools{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 18px;border-bottom:1px solid var(--line)}
+  .dm-arch-search{flex:1;max-width:420px;padding:9px 12px;border:1px solid var(--line);border-radius:10px;
+    font-size:13px;background:rgba(255,255,255,.04);color:var(--ink);outline:none}
+  .dm-arch-search:focus{border-color:var(--primary)}
+  html[data-theme="light"] .dm-arch-search{background:#fff}
+  .dm-modal-body{flex:1;overflow:auto;padding:6px 18px}
+  .dm-arch-list{display:flex;flex-direction:column;gap:12px;padding-top:12px;padding-bottom:12px}
+  .dm-modal-foot{padding:10px 18px;border-top:1px solid var(--line)}
+  /* Leaderboard */
+  .lb-table td,.lb-table th{white-space:nowrap}
+  .lb-rank{font-weight:800;font-size:14px}
+  .lb-you{background:rgba(139,92,246,.08)}
+  .lb-you td{font-weight:700}
+  .lb-badges{white-space:normal}
+  .lb-badge{display:inline-block;margin:2px 4px 2px 0;padding:3px 9px;border-radius:999px;font-size:11px;
+    font-weight:700;background:rgba(139,92,246,.1);border:1px solid rgba(139,92,246,.3);color:#c4b5fd}
+  .dm-slips summary{cursor:pointer;list-style:none}
+  .dm-slips summary::-webkit-details-marker{display:none}
+  .dm-slips summary::before{content:"▸ ";color:var(--muted)}
+  .dm-slips[open] summary::before{content:"▾ "}
   @media(max-width:640px){ .an-form{grid-template-columns:1fr} }
   @media(max-width:640px){ .an-grid{grid-template-columns:1fr} .an-head{flex-direction:column} }
   .cmb-foot{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
@@ -2451,7 +2929,13 @@ async function renderDashboard(
   .sc-mid{flex:1;min-width:0;font-size:12.5px;line-height:1.5;border-left:1px solid var(--line);padding-left:16px}
   .sc-right{flex-shrink:0;display:flex;flex-direction:column;align-items:flex-end;gap:6px}
   .sc-meta{font-size:11px;color:var(--muted)}
-  @media(max-width:720px){ .sc-row{flex-direction:column} .sc-when{width:auto} .sc-mid{border-left:0;padding-left:0;border-top:1px solid var(--line);padding-top:10px} .sc-right{align-items:flex-start} }
+  .personal-panel{display:grid;gap:12px;margin-bottom:16px}
+  .personal-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  .personal-card{background:rgba(139,92,246,.08);border:1px solid rgba(139,92,246,.22);border-radius:14px;padding:12px;display:grid;gap:8px}
+  .personal-value{font-size:13px;color:var(--text);line-height:1.55}
+  .personal-item{padding:4px 0;border-top:1px solid rgba(139,92,246,.12)}
+  .personal-item:first-child{border-top:none;padding-top:0}
+  @media(max-width:720px){ .sc-row{flex-direction:column} .sc-when{width:auto} .sc-mid{border-left:0;padding-left:0;border-top:1px solid var(--line);padding-top:10px} .sc-right{align-items:flex-start} .personal-grid{grid-template-columns:1fr} }
   /* Drag-and-drop overlay */
   #dropzone{position:fixed;inset:0;z-index:70;background:rgba(5,3,12,.72);backdrop-filter:blur(6px);display:grid;place-items:center;
     opacity:0;pointer-events:none;transition:opacity .15s}
@@ -2582,6 +3066,30 @@ async function renderDashboard(
   .muted{color:var(--muted)}.small{font-size:12px}.mono{font-family:ui-monospace,monospace}
   .ccopy{cursor:pointer;border-bottom:1px dashed rgba(167,139,250,.55)}
   .ccopy:hover{color:#c4b5fd}
+  /* Per-code actions (🎮 demo-test / ✏️ edit in AI Analysis) */
+  .actcol{white-space:nowrap}
+  .mini-act{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;
+    background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:7px;cursor:pointer;
+    font-size:13px;text-decoration:none;margin-right:4px;padding:0;vertical-align:middle}
+  .mini-act:hover{border-color:var(--primary);background:rgba(139,92,246,.12)}
+  html[data-theme="light"] .mini-act{background:rgba(24,12,60,.03)}
+  .an-editing{border-color:rgba(139,92,246,.5);background:linear-gradient(120deg,rgba(139,92,246,.12),rgba(56,189,248,.06)),var(--card)}
+  /* Edit mode: the code's live/finished games (real scores, not re-bookable) */
+  .ed-rest{margin-top:14px}
+  .ed-rows{display:flex;flex-direction:column;gap:5px}
+  .ed-row{display:grid;grid-template-columns:auto 1fr auto auto;gap:10px;align-items:center;
+    font-size:12px;padding:6px 10px;border:1px solid var(--line);border-radius:9px}
+  .ed-st{font-weight:800;font-size:11px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);white-space:nowrap}
+  .ed-st.ed-live{color:#ff8fa3;border-color:rgba(251,113,133,.5);background:rgba(251,113,133,.08);animation:sigpulse-r 1.4s ease-in-out infinite}
+  .ed-st.ed-ft{color:var(--ink);background:rgba(255,255,255,.06)}
+  .ed-st.ed-na{color:var(--muted)}
+  .ed-m{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+  .ed-p{color:#c4b5fd;font-weight:700;white-space:nowrap}
+  .ed-res{font-style:normal;font-size:11px;font-weight:800}
+  .ed-res.ok{color:var(--green)}
+  .ed-res.bad{color:var(--bad)}
+  .ed-k{white-space:nowrap;font-size:11px}
+  @media(max-width:640px){ .ed-row{grid-template-columns:auto 1fr} .ed-k{display:none} }
   .tag{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:700;
     background:rgba(255,255,255,.07);color:#b6aed6}
   .tag.new{background:rgba(52,211,153,.16);color:#6ee7b7}
@@ -2769,7 +3277,13 @@ async function renderDashboard(
   html[data-theme="light"] .btn.ghost{background:#fff;border-color:var(--line);color:var(--ink)}
   html[data-theme="light"] .btn.ghost:hover{background:#f3f1fb}
   html[data-theme="light"] .nav-item{color:#5b5380}
-  html[data-theme="light"] .nav-item:hover{background:rgba(124,58,237,.08);color:var(--ink)}
+  html[data-theme="light"] .nav-item:hover{background:rgba(124,58,237,.07);color:var(--ink)}
+  /* Active: a soft violet wash + accent bar carries the state on white without
+     the heavy saturated pill, which drew the eye away from the page content. */
+  html[data-theme="light"] .nav-item.on{background:rgba(124,58,237,.09);
+    border-color:rgba(124,58,237,.20);color:#3b2d70}
+  html[data-theme="light"] .nav-item.on svg.ni{color:#7c3aed}
+  html[data-theme="light"] .nav-label{color:#8b85ab}
   html[data-theme="light"] .xform select{background:#fff;color:var(--ink)}
   html[data-theme="light"] .xpick{background:rgba(24,12,60,.05)}
   html[data-theme="light"] .xwhy span{color:#5f578a;background:rgba(24,12,60,.04)}
@@ -2865,25 +3379,26 @@ async function renderDashboard(
 <div class="bgfx" aria-hidden="true"><i class="b1"></i><i class="b2"></i><i class="b3"></i></div>
 <div class="layout">
   <aside class="sidebar">
-    <div class="brand"><span class="logo">⚡</span>Sporty Value Pick <span>&nbsp;AI</span></div>
+    <div class="brand"><span class="logo"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13.2 2 4.6 13.1a.6.6 0 0 0 .48.97h5.06l-1.4 7.06a.6.6 0 0 0 1.06.48l8.6-11.1a.6.6 0 0 0-.48-.97h-5.06l1.4-7.06A.6.6 0 0 0 13.2 2Z"/></svg></span>Sporty Value Pick <span>&nbsp;AI</span></div>
     <div class="nav-label">Main</div>
-    ${nav("human", "📊", "Dashboard", mode === "human")}
-    ${nav("ai", "🤖", "AI Codes", mode === "ai")}
-    ${nav("pred", "📈", "Predictions", mode === "pred")}
-    ${nav("expert", "🎯", "Expert Picks", mode === "expert")}
-    ${nav("value", "💎", "Value Picks", mode === "value")}
-    ${nav("analysis", "📊", "AI Analysis", mode === "analysis")}
-    ${nav("combo", "🎰", "Value Combos", mode === "combo")}
-    ${nav("saved", "💾", "Saved Codes", mode === "saved")}
-    ${nav("demo", "🎮", "Demo Wallet", mode === "demo", "FREE")}
+    ${nav("human", "dashboard", "Dashboard", mode === "human")}
+    ${nav("ai", "bot", "AI Codes", mode === "ai")}
+    ${nav("pred", "calendar", "Predictions", mode === "pred")}
+    ${nav("expert", "target", "Expert Picks", mode === "expert")}
+    ${nav("value", "gem", "Value Picks", mode === "value")}
+    ${nav("analysis", "pulse", "AI Analysis", mode === "analysis")}
+    ${nav("combo", "layers", "Value Combos", mode === "combo")}
+    ${nav("saved", "bookmark", "Saved Codes", mode === "saved")}
+    ${nav("demo", "wallet", "Demo Wallet", mode === "demo", "FREE")}
+    ${nav("leaderboard", "trophy", "Leaderboard", mode === "leaderboard", "FREE")}
     ${
       isAdmin
         ? `<div class="nav-label">Owner</div>
-    ${nav("metrics", "📈", "Metrics", mode === "metrics")}
+    ${nav("metrics", "chart", "Metrics", mode === "metrics")}
     <div class="nav-label">Data</div>
-    <a class="nav-item" href="/api/codes" target="_blank"><span class="ni">🔗</span>Codes API</a>
-    <a class="nav-item" href="/api/ai-slips" target="_blank"><span class="ni">🧠</span>AI Slips API</a>
-    <a class="nav-item" href="/health" target="_blank"><span class="ni">💓</span>Health</a>`
+    <a class="nav-item" href="/api/codes" target="_blank">${ico("link")}<span class="nav-t">Codes API</span></a>
+    <a class="nav-item" href="/api/ai-slips" target="_blank">${ico("brain")}<span class="nav-t">AI Slips API</span></a>
+    <a class="nav-item" href="/health" target="_blank">${ico("heart")}<span class="nav-t">Health</span></a>`
         : ""
     }
     <div class="side-foot">
@@ -2905,7 +3420,7 @@ async function renderDashboard(
   <div class="app">
     <div class="topbar">
       <div>
-        <h1>${mode === "metrics" ? "Owner Metrics" : mode === "demo" ? "Demo Bet Simulator" : mode === "analysis" ? "AI Match Analysis" : mode === "combo" ? "Value Combos" : mode === "value" ? "Value Picks" : mode === "saved" ? "Saved Codes" : mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
+        <h1>${mode === "metrics" ? "Owner Metrics" : mode === "leaderboard" ? "Demo Wallet Leaderboard" : mode === "demo" ? "Demo Bet Simulator" : mode === "analysis" ? "AI Match Analysis" : mode === "combo" ? "Value Combos" : mode === "value" ? "Value Picks" : mode === "saved" ? "Saved Codes" : mode === "expert" ? "Expert Picks" : mode === "pred" ? "Match Predictions" : mode === "ai" ? "AI-Generated Slips" : "Booking Code Dashboard"}</h1>
         <div class="sub">${mode === "analysis" ? "Poisson model calibrated to live odds — match & correct-score probabilities" : mode === "combo" ? "Ready-made accumulators auto-built from the best picks — book one in a click" : mode === "value" ? "Higher-odds opportunities where a model beats the market price — EV-ranked, estimates not guarantees" : mode === "saved" ? "Every generated code — with the day, time and who made it" : mode === "expert" ? "Confidence-ranked picks across your chosen window — estimates, never guarantees" : mode === "pred" ? "Third-party statistical tips — not booking codes" : mode === "ai" ? "Model recommendations with auto-generated booking codes" : "Live codes discovered & verified against SportyBet"}</div>
       </div>
       <div class="search"><input id="search" placeholder="Search codes, leagues, sources…" oninput="flt(this.value)"/></div>
@@ -2945,7 +3460,7 @@ async function renderDashboard(
       <div class="risk-detail" id="riskDetail" hidden>
         <b>Full risk warning</b>
         <ul>
-          <li><b>Nothing here is a guaranteed win.</b> Booking codes found from public channels, AI-generated slips, and third-party predictions are all estimates. Even the best tipsters lose bets regularly.</li>
+          <li><b>Nothing here is a guaranteed win.</b> Discovered booking codes, AI-generated slips, and third-party predictions are all estimates. Even the best tipsters lose bets regularly.</li>
           <li><b>We never place bets or move your money.</b> A booking code only saves a selection you must review and stake yourself on SportyBet.</li>
           <li><b>Avoid "fixed match" and "100% sure" scams.</b> No one can guarantee outcomes. Never pay for "VIP sure odds".</li>
           <li><b>Gambling is addictive and can cause serious financial harm.</b> Only bet what you can afford to lose. If it stops being fun, stop. Help: <a href="https://www.begambleaware.org" target="_blank" rel="noopener">BeGambleAware.org</a>.</li>
@@ -2963,7 +3478,9 @@ async function renderDashboard(
         mode === "expert"
           ? "Confidence scores blend model win probability, market odds and source agreement — they rank likelihood, they do NOT guarantee an outcome. No pick is ever \"sure\"; anyone claiming 99–100% guaranteed wins is misleading you."
           : mode === "pred"
-          ? "Predictions from footballpredictions.com, forebet.com + Telegram analysts (@betmines, @eaglepredict) — third-party tips, not affiliated with SportyBet. No prediction is ever guaranteed."
+          ? isAdmin
+            ? "Predictions from footballpredictions.com, forebet.com + Telegram analysts (@betmines, @eaglepredict) — third-party tips, not affiliated with SportyBet. No prediction is ever guaranteed."
+            : "Predictions come from independent third-party football models and pro analysts — not affiliated with SportyBet. No prediction is ever guaranteed."
           : mode === "ai"
             ? "AI slips are model estimates — booking codes save selections only; review & stake yourself."
             : "Codes are verified against SportyBet's official API for validity only — validity is not a prediction of winning."
@@ -3238,8 +3755,40 @@ async function renderDashboard(
       btn.disabled = false; btn.textContent = o;
     }
   }
+  /* Demo-simulate a dashboard code with virtual money (🎮 button in the table). */
+  async function demoCode(code, btn){
+    var stake = parseFloat(prompt('Demo stake for code '+code+' (virtual ₦, min 100 — no real money):', '500') || '0') || 0;
+    if(stake < 100){ showToast('Minimum demo stake is ₦100','warn'); return; }
+    btn.disabled = true;
+    try{
+      var r = await fetch('/api/demo/code',{method:'POST',headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({code: code, stake: stake})});
+      var j = await r.json();
+      if(j.ok){
+        var skipped = (j.skipped && j.skipped.length) ? ' · '+j.skipped.length+' game(s) skipped (kicked off)' : '';
+        showToast('🎮 Demo bet on '+code+': '+j.legs+' legs @ '+j.totalOdds+' — potential ₦'+Math.round(j.potential).toLocaleString()+skipped+'. Track it in 🎮 Demo Wallet.','ok');
+      } else {
+        showToast(j.error || 'Demo bet failed — try again','warn');
+      }
+    }catch(e){ showToast('Demo bet failed — network error','warn'); }
+    btn.disabled = false;
+  }
+  /* Results-archive modal: open/close + live search over saved games. */
+  function demoArchiveOpen(){ var m=document.getElementById('dm-archive'); if(m){ m.hidden=false; var q=document.getElementById('dm-arch-q'); if(q) q.focus(); } }
+  function demoArchiveClose(){ var m=document.getElementById('dm-archive'); if(m) m.hidden=true; }
+  function demoArchiveFilter(){
+    var q=(document.getElementById('dm-arch-q').value||'').toLowerCase().trim();
+    var items=document.querySelectorAll('#dm-archive .dm-arch-item'), shown=0;
+    items.forEach(function(r){
+      var ok = !q || (r.getAttribute('data-h')||'').indexOf(q)>=0;
+      r.style.display = ok ? '' : 'none';
+      if(ok) shown++;
+    });
+    var c=document.getElementById('dm-arch-count'); if(c) c.textContent = shown+(shown===1?' ticket':' tickets')+' shown';
+  }
+  document.addEventListener('keydown', function(e){ if(e.key==='Escape') demoArchiveClose(); });
   async function demoReset(btn){
-    if(!confirm('Reset your demo balance back to the starting bank? Your bet history is kept.')) return;
+    if(!confirm('Reset your demo balance to the fresh daily bank now? (It refreshes automatically every day anyway.) Your bet history is kept.')) return;
     btn.disabled = true;
     try{
       var r = await fetch('/api/demo/reset',{method:'POST'});
@@ -3457,6 +4006,36 @@ async function renderDashboard(
       }
     });
   })();
+  async function savePrefs(){
+    try{
+      var payload = {
+        preferredGameType: 'safe',
+        minConfidence: 0.6,
+        maxOdds: 3,
+        favoriteLeagues: ['Premier League','La Liga'],
+        notifyOnNewPicks: true,
+      };
+      var r = await fetch('/api/personal/preferences',{method:'POST',headers:{'Content-Type':'application/json'},body: JSON.stringify(payload)});
+      var j = await r.json();
+      if(j.ok){ showToast('Preferences saved to your account','ok'); }
+      else showToast(j.error || 'Could not save preferences','warn');
+    }catch(e){ showToast('Could not save preferences','warn'); }
+  }
+  async function saveCurrentPick(){
+    var keys = Object.keys(SEL);
+    if(!keys.length){ showToast('Pick at least 1 match first','warn'); return; }
+    var first = keys[0];
+    var parts = first.split('|');
+    var home = parts[0] || '';
+    var away = parts[1] || '';
+    var payload = {home: home, away: away, league: '', market: 'Double Chance', selection: '1X', odds: 2.2, confidence: 0.7, notes: 'Saved from dashboard'};
+    try{
+      var r = await fetch('/api/personal/saved-pick',{method:'POST',headers:{'Content-Type':'application/json'},body: JSON.stringify(payload)});
+      var j = await r.json();
+      if(j.ok){ showToast('Saved pick added to your profile','ok'); }
+      else showToast(j.error || 'Could not save pick','warn');
+    }catch(e){ showToast('Could not save pick','warn'); }
+  }
   function showOcr(j){
     var codes = (j && j.codes) || [];
     var rows = codes.length
@@ -4010,8 +4589,10 @@ export function startServer() {
                       ? "saved"
                       : modeParam === "demo"
                         ? "demo"
-                        : modeParam === "metrics"
-                          ? "metrics"
+                        : modeParam === "leaderboard"
+                          ? "leaderboard"
+                          : modeParam === "metrics"
+                            ? "metrics"
                         : "human";
       // Tier comes from the user's paid subscription window in the DB. The demo
       // unlock cookie must carry a hashed token (not the literal "premium"), so
@@ -4161,8 +4742,11 @@ export function startServer() {
             lastRunAt,
             nextRunAt,
             intervalSec,
-            lastSummary,
-            telegramApi: telegramClientEnabled() ? "live" : "web-preview",
+            // Source-revealing details (crawl summary, Telegram pipeline) are
+            // admin-only — regular users just get liveness.
+            ...(isAdmin
+              ? { lastSummary, telegramApi: telegramClientEnabled() ? "live" : "web-preview" }
+              : {}),
           }),
         );
         return;
@@ -4215,6 +4799,80 @@ export function startServer() {
         const data = await getExpertRoi();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(data));
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/personal/preferences") {
+        if (!user) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Sign in to save your preferences." }));
+          return;
+        }
+        let payload: Record<string, unknown> = {};
+        try {
+          payload = JSON.parse((await readBody(req, 16 * 1024)) || "{}");
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Bad request body." }));
+          return;
+        }
+        const preferences = normalizePreferences(payload as any);
+        const up = await prisma.userPreference.upsert({
+          where: { userId: user.id },
+          create: {
+            userId: user.id,
+            preferredGameType: preferences.preferredGameType,
+            minConfidence: preferences.minConfidence,
+            maxOdds: preferences.maxOdds,
+            favoriteLeagues: preferences.favoriteLeagues,
+            notifyOnNewPicks: preferences.notifyOnNewPicks,
+          },
+          update: {
+            preferredGameType: preferences.preferredGameType,
+            minConfidence: preferences.minConfidence,
+            maxOdds: preferences.maxOdds,
+            favoriteLeagues: preferences.favoriteLeagues,
+            notifyOnNewPicks: preferences.notifyOnNewPicks,
+          },
+        });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, preferences: { ...preferences, id: up.id } }));
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/personal/saved-pick") {
+        if (!user) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Sign in to save picks." }));
+          return;
+        }
+        let payload: Record<string, unknown> = {};
+        try {
+          payload = JSON.parse((await readBody(req, 16 * 1024)) || "{}");
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Bad request body." }));
+          return;
+        }
+        const pick = normalizeSavedPick(payload as any);
+        if (!pick.home || !pick.away || !pick.market || !pick.selection) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Home, away, market and selection are required." }));
+          return;
+        }
+        const saved = await prisma.savedPick.create({
+          data: {
+            userId: user.id,
+            home: pick.home,
+            away: pick.away,
+            league: pick.league ?? undefined,
+            market: pick.market,
+            selection: pick.selection,
+            odds: pick.odds,
+            confidence: pick.confidence,
+            notes: pick.notes ?? undefined,
+          },
+        });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, pick: saved }));
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/demo/bet") {
@@ -4291,6 +4949,53 @@ export function startServer() {
         res.end(JSON.stringify(out));
         return;
       }
+      if (req.method === "POST" && url.pathname === "/api/demo/code") {
+        // Demo-simulate a dashboard code: virtual stake on that EXACT code's
+        // verified selections, settled later against the real final scores.
+        let code = "";
+        let stake = 0;
+        try {
+          const body = JSON.parse((await readBody(req, 16 * 1024)) || "{}");
+          code = String(body.code ?? "").trim().toUpperCase().slice(0, 24);
+          stake = Number(body.stake) || 0;
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Bad request body." }));
+          return;
+        }
+        let owner = user ? `u:${user.id}` : null;
+        let setCookie: string | null = null;
+        if (!owner) {
+          let did = readCookie(cookies, "demo_id");
+          if (!did || !/^[a-f0-9]{16,64}$/.test(did)) {
+            did = randomBytes(16).toString("hex");
+            setCookie = `demo_id=${did}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`;
+          }
+          owner = `g:${did}`;
+        }
+        // Dupes of the same code exist across sources — use the newest row
+        // that actually carries verified selections.
+        const hcRows = code
+          ? await prisma.humanCode
+              .findMany({ where: { code }, orderBy: { foundAt: "desc" }, take: 10 })
+              .catch(() => [])
+          : [];
+        const hc = hcRows.find((r) => Array.isArray(r.selections) && (r.selections as any[]).length > 0) ?? hcRows[0] ?? null;
+        const sels: any[] = Array.isArray(hc?.selections) ? (hc!.selections as any[]) : [];
+        const result = !hc
+          ? { ok: false as const, error: "That code isn't on the dashboard." }
+          : !sels.length
+            ? { ok: false as const, error: "This code's game details haven't been verified yet — try again after the next scan." }
+            : await placeDemoBetFromSelections(owner, sels, stake, "code").catch((e) => ({
+                ok: false as const,
+                error: `Demo bet failed: ${e?.message ?? e}`,
+              }));
+        const headers: Record<string, string | string[]> = { "Content-Type": "application/json" };
+        if (setCookie) headers["Set-Cookie"] = setCookie;
+        res.writeHead(result.ok ? 200 : 400, headers);
+        res.end(JSON.stringify(result));
+        return;
+      }
       if (req.method === "POST" && url.pathname === "/api/demo/reset") {
         const owner = user
           ? `u:${user.id}`
@@ -4305,6 +5010,28 @@ export function startServer() {
         }
         const balance = await resetDemoWallet(owner).catch(() => null);
         res.end(balance === null ? JSON.stringify({ ok: false, error: "Reset failed." }) : JSON.stringify({ ok: true, balance }));
+        return;
+      }
+      if (url.pathname === "/api/demo/export") {
+        // Download the wallet's full saved history as a CSV (opens in Excel).
+        const owner = user
+          ? `u:${user.id}`
+          : (() => {
+              const did = readCookie(cookies, "demo_id");
+              return did && /^[a-f0-9]{16,64}$/.test(did) ? `g:${did}` : null;
+            })();
+        if (!owner) {
+          res.writeHead(404, { "Content-Type": "text/plain" });
+          res.end("No demo wallet yet — place a demo bet first.");
+          return;
+        }
+        const csv = await exportDemoCsv(owner).catch(() => "");
+        const fname = `demo-results-${new Date().toLocaleDateString("en-CA", { timeZone: "Africa/Lagos" })}.csv`;
+        res.writeHead(200, {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${fname}"`,
+        });
+        res.end(csv);
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/analysis/chat") {
@@ -4530,6 +5257,8 @@ export function startServer() {
               const did = readCookie(cookies, "demo_id");
               return did && /^[a-f0-9]{16,64}$/.test(did) ? `g:${did}` : null;
             })(),
+        (url.searchParams.get("code") ?? "").trim().toUpperCase().slice(0, 24) || null,
+        user?.id ?? null,
       );
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(html);
