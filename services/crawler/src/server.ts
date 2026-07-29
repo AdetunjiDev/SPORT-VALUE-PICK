@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { prisma } from "@sportybet/db";
 import { RESPONSIBLE_GAMBLING_DISCLAIMER } from "@sportybet/shared";
 import { config } from "./config.js";
+import { isEmailEnabled } from "./mailer.js";
 import { runCycle, lastRunAt, nextRunAt, lastSummary, intervalSec } from "./scheduler.js";
 import { getPredictions } from "./predictions.js";
 import { planForTips, legsForFixtureKeys, getSportyFixtures, fetchEventById, fuzzyTeamsMatch, PICKS, devig, type SbEvent } from "./forebet-ai.js";
@@ -1675,6 +1676,11 @@ async function renderDashboard(
           <label class="ap-f"><span>Pick source</span>
             <select id="ap-engine">${eopt("analysis", "AI Analysis (safest)")}${eopt("expert", "Expert Picks")}${eopt("combo", "Value Combos")}</select></label>
         </div>
+        <div class="ap-delivery muted small">${
+          isEmailEnabled()
+            ? `📧 The code will also be <b>emailed to ${esc(account?.email ?? "your account")}</b> when it's built.`
+            : `📧 Email delivery is off — you'll get the code as an in-app notification. (Owner: set RESEND_API_KEY to email codes too.)`
+        }</div>
         <div class="ap-actions">
           <button class="btn" onclick="saveAutopilot(this)">💾 Save Auto-Pilot</button>
           <span class="muted small">Target odds stops adding games once the combined odds reach it (capped at your game count).</span>

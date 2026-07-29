@@ -2,6 +2,7 @@ import { prisma } from "@sportybet/db";
 import { getMatchAnalyses } from "./xg.js";
 import { legsForFixtureKeys } from "./forebet-ai.js";
 import { createBookingCode } from "./booker.js";
+import { sendEmail, autopilotEmailHtml, isEmailEnabled } from "./mailer.js";
 
 /**
  * Auto-Pilot — scheduled auto-generation of a SportyBet booking code.
@@ -119,6 +120,7 @@ export async function runDueAutopilots(limit = 20): Promise<AutopilotOutcome[]> 
         OR: [{ autoLastRunDate: null }, { autoLastRunDate: { not: date } }],
       },
       take: limit,
+      include: { user: { select: { email: true } } },
     })
     .catch(() => []);
   const out: AutopilotOutcome[] = [];
@@ -174,6 +176,22 @@ export async function runDueAutopilots(limit = 20): Promise<AutopilotOutcome[]> 
         },
       })
       .catch(() => null);
+    // Email the code to the account owner, if email delivery is configured.
+    // No-op when RESEND_API_KEY is unset — the in-app notification above is
+    // always the baseline; email is an optional extra channel.
+    const email = (pref as unknown as { user?: { email?: string } }).user?.email;
+    if (isEmailEnabled() && email) {
+      await sendEmail(
+        email,
+        `🤖 Auto-Pilot slip ready — code ${slip.code}`,
+        autopilotEmailHtml({
+          code: slip.code,
+          games: slip.games ?? 0,
+          totalOdds: slip.totalOdds ?? 0,
+          url: slip.url,
+        }),
+      ).catch(() => null);
+    }
     out.push({
       userId: pref.userId,
       ok: true,
