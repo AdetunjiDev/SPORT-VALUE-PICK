@@ -588,12 +588,24 @@ model UserPreference {
   maxOdds            Float    @default(0)
   favoriteLeagues    Json?    @default("[]")
   notifyOnNewPicks   Boolean  @default(false)
+
+  // --- Auto-Pilot: scheduled auto-generation of a booking code ---
+  // The app builds the code and alerts the user; it NEVER logs in or places
+  // the bet — the user opens the code and stakes it themselves.
+  autoEnabled     Boolean @default(false)
+  autoGames       Int     @default(20) // how many games to put in the slip (1–40)
+  autoHourWat     Int     @default(12) // hour of day in WAT (0–23) to build it
+  autoTargetOdds  Float   @default(0)  // stop adding games once combined odds ≥ this (0 = just the game count)
+  autoEngine      String  @default("analysis") // which pick source: analysis | expert | combo
+  autoLastRunDate String? // "YYYY-MM-DD" (WAT) it last fired — one run per day
+
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+  @@index([autoEnabled, autoHourWat])
   @@map("user_preferences")
 }
 

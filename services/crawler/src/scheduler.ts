@@ -3,7 +3,9 @@ import { verifyPending } from "./verifier.js";
 import { generateAiSlips } from "./ai.js";
 import { getPredictions } from "./predictions.js";
 import { logExpertPicks, settleExpertPicks } from "./analyst.js";
+import { settleDemoBets, pruneOldDemoBets } from "./demo.js";
 import { getSportyFixtures } from "./forebet-ai.js";
+import { runDueAutopilots } from "./autopilot.js";
 import { config } from "./config.js";
 
 let running = false;
@@ -71,6 +73,25 @@ export async function runCycle(trigger: string): Promise<string> {
     }
     try {
       settled = await settleExpertPicks(12);
+    } catch {
+      /* keep going */
+    }
+    // Demo-bet simulator: settle finished virtual bets against real scores,
+    // then prune games older than the 3-month retention window.
+    try {
+      await settleDemoBets(8);
+      await pruneOldDemoBets();
+    } catch {
+      /* keep going */
+    }
+    // Auto-Pilot: for any user whose scheduled hour has arrived, build their
+    // booking code and notify them. Never logs in or places the bet. Best-effort.
+    try {
+      const fired = await runDueAutopilots(20);
+      if (fired.length) {
+        const ok = fired.filter((f) => f.ok).length;
+        console.log(`Auto-Pilot: ${ok}/${fired.length} slips built.`);
+      }
     } catch {
       /* keep going */
     }

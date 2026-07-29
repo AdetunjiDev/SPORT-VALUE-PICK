@@ -1638,6 +1638,49 @@ async function renderDashboard(
           </div>
         </div>
       </div>
+      ${(() => {
+        const ap = userPreferences as unknown as {
+          autoEnabled?: boolean; autoGames?: number; autoHourWat?: number;
+          autoTargetOdds?: number; autoEngine?: string; autoLastRunDate?: string | null;
+        } | null;
+        const on = !!ap?.autoEnabled;
+        const games = ap?.autoGames ?? 20;
+        const hour = ap?.autoHourWat ?? 12;
+        const target = ap?.autoTargetOdds ?? 0;
+        const engine = ap?.autoEngine ?? "analysis";
+        const hopt = (h: number) =>
+          `<option value="${h}" ${h === hour ? "selected" : ""}>${String(h).padStart(2, "0")}:00 WAT</option>`;
+        const eopt = (v: string, label: string) =>
+          `<option value="${v}" ${v === engine ? "selected" : ""}>${label}</option>`;
+        return `
+      <div class="autopilot ${on ? "on" : ""}">
+        <div class="ap-head">
+          <div><b>🤖 Auto-Pilot</b> <span class="ap-tag">${on ? "ON" : "OFF"}</span>
+            <div class="muted small">Every day at your chosen time, the app auto-builds a SportyBet booking code from the safest picks and alerts you. <b>It never logs in or places the bet</b> — you open the code and stake it yourself.${
+              ap?.autoLastRunDate ? ` · last built ${esc(ap.autoLastRunDate)}` : ""
+            }</div>
+          </div>
+        </div>
+        <div class="ap-grid">
+          <label class="ap-f"><span>Enable</span>
+            <input type="checkbox" id="ap-on" ${on ? "checked" : ""}/></label>
+          <label class="ap-f"><span>Games in slip</span>
+            <select id="ap-games">
+              ${[5, 10, 15, 20, 25, 30, 40].map((g) => `<option value="${g}" ${g === games ? "selected" : ""}>${g} games</option>`).join("")}
+            </select></label>
+          <label class="ap-f"><span>Build time (WAT)</span>
+            <select id="ap-hour">${Array.from({ length: 24 }, (_, h) => hopt(h)).join("")}</select></label>
+          <label class="ap-f"><span>Target total odds</span>
+            <input type="number" id="ap-target" min="0" step="1" value="${target}" placeholder="0 = just the games"/></label>
+          <label class="ap-f"><span>Pick source</span>
+            <select id="ap-engine">${eopt("analysis", "AI Analysis (safest)")}${eopt("expert", "Expert Picks")}${eopt("combo", "Value Combos")}</select></label>
+        </div>
+        <div class="ap-actions">
+          <button class="btn" onclick="saveAutopilot(this)">💾 Save Auto-Pilot</button>
+          <span class="muted small">Target odds stops adding games once the combined odds reach it (capped at your game count).</span>
+        </div>
+      </div>`;
+      })()}
     </div>`
     : "";
 
@@ -2935,6 +2978,20 @@ async function renderDashboard(
   .personal-value{font-size:13px;color:var(--text);line-height:1.55}
   .personal-item{padding:4px 0;border-top:1px solid rgba(139,92,246,.12)}
   .personal-item:first-child{border-top:none;padding-top:0}
+  /* Auto-Pilot panel */
+  .autopilot{border:1px solid rgba(139,92,246,.28);border-radius:14px;padding:14px 16px;
+    background:linear-gradient(135deg,rgba(139,92,246,.08),rgba(99,102,241,.04))}
+  .autopilot.on{border-color:rgba(52,211,153,.45);background:linear-gradient(135deg,rgba(52,211,153,.08),rgba(139,92,246,.05))}
+  .ap-head{display:flex;justify-content:space-between;gap:12px;margin-bottom:12px}
+  .ap-tag{display:inline-block;margin-left:6px;padding:1px 8px;border-radius:999px;font-size:10px;font-weight:800;
+    color:var(--muted);background:rgba(139,92,246,.14);border:1px solid rgba(139,92,246,.35);vertical-align:middle}
+  .autopilot.on .ap-tag{color:#0f8a52;background:rgba(52,211,153,.16);border-color:rgba(52,211,153,.5)}
+  .ap-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:12px}
+  .ap-f{display:flex;flex-direction:column;gap:5px;font-size:11px;font-weight:700;color:var(--muted)}
+  .ap-f select,.ap-f input{padding:8px 10px;border-radius:9px;border:1px solid var(--line);
+    background:#fff;color:var(--ink);font-size:13px;font-weight:600}
+  .ap-f input[type=checkbox]{width:20px;height:20px;align-self:flex-start;accent-color:var(--primary)}
+  .ap-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
   @media(max-width:720px){ .sc-row{flex-direction:column} .sc-when{width:auto} .sc-mid{border-left:0;padding-left:0;border-top:1px solid var(--line);padding-top:10px} .sc-right{align-items:flex-start} .personal-grid{grid-template-columns:1fr} }
   /* Drag-and-drop overlay */
   #dropzone{position:fixed;inset:0;z-index:70;background:rgba(5,3,12,.72);backdrop-filter:blur(6px);display:grid;place-items:center;
@@ -4021,6 +4078,28 @@ async function renderDashboard(
       else showToast(j.error || 'Could not save preferences','warn');
     }catch(e){ showToast('Could not save preferences','warn'); }
   }
+  async function saveAutopilot(btn){
+    var on = document.getElementById('ap-on');
+    var payload = {
+      autoEnabled: !!(on && on.checked),
+      autoGames: parseInt((document.getElementById('ap-games')||{}).value,10) || 20,
+      autoHourWat: parseInt((document.getElementById('ap-hour')||{}).value,10) || 12,
+      autoTargetOdds: parseFloat((document.getElementById('ap-target')||{}).value) || 0,
+      autoEngine: (document.getElementById('ap-engine')||{}).value || 'analysis'
+    };
+    if(btn){ btn.disabled = true; }
+    try{
+      var r = await fetch('/api/personal/autopilot',{method:'POST',headers:{'Content-Type':'application/json'},body: JSON.stringify(payload)});
+      var j = await r.json();
+      if(j.ok){
+        showToast(payload.autoEnabled
+          ? ('Auto-Pilot ON — a '+payload.autoGames+'-game code will be built daily at '+String(payload.autoHourWat).padStart(2,'0')+':00 WAT. You place it yourself.')
+          : 'Auto-Pilot turned off.','ok');
+        setTimeout(function(){ location.reload(); }, 1000);
+      } else showToast(j.error || 'Could not save Auto-Pilot','warn');
+    }catch(e){ showToast('Could not save Auto-Pilot','warn'); }
+    if(btn){ btn.disabled = false; }
+  }
   async function saveCurrentPick(){
     var keys = Object.keys(SEL);
     if(!keys.length){ showToast('Pick at least 1 match first','warn'); return; }
@@ -4836,6 +4915,45 @@ export function startServer() {
         });
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, preferences: { ...preferences, id: up.id } }));
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/personal/autopilot") {
+        // Save an Auto-Pilot rule. This ONLY schedules code generation + an
+        // alert — it never logs into SportyBet or places a bet.
+        if (!user) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Sign in to set up Auto-Pilot." }));
+          return;
+        }
+        let p: Record<string, unknown> = {};
+        try {
+          p = JSON.parse((await readBody(req, 8 * 1024)) || "{}");
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Bad request body." }));
+          return;
+        }
+        const clampInt = (v: unknown, lo: number, hi: number, dflt: number) => {
+          const n = Math.floor(Number(v));
+          return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : dflt;
+        };
+        const engine = ["analysis", "expert", "combo"].includes(String(p.autoEngine))
+          ? String(p.autoEngine)
+          : "analysis";
+        const fields = {
+          autoEnabled: !!p.autoEnabled,
+          autoGames: clampInt(p.autoGames, 1, 40, 20),
+          autoHourWat: clampInt(p.autoHourWat, 0, 23, 12),
+          autoTargetOdds: Math.max(0, Math.min(100000, Number(p.autoTargetOdds) || 0)),
+          autoEngine: engine,
+        };
+        const up = await prisma.userPreference.upsert({
+          where: { userId: user.id },
+          create: { userId: user.id, ...fields },
+          update: fields,
+        });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, autopilot: fields, id: up.id }));
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/personal/saved-pick") {
