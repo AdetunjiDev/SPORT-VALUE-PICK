@@ -1,5 +1,9 @@
 export const config = {
-  port: Number(process.env.CRAWLER_PORT ?? 4200),
+  // Railway (and most cloud hosts) inject PORT and route traffic to whatever
+  // it's set to — take priority over CRAWLER_PORT so the app is reachable
+  // there, while local/Docker dev (which sets CRAWLER_PORT, not PORT) is
+  // unaffected.
+  port: Number(process.env.PORT ?? process.env.CRAWLER_PORT ?? 4200),
   defaultIntervalSec: Number(process.env.DEFAULT_CRAWL_INTERVAL_SEC ?? 180),
   // Polite crawler identity — Reddit requires a descriptive User-Agent.
   userAgent:
