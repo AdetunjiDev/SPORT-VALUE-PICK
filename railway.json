@@ -2,5 +2,8 @@
   "$schema": "https://railway.com/railway.schema.json",
   "build": {
     "dockerfilePath": "services/crawler/Dockerfile"
+  },
+  "deploy": {
+    "preDeployCommand": ["cd packages/db && npx prisma migrate deploy && npx tsx prisma/seed.ts"]
   }
 }
