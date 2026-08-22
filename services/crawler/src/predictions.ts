@@ -1,5 +1,6 @@
 import { fetchText, stripHtml } from "./adapters/http.js";
 import { getApiFootballPredictions } from "./apifootball.js";
+import { getH2HDeep } from "./apifootball-intel.js";
 
 /**
  * Manual-prediction feed, merged from two kinds of source:
@@ -27,6 +28,7 @@ export interface ExtPrediction {
   // O/U codes = Over/Under goals lines (e.g. O25 = Over 2.5).
   predCode?: "1" | "X" | "2" | "O15" | "O25" | "O35" | "U15" | "U25" | "U35";
   probs?: [number, number, number]; // home / draw / away %
+  h2h?: any; // H2HDeep from apifootball-intel
 }
 
 /**
@@ -347,6 +349,20 @@ export async function getPredictions(): Promise<ExtPrediction[]> {
         return t(a) - t(b);
       })
       .slice(0, 120);
+
+    // Fetch H2H for the top 30 predictions to enrich data without hammering the API
+    await Promise.all(
+      data.slice(0, 30).map(async (p) => {
+        if (p.home && p.away) {
+          try {
+            const h2h = await getH2HDeep(p.home, p.away);
+            if (h2h) p.h2h = h2h;
+          } catch {
+            // ignore
+          }
+        }
+      })
+    );
 
     if (data.length) cache = { at: Date.now(), data };
     return data.length ? data : (cache?.data ?? []);

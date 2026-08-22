@@ -2,11 +2,12 @@ import { prisma, Prisma } from "@sportybet/db";
 import { createBookingCode } from "./booker.js";
 import { forebetLegs, legsForTips } from "./forebet-ai.js";
 import { getApiFootballPredictions } from "./apifootball.js";
+import { generateSlipNarrative } from "./bytez.js";
 
 // Delta booking: recompute slips every cycle, but only mint a NEW SportyBet
 // booking code when a slip's selections actually change (a leg drops out of the
 // pool) — so we can refresh every 3 min without hammering SportyBet's API.
-const MAX_NEW_BOOKINGS_PER_CYCLE = Math.max(1, Number(process.env.AI_MAX_BOOKINGS_PER_CYCLE ?? 3));
+const MAX_NEW_BOOKINGS_PER_CYCLE = Math.max(1, Number(process.env.AI_MAX_BOOKINGS_PER_CYCLE ?? 5));
 // Rotate the pick selection on a slow clock (default 15 min) so fresh slips
 // vary over time instead of churning every cycle.
 const ROTATE_MS = Math.max(1, Number(process.env.AI_ROTATE_MIN ?? 15)) * 60_000;
@@ -135,18 +136,46 @@ async function candidatePool(): Promise<Leg[]> {
   });
 }
 
-interface Profile {
+// ---- Value Score engine ----
+// Every pick is scored by valueScore = odds × prob (expected return per unit).
+// Picks with valueScore > 1.0 have positive expected value. We enforce quality
+// floors so customers get meaningful odds with solid win rates.
+
+// Quality floors — every individual pick must clear these.
+const MIN_ODDS = 1.40;  // No tiny odds — the customer wants real returns
+const MIN_PROB = 0.40;  // No blind longshots — at least 40% model probability
+const MAX_ODDS = 8;     // Cap wild outliers
+
+// Minimum combined odds per slip size — ensures the slip is worth staking.
+const MIN_COMBINED: Record<number, number> = { 2: 3, 3: 5, 4: 8, 5: 12 };
+
+interface ValueProfile {
   title: string;
   codeType: "SAFE" | "COMBO" | "HIGH_ODDS";
-  minOdds: number;
-  maxOdds: number;
   legs: number;
-  sort: (a: Leg, b: Leg) => number;
+  minCombined: number;
 }
 
-function buildSlip(pool: Leg[], p: Profile, seed: number) {
+/**
+ * Build a value-optimised slip of N games from the pool.
+ *
+ * 1. Filter: odds ∈ [MIN_ODDS, MAX_ODDS], prob ≥ MIN_PROB
+ * 2. Rank by valueScore (odds × prob) DESC, then consensus, then freshness
+ * 3. Take top N unique matches (one pick per match)
+ * 4. Verify combined odds ≥ target minimum; if not, try swapping in the next-
+ *    best picks from lower in the pool (higher odds, slightly lower value)
+ */
+function buildValueSlip(
+  pool: Leg[],
+  p: ValueProfile,
+  seed: number,
+): ReturnType<typeof _assembleSlip> {
   const now = Date.now();
-  const inBand = pool.filter((l) => l.odds >= p.minOdds && l.odds <= p.maxOdds);
+
+  // Quality gate: individual picks must have decent odds AND win probability.
+  const qualified = pool.filter(
+    (l) => l.odds >= MIN_ODDS && l.odds <= MAX_ODDS && l.prob >= MIN_PROB,
+  );
 
   // Prefer the SOONEST matches so slips reflect the current slate and refresh
   // as matches kick off. Widen the window only if we can't fill the slip.
@@ -155,9 +184,16 @@ function buildSlip(pool: Leg[], p: Profile, seed: number) {
   for (const w of windows) {
     const seen = new Set<string>();
     distinct = [];
-    for (const l of inBand
+    // Sort by VALUE SCORE descending: best risk/reward ratio first.
+    const sorted = qualified
       .filter((leg) => !leg.kickoff || (leg.kickoff - now) / 3_600_000 <= w)
-      .sort(p.sort)) {
+      .sort(
+        (a, b) =>
+          b.odds * b.prob - a.odds * a.prob ||
+          b.consensus - a.consensus ||
+          b.foundAt - a.foundAt,
+      );
+    for (const l of sorted) {
       if (seen.has(l.eventId)) continue; // one selection per match
       seen.add(l.eventId);
       distinct.push(l);
@@ -166,19 +202,51 @@ function buildSlip(pool: Leg[], p: Profile, seed: number) {
   }
   if (distinct.length < 2) return null;
 
-  // Rotate among the top-quality candidates so slips evolve each cycle (fresh
-  // booking codes) without dropping to low-quality picks.
-  const topPool = distinct.slice(0, Math.min(distinct.length, p.legs + 5));
+  // Rotate among the top-quality candidates so slips evolve each cycle.
+  const topPool = distinct.slice(0, Math.min(distinct.length, p.legs + 6));
   const offset = ((seed % topPool.length) + topPool.length) % topPool.length;
-  const picks = topPool.slice(offset).concat(topPool.slice(0, offset)).slice(0, p.legs);
+  let picks = topPool.slice(offset).concat(topPool.slice(0, offset)).slice(0, p.legs);
   if (picks.length < 2) return null;
 
+  // If combined odds fall short of the minimum target, try promoting higher-
+  // odds picks from deeper in the ranked pool (they still passed the quality
+  // floor). This ensures customers always get meaningful combined odds.
+  let totalOdds = picks.reduce((a, l) => a * l.odds, 1);
+  if (totalOdds < p.minCombined && distinct.length > picks.length) {
+    const usedEvents = new Set(picks.map((l) => l.eventId));
+    const extras = distinct.filter((l) => !usedEvents.has(l.eventId));
+    // Sort extras by odds descending so we swap in higher-paying picks first.
+    extras.sort((a, b) => b.odds - a.odds);
+    // Replace the LOWEST-odds pick with a higher-odds one until target met.
+    for (const ex of extras) {
+      if (totalOdds >= p.minCombined) break;
+      const weakest = picks.reduce((lo, l, i) =>
+        l.odds < picks[lo].odds ? i : lo, 0,
+      );
+      const old = picks[weakest];
+      if (ex.odds <= old.odds) continue; // only upgrade
+      picks = [...picks.slice(0, weakest), ...picks.slice(weakest + 1), ex];
+      totalOdds = picks.reduce((a, l) => a * l.odds, 1);
+    }
+  }
+
+  return _assembleSlip(picks, p);
+}
+
+/** Compute metrics and package a finished slip. */
+function _assembleSlip(picks: Leg[], p: ValueProfile) {
+  if (picks.length < 2) return null;
   const totalOdds = picks.reduce((a, l) => a * l.odds, 1);
   const slipProb = picks.reduce((a, l) => a * l.prob, 1);
   const ev = totalOdds * slipProb - 1;
   const b = totalOdds - 1;
   const kelly = b > 0 ? (b * slipProb - (1 - slipProb)) / b : 0;
   const kellyCapped = Math.max(0, Math.min(0.25, kelly)); // quarter-Kelly cap
+
+  // Sort picks by kickoff so the slip reads chronologically.
+  picks.sort((a, b) => (a.kickoff ?? 0) - (b.kickoff ?? 0));
+
+  const avgOdds = round(totalOdds ** (1 / picks.length), 2);
 
   return {
     title: p.title,
@@ -189,9 +257,10 @@ function buildSlip(pool: Leg[], p: Profile, seed: number) {
     expectedValue: round(ev, 4),
     kellyStakePct: round(kellyCapped * 100, 2),
     reasoning:
-      `${picks.length} legs from ${new Set(picks.flatMap((l) => l.eventId)).size} matches. ` +
-      `Combined odds ${round(totalOdds)}, model win probability ${round(slipProb * 100)}%. ` +
-      `Consensus-weighted, one pick per match. Estimates only — not a guarantee.`,
+      `${picks.length} best-value games for today. ` +
+      `Combined odds ${round(totalOdds)} (avg ${avgOdds}/game), ` +
+      `model win probability ${round(slipProb * 100)}%. ` +
+      `Value-ranked: best odds × win rate. One pick per match. Estimates only — not a guarantee.`,
     legs: picks,
   };
 }
@@ -250,56 +319,28 @@ export async function generateAiSlips(): Promise<number> {
 
   if (pool.length < 2 && fbPool.length < 2 && afPool.length < 2) return 0;
 
-  const profiles: Profile[] = [
-    {
-      title: "AI Safe Slip",
-      codeType: "SAFE",
-      minOdds: 1.2,
-      maxOdds: 1.75,
-      legs: 4,
-      sort: (a, b) => b.prob - a.prob || b.consensus - a.consensus || b.foundAt - a.foundAt,
-    },
-    {
-      title: "AI Value Slip",
-      codeType: "COMBO",
-      minOdds: 1.6,
-      maxOdds: 2.8,
-      legs: 4,
-      sort: (a, b) =>
-        b.prob - 1 / b.odds - (a.prob - 1 / a.odds) ||
-        b.consensus - a.consensus ||
-        b.foundAt - a.foundAt,
-    },
-    {
-      title: "AI High-Odds Slip",
-      codeType: "HIGH_ODDS",
-      minOdds: 1.8,
-      maxOdds: 6,
-      legs: 5,
-      sort: (a, b) => b.odds * b.prob - a.odds * a.prob || b.foundAt - a.foundAt,
-    },
+  // ---- Upgraded Value Picks Slips ----
+  // Distinct profiles optimized for positive expected return and disciplined risk.
+  const valueProfiles: ValueProfile[] = [
+    { title: "🎯 Value 2-Game (Banker)", codeType: "SAFE",      legs: 2, minCombined: MIN_COMBINED[2] },
+    { title: "💎 AI Super Value 3-Game", codeType: "COMBO",     legs: 3, minCombined: MIN_COMBINED[3] },
+    { title: "🎯 Value 4-Game Combo",     codeType: "COMBO",     legs: 4, minCombined: MIN_COMBINED[4] },
+    { title: "🚀 High Multiplier 5-Game", codeType: "HIGH_ODDS", legs: 5, minCombined: MIN_COMBINED[5] },
   ];
 
   // Rotate on a slow clock, not every cycle, so an unchanged pool yields the
   // SAME picks (and thus keeps the same booking code) between rotation windows.
   generation = Math.floor(Date.now() / ROTATE_MS);
-  const slips = profiles.map((p) => buildSlip(pool, p, generation)).filter(Boolean) as NonNullable<
-    ReturnType<typeof buildSlip>
-  >[];
+  const slips = valueProfiles
+    .map((p) => buildValueSlip(pool, p, generation))
+    .filter(Boolean) as NonNullable<ReturnType<typeof buildValueSlip>>[];
 
   // Dedicated Forebet slip: built purely from Forebet's model predictions
-  // matched to live SportyBet 1X2 prices.
+  // matched to live SportyBet 1X2 prices. Capped at 4 games with value logic.
   if (fbPool.length >= 2) {
-    const fbSlip = buildSlip(
+    const fbSlip = buildValueSlip(
       fbPool,
-      {
-        title: "AI Forebet Slip",
-        codeType: "COMBO",
-        minOdds: 1.15,
-        maxOdds: 8,
-        legs: 4,
-        sort: (a, b) => b.prob - a.prob || b.odds - a.odds,
-      },
+      { title: "🔮 Forebet Value Slip", codeType: "COMBO", legs: 4, minCombined: 3 },
       generation,
     );
     if (fbSlip) {
@@ -310,21 +351,30 @@ export async function generateAiSlips(): Promise<number> {
 
   // Dedicated API-Football slip: built purely from the premium model's picks.
   if (afPool.length >= 2) {
-    const afSlip = buildSlip(
+    const afSlip = buildValueSlip(
       afPool,
-      {
-        title: "AI Premium Slip ⭐",
-        codeType: "COMBO",
-        minOdds: 1.15,
-        maxOdds: 8,
-        legs: 4,
-        sort: (a, b) => b.prob - a.prob || b.odds - a.odds,
-      },
+      { title: "⭐ Premium Value Slip", codeType: "COMBO", legs: 4, minCombined: 3 },
       generation,
     );
     if (afSlip) {
       afSlip.reasoning += " Legs sourced from API-Football's premium prediction model.";
       slips.push(afSlip);
+    }
+  }
+
+  // Enrich slips with Bytez AI tactical narrative
+  for (const s of slips) {
+    try {
+      const narrative = await generateSlipNarrative({
+        title: s.title,
+        totalOdds: s.totalOdds,
+        confidence: s.confidence,
+        expectedValue: s.expectedValue,
+        legs: s.legs,
+      });
+      if (narrative) s.reasoning = narrative;
+    } catch {
+      /* continue with standard reasoning */
     }
   }
 

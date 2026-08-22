@@ -10,6 +10,10 @@ export const config = {
   // TheSportsDB API key for real past-results/form lookups. "3" is the public
   // free test key (rate-limited); set SPORTSDB_KEY for a paid key if needed.
   sportsDbKey: process.env.SPORTSDB_KEY ?? "3",
+  // Cache for expensive per-request computations (dashboard's recommended
+  // picks, expert picks). Empty ⇒ caching module falls back to computing
+  // fresh every time — slower, but the app still works without Redis.
+  redisUrl: process.env.REDIS_URL ?? "",
   // --- App access gate ---
   // When set, the WHOLE dashboard requires this password to load — external
   // viewers can't see any page (or its source) without it. Empty ⇒ open (local
@@ -73,6 +77,10 @@ export const config = {
     // How many prediction lookups to spend per refresh (each is 1 request).
     predsPerCycle: Number(process.env.APIFOOTBALL_PREDS_PER_CYCLE ?? 6),
   },
+  // --- API-Football Intelligence Features (momentum, standings, H2H, injuries) ---
+  // Separate budget from predictions so intel lookups never starve the existing flow.
+  // On the Pro plan (7,500/day) this is very conservative; raise it freely.
+  intelBudget: Number(process.env.APIFOOTBALL_INTEL_BUDGET ?? 500),
   // --- Email delivery (transactional, via Resend HTTP API) ---
   // Empty apiKey ⇒ mailer is a no-op, so the app runs fine without it (users
   // still get the in-app notification). Set RESEND_API_KEY + EMAIL_FROM to make
@@ -83,4 +91,14 @@ export const config = {
     apiKey: process.env.RESEND_API_KEY ?? "",
     from: process.env.EMAIL_FROM ?? "Sporty Value Pick AI <onboarding@resend.dev>",
   },
+  // --- Bytez AI (LLM Reasoning & Match Commentary) ---
+  // Connects open-source models (Llama 3.3 70B, DeepSeek-R1, Qwen 2.5) via Bytez.
+  // When blank or offline, gracefully falls back to deterministic Poisson stats.
+  bytez: {
+    apiKey: process.env.BYTEZ_API_KEY ?? "",
+    model: process.env.BYTEZ_MODEL ?? "meta-llama/Llama-3.3-70B-Instruct",
+    fallbackModel: process.env.BYTEZ_FALLBACK_MODEL ?? "Qwen/Qwen2.5-72B-Instruct",
+    timeoutMs: Number(process.env.BYTEZ_TIMEOUT_MS ?? 12000),
+  },
 };
+

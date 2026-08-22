@@ -34,6 +34,9 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 
+# Claude Code — local-only machine settings (permissions allowlist etc.)
+.claude/settings.local.json
+
 # Python (ML service)
 __pycache__/
 *.pyc

@@ -28,6 +28,8 @@ export const PICKS: Record<
   X: { marketId: "1", specifier: "", outcomeId: "2", label: "Draw", market: "1X2" },
   "2": { marketId: "1", specifier: "", outcomeId: "3", label: "Away", market: "1X2" },
   // Over/Under total match goals
+  O05: { marketId: "18", specifier: "total=0.5", outcomeId: "12", label: "Over 0.5 Goals", market: "Over/Under" },
+  U05: { marketId: "18", specifier: "total=0.5", outcomeId: "13", label: "Under 0.5 Goals", market: "Over/Under" },
   O15: { marketId: "18", specifier: "total=1.5", outcomeId: "12", label: "Over 1.5 Goals", market: "Over/Under" },
   O25: { marketId: "18", specifier: "total=2.5", outcomeId: "12", label: "Over 2.5 Goals", market: "Over/Under" },
   O35: { marketId: "18", specifier: "total=3.5", outcomeId: "12", label: "Over 3.5 Goals", market: "Over/Under" },
@@ -90,8 +92,10 @@ async function sportyEvents(): Promise<SbEvent[]> {
   if (evCache && Date.now() - evCache.at < EV_TTL_MS) return evCache.data;
   const out: SbEvent[] = [];
   try {
-    // 10 pages ≈ 700+ fixtures; cached 10 min so this is ~1 req/min average.
-    for (let page = 1; page <= 10; page++) {
+    // 20 pages ≈ up to 2000 fixtures (stops early when a page adds nothing);
+    // cached 10 min so this stays ~2 req/min average. Deep enough that even a
+    // 50-leg accumulator code across minor leagues resolves for edit/demo.
+    for (let page = 1; page <= 20; page++) {
       const json = await fetchJson(EVENTS_API + page).catch(() => null);
       const tours: any[] = json?.data?.tournaments ?? [];
       let added = 0;
@@ -127,6 +131,45 @@ async function sportyEvents(): Promise<SbEvent[]> {
   }
   if (out.length) evCache = { at: Date.now(), data: out };
   return out.length ? out : (evCache?.data ?? []);
+}
+
+// ---- Single-event lookup (factsCenter/event) ----
+// The bulk upcoming feed carries ~2000 fixtures; anything beyond it (deep
+// friendlies, small cups) can still be fetched individually with FULL markets.
+// Used by the code-edit flow so EVERY still-upcoming leg becomes editable.
+const EVENT_BY_ID_API = "https://www.sportybet.com/api/ng/factsCenter/event?eventId=";
+const evByIdCache = new Map<string, { at: number; data: SbEvent | null }>();
+
+export async function fetchEventById(eventId: string): Promise<SbEvent | null> {
+  const hit = evByIdCache.get(eventId);
+  if (hit && Date.now() - hit.at < EV_TTL_MS) return hit.data;
+  const json = await fetchJson(`${EVENT_BY_ID_API}${encodeURIComponent(eventId)}`).catch(() => null);
+  const d = json?.data;
+  let out: SbEvent | null = null;
+  if (d?.homeTeamName && d?.awayTeamName) {
+    const outcomes: Record<string, number> = {};
+    for (const m of d.markets ?? []) {
+      for (const [code, meta] of Object.entries(PICKS)) {
+        if (String(m.id) !== meta.marketId) continue;
+        if (meta.specifier && (m.specifier ?? "") !== meta.specifier) continue;
+        const o = (m.outcomes ?? []).find((x: any) => String(x.id) === meta.outcomeId);
+        const odds = o ? Number(o.odds) : NaN;
+        if (Number.isFinite(odds) && odds > 1) outcomes[code] = odds;
+      }
+    }
+    if (Object.keys(outcomes).length) {
+      out = {
+        eventId: String(d.eventId ?? eventId),
+        home: String(d.homeTeamName),
+        away: String(d.awayTeamName),
+        league: d?.sport?.category?.tournament?.name ? String(d.sport.category.tournament.name) : undefined,
+        kickoff: Number(d.estimateStartTime) || 0,
+        outcomes,
+      };
+    }
+  }
+  evByIdCache.set(eventId, { at: Date.now(), data: out });
+  return out;
 }
 
 /** Normalise a club name for fuzzy comparison across the two sites. */
@@ -199,6 +242,8 @@ const MARKET_GROUP: Record<string, readonly string[]> = {
   "1": RESULT_CODES,
   X: RESULT_CODES,
   "2": RESULT_CODES,
+  O05: ["O05", "U05"],
+  U05: ["O05", "U05"],
   O15: ["O15", "U15"],
   U15: ["O15", "U15"],
   O25: ["O25", "U25"],

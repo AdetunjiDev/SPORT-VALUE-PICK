@@ -1,4 +1,5 @@
 import { getSportyFixtures, devig, type SbEvent } from "./forebet-ai.js";
+import { getH2HDeep } from "./apifootball-intel.js";
 
 /**
  * AI Score Predictor — a Poisson goals model calibrated to live SportyBet odds.
@@ -30,6 +31,13 @@ function poisCdf(k: number, lambda: number): number {
   for (let i = 0; i <= k; i++) s += pois(i, lambda);
   return s;
 }
+
+// Selectable markets per match: Result, Double Chance, both sides of the goal
+// lines (Over 0.5 → Over 3.5 / Under 1.5 → Under 3.5), BTTS both ways, DNB and
+// team goals — filtered to whatever SportyBet actually prices. The user picks
+// which one to add to their slip (one per match).
+const OPTIONS_TARGET = 4; // min priced markets for a "full" card (backfill quality gate)
+const OPTIONS_MAX = 12; // max markets offered per card (the choose-your-market menu)
 
 /** De-vigged probability for one outcome code (null if the price is missing). */
 function P(ev: SbEvent, code: string): number | null {
@@ -97,13 +105,16 @@ export interface MatchAnalysis {
   pDraw: number;
   pAway: number;
   btts: number; // both teams to score
+  over35: number;
   over25: number; // total goals over 2.5
   over15: number;
+  over05: number; // at least one goal in the match
   topScores: ScoreProb[]; // most likely correct scores
   likeliest: string; // headline scoreline
   verdict: string; // "Home win", "Draw", "Away win"
   pickCode: "1" | "X" | "2"; // model's result pick (for the slip)
   pickOdds?: string; // SportyBet odds for that result
+  h2h?: any; // H2HDeep
   confidence: number; // model prob for the pick (0..1)
   options: BetOption[]; // selectable markets from the analysis (result, O/U, BTTS, DC)
 }
@@ -128,8 +139,10 @@ export function analyzeEvent(ev: SbEvent): MatchAnalysis | null {
   let pDraw = 0;
   let pAway = 0;
   let btts = 0;
+  let over35 = 0;
   let over25 = 0;
   let over15 = 0;
+  let over05 = 0;
   for (let i = 0; i <= N; i++) {
     for (let j = 0; j <= N; j++) {
       const p = pois(i, lh) * pois(j, la);
@@ -138,8 +151,10 @@ export function analyzeEvent(ev: SbEvent): MatchAnalysis | null {
       else if (i === j) pDraw += p;
       else pAway += p;
       if (i >= 1 && j >= 1) btts += p;
+      if (i + j >= 4) over35 += p;
       if (i + j >= 3) over25 += p;
       if (i + j >= 2) over15 += p;
+      if (i + j >= 1) over05 += p;
     }
   }
   cells.sort((a, b) => b.p - a.p);
@@ -175,22 +190,35 @@ export function analyzeEvent(ev: SbEvent): MatchAnalysis | null {
   const pAwayScore = 1 - Math.exp(-la);
   const dnbH = pHome / (pHome + pAway || 1);
 
-  // Candidate markets in priority order; we take the first FOUR that SportyBet
-  // actually prices, so nearly every match gets a full set of 4 options even if
-  // one market (e.g. BTTS) is missing for a small-league fixture.
+  // Full market menu so the user can CHOOSE the direction they want — both the
+  // Over and Under side of each goal line (Over 0.5 … Over 3.5, Under 1.5 …
+  // Under 3.5), BTTS both ways, the result, best double chance, draw-no-bet and
+  // team goals. Ordered by usefulness; only the ones SportyBet actually prices
+  // survive (opt() → null otherwise), capped at OPTIONS_MAX.
   const candidates: (BetOption | null)[] = [
+    // Result & double chance
     opt(pickCode, resultLabel, "Result", conf),
-    over25 >= 0.5 ? opt("O25", "Over 2.5 Goals", "Goals", over25) : opt("U25", "Under 2.5 Goals", "Goals", 1 - over25),
-    btts >= 0.5 ? opt("BTTSY", "Both Teams To Score", "BTTS", btts) : opt("BTTSN", "Both NOT To Score", "BTTS", 1 - btts),
     opt(dcs[0][0], `${dcs[0][2]} (DC)`, "Double Chance", dcs[0][1]),
-    // Fallbacks to guarantee 4 when a primary market isn't priced:
-    over15 >= 0.5 ? opt("O15", "Over 1.5 Goals", "Goals", over15) : opt("U15", "Under 1.5 Goals", "Goals", 1 - over15),
+    // Over goal lines (safest → longest)
+    opt("O05", "Over 0.5 Goals", "Goals", over05),
+    opt("O15", "Over 1.5 Goals", "Goals", over15),
+    opt("O25", "Over 2.5 Goals", "Goals", over25),
+    opt("O35", "Over 3.5 Goals", "Goals", over35),
+    // Under goal lines (safest → tightest)
+    opt("U35", "Under 3.5 Goals", "Goals", 1 - over35),
+    opt("U25", "Under 2.5 Goals", "Goals", 1 - over25),
+    opt("U15", "Under 1.5 Goals", "Goals", 1 - over15),
+    // Both teams to score, both ways
+    opt("BTTSY", "Both Teams To Score", "BTTS", btts),
+    opt("BTTSN", "Both Teams NOT To Score", "BTTS", 1 - btts),
+    // Draw no bet (favoured side), team goals, second double chance, 0-0
     dnbH >= 0.5
       ? opt("DNBH", `${ev.home} (Draw No Bet)`, "Draw No Bet", dnbH)
       : opt("DNBA", `${ev.away} (Draw No Bet)`, "Draw No Bet", 1 - dnbH),
     opt("HO05", `${ev.home} Over 0.5`, "Team Goals", pHomeScore),
     opt("AO05", `${ev.away} Over 0.5`, "Team Goals", pAwayScore),
     opt("DC12", `${ev.home} or ${ev.away}`, "Double Chance", pHome + pAway),
+    opt("U05", "Under 0.5 Goals (0-0)", "Goals", 1 - over05),
   ];
   const seen = new Set<string>();
   const options: BetOption[] = [];
@@ -198,7 +226,7 @@ export function analyzeEvent(ev: SbEvent): MatchAnalysis | null {
     if (!o || seen.has(o.code)) continue;
     seen.add(o.code);
     options.push(o);
-    if (options.length >= 4) break;
+    if (options.length >= OPTIONS_MAX) break;
   }
 
   return {
@@ -213,8 +241,10 @@ export function analyzeEvent(ev: SbEvent): MatchAnalysis | null {
     pDraw: round(pDraw, 4),
     pAway: round(pAway, 4),
     btts: round(btts, 4),
+    over35: round(over35, 4),
     over25: round(over25, 4),
     over15: round(over15, 4),
+    over05: round(over05, 4),
     topScores,
     likeliest: topScores[0]?.score ?? "—",
     verdict,
@@ -230,18 +260,45 @@ export interface AnalysisResult {
   requested: number;
   windowDays: number;
   scanned: number;
+  onDate?: string; // set when a specific calendar day was requested (YYYY-MM-DD)
+  onEnd?: string; // set when a date RANGE was requested (e.g. a weekend); inclusive
 }
 
-/** Analyse the soonest upcoming fixtures (that have usable prices). */
-export async function getMatchAnalyses(count = 12, days = 5): Promise<AnalysisResult> {
+/**
+ * Analyse upcoming fixtures (that have usable prices). By default scans the
+ * rolling "next `days`" window; when `onDate` (YYYY-MM-DD) is given, scans only
+ * that Africa/Lagos calendar day — or the inclusive `onDate`..`onEnd` range
+ * (used by the "This weekend" shortcut) — the calendar view.
+ */
+export async function getMatchAnalyses(
+  count = 12,
+  days = 5,
+  onDate?: string,
+  onEnd?: string,
+): Promise<AnalysisResult> {
   const n = Math.max(1, Math.min(70, Math.floor(count) || 12));
   const d = Math.max(1, Math.min(30, Math.floor(days) || 5));
   const now = Date.now();
-  const maxT = now + d * 86_400_000;
+  // Calendar mode: restrict to the picked Lagos day(s) (WAT = UTC+1, no DST).
+  // Never show kickoffs already in the past, so today starts from now.
+  const isDate = (v?: string) => !!v && /^\d{4}-\d{2}-\d{2}$/.test(v);
+  const onValid = isDate(onDate) ? onDate : undefined;
+  const endValid = isDate(onEnd) && (onEnd as string) >= (onValid as string) ? onEnd : undefined;
+  let minT = now;
+  let maxT = now + d * 86_400_000;
+  if (onValid) {
+    const dayStart = Date.parse(`${onValid}T00:00:00+01:00`);
+    const lastDay = endValid ?? onValid;
+    const dayEnd = Date.parse(`${lastDay}T00:00:00+01:00`) + 86_400_000;
+    if (Number.isFinite(dayStart) && Number.isFinite(dayEnd)) {
+      minT = Math.max(now, dayStart);
+      maxT = dayEnd;
+    }
+  }
 
   const fixtures = await getSportyFixtures().catch(() => [] as SbEvent[]);
   const inWindow = fixtures
-    .filter((e) => e.kickoff > now && e.kickoff <= maxT)
+    .filter((e) => e.kickoff > minT && e.kickoff <= maxT)
     .sort((a, b) => a.kickoff - b.kickoff);
 
   const out: MatchAnalysis[] = [];
@@ -251,9 +308,9 @@ export async function getMatchAnalyses(count = 12, days = 5): Promise<AnalysisRe
     const a = analyzeEvent(ev);
     if (!a) continue;
     scanned += 1;
-    // Prefer matches with a full set of 4 options so the UI is consistent;
+    // Prefer matches with a full set of options so the UI is consistent;
     // there are hundreds of fixtures, so we can afford to skip thin ones.
-    if (a.options.length >= 4) {
+    if (a.options.length >= OPTIONS_TARGET) {
       out.push(a);
       if (out.length >= n) break;
     } else if (spare.length < n) {
@@ -267,5 +324,20 @@ export async function getMatchAnalyses(count = 12, days = 5): Promise<AnalysisRe
     out.push(a);
   }
   out.sort((x, y) => new Date(x.kickoff).getTime() - new Date(y.kickoff).getTime());
-  return { matches: out, requested: n, windowDays: d, scanned };
+
+  // Fetch H2H for the top 20 matches to enrich data
+  await Promise.all(
+    out.slice(0, 20).map(async (a) => {
+      if (a.home && a.away) {
+        try {
+          const h2h = await getH2HDeep(a.home, a.away);
+          if (h2h) a.h2h = h2h;
+        } catch {
+          // ignore
+        }
+      }
+    })
+  );
+
+  return { matches: out, requested: n, windowDays: d, scanned, onDate: onValid, onEnd: endValid };
 }

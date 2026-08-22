@@ -17,6 +17,7 @@
     "@sportybet/db": "workspace:*",
     "@sportybet/shared": "workspace:*",
     "fast-xml-parser": "^4.5.0",
+    "ioredis": "^6.0.0",
     "node-tesseract-ocr": "^2.2.1",
     "telegram": "^2.26.22"
   },

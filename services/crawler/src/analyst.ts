@@ -5,9 +5,26 @@ import {
   bestOutcome,
   devig,
   CODE_SETS,
+  RESULT_CODES,
+  DC_CODES,
   type SbEvent,
   type GameType,
 } from "./forebet-ai.js";
+import { getFormsForMatches, type MatchForm, type TeamForm } from "./form.js";
+import { generateMatchValueInsight } from "./bytez.js";
+import { analyzeEvent } from "./xg.js";
+import {
+  intelEnabled,
+  getTeamMomentum,
+  getMatchIntel,
+  analyzeBankerLock,
+  analyzeUpsetPotential,
+  type MomentumResult,
+  type BankerLockResult,
+  type GiantKillerResult,
+  type TrapGameResult,
+  type MatchIntelReport,
+} from "./apifootball-intel.js";
 export type { GameType };
 
 /**
@@ -53,15 +70,24 @@ export interface ExpertPick {
   eventId?: string; // SportyBet sr:match: id — for result tracking
   pickCode?: string; // 1 | X | 2 | O15 | … — for settlement
   market?: string; // "1X2" | "Over/Under" | "Double Chance" | …
+  // --- Intel features (API-Football powered) ---
+  homeMomentum?: MomentumResult;
+  awayMomentum?: MomentumResult;
+  bankerLock?: BankerLockResult;
+  giantKiller?: GiantKillerResult;
+  trapGame?: TrapGameResult;
+  intelReport?: MatchIntelReport;
 }
 
 const PICK_LABEL: Record<string, (h: string, a: string) => string> = {
   "1": (h) => `${h} to Win`,
   X: () => "Draw",
   "2": (_h, a) => `${a} to Win`,
+  O05: () => "Over 0.5 Goals",
   O15: () => "Over 1.5 Goals",
   O25: () => "Over 2.5 Goals",
   O35: () => "Over 3.5 Goals",
+  U05: () => "Under 0.5 Goals (no goals)",
   U15: () => "Under 1.5 Goals",
   U25: () => "Under 2.5 Goals",
   U35: () => "Under 3.5 Goals",
@@ -150,6 +176,131 @@ function findExternalTip(ev: SbEvent, preds: ExtPrediction[]): ExtPrediction | u
   return preds.find(
     (p) => p.home && p.away && fuzzyTeamsMatch(p.home, ev.home) && fuzzyTeamsMatch(p.away, ev.away),
   );
+}
+
+// =====================================================================
+// FORM-AWARE REFINEMENT — real recent results, not a blanket home prior
+// =====================================================================
+// Pure market odds structurally favour "Home or Draw": Double Chance picks
+// whichever pair excludes the least-likely single outcome, and across a
+// broad set of fixtures that's usually "Away win" (home advantage is a real,
+// well-documented effect). Left unchecked, that means the safe-pick engine
+// reflexively lands on DC1X ("Home or Draw") on nearly every match — a
+// blanket prior, not analysis. A professional scout weighs CURRENT status —
+// who's actually won recently — and lets that flip the read when it disagrees
+// with the market. This section blends real recent results (already fetched
+// and durably cached elsewhere in the app) into the 1X2/Double-Chance choice,
+// so the pick can genuinely become "Draw or Away" or a straight result when
+// the data supports it. It only ever moves the needle on real, sufficient
+// data (3+ games for BOTH teams) — no data, no adjustment, never an invented
+// edge from a hunch or a thin sample.
+const FORM_WEIGHT = 0.16; // bounded nudge: max ~16pt shift on a maximal form gap
+
+/** Points-per-game from real recent results, 0..1 — null if fewer than 3 games. */
+function ppg(f: TeamForm | null | undefined): number | null {
+  if (!f || f.matches.length < 3) return null;
+  const pts = f.matches.reduce((s, m) => s + (m.result === "W" ? 3 : m.result === "D" ? 1 : 0), 0);
+  return pts / (3 * f.matches.length);
+}
+
+interface Triple {
+  pHome: number;
+  pDraw: number;
+  pAway: number;
+}
+
+/**
+ * Blend real recent-form into the market-implied 1X2 read. Draw is left at
+ * the market level (recent form is a weak predictor of draws either way);
+ * mass shifts between home/away in proportion to the PPG gap. No-ops
+ * (returns the raw market read) when either team lacks 3+ games of form.
+ */
+export function formAdjustedTriple(ev: SbEvent, form: MatchForm | null): Triple {
+  const mH = devig(ev.outcomes, "1");
+  const mD = devig(ev.outcomes, "X");
+  const mA = devig(ev.outcomes, "2");
+  const homePpg = ppg(form?.home);
+  const awayPpg = ppg(form?.away);
+  if (homePpg === null || awayPpg === null || (!mH && !mD && !mA)) return { pHome: mH, pDraw: mD, pAway: mA };
+  const shift = (homePpg - awayPpg) * FORM_WEIGHT; // homePpg, awayPpg ∈ [0,1] → shift ∈ [-0.16, 0.16]
+  const pHome = Math.max(0.02, Math.min(0.95, mH + shift));
+  const pAway = Math.max(0.02, Math.min(0.95, mA - shift));
+  const total = pHome + mD + pAway || 1;
+  return { pHome: pHome / total, pDraw: mD / total, pAway: pAway / total };
+}
+
+/**
+ * Like bestOutcome(), but re-ranks RESULT (1/X/2) and DOUBLE CHANCE
+ * (DC1X/DC12/DCX2) candidates using the form-adjusted triple instead of the
+ * raw market read — so the "safest cover" reflects actual current team
+ * status. Only these six codes are affected; goals/BTTS/team-goals picks are
+ * untouched (this isn't the market bias those markets have).
+ */
+export function formAwareBestOutcome(
+  ev: SbEvent,
+  codes: readonly string[],
+  triple: Triple,
+): { code: string; odds: number; implied: number } | null {
+  const derived: Partial<Record<string, number>> = {
+    "1": triple.pHome,
+    X: triple.pDraw,
+    "2": triple.pAway,
+    DC1X: triple.pHome + triple.pDraw,
+    DC12: triple.pHome + triple.pAway,
+    DCX2: triple.pDraw + triple.pAway,
+  };
+  let best: { code: string; odds: number; implied: number } | null = null;
+  for (const code of codes) {
+    const odds = ev.outcomes[code];
+    if (!odds || odds <= 1) continue;
+    const implied = derived[code];
+    if (implied === undefined) continue; // only the 6 result/DC codes are form-refined
+    if (!best || implied > best.implied) best = { code, odds, implied };
+  }
+  return best;
+}
+
+const RESULT_OR_DC_CODES = new Set<string>([...RESULT_CODES, ...DC_CODES]);
+
+/**
+ * Refine already-selected picks whose market is 1X2 or Double Chance, using
+ * real recent form — mutates `picks` in place. Fetches form only for the
+ * fixtures actually being shown (not the full scan), bounded by the same
+ * time budget the AI Analysis page uses, so this stays fast on a warm cache
+ * and never blocks a page render for long on a cold one.
+ */
+async function refineWithForm(picks: ExpertPick[], fixtures: SbEvent[]): Promise<void> {
+  const targets = picks.filter((p) => p.pickCode && RESULT_OR_DC_CODES.has(p.pickCode) && p.eventId);
+  if (!targets.length) return;
+  const evById = new Map(fixtures.map((e) => [e.eventId, e]));
+  const forms = await getFormsForMatches(
+    targets.map((p) => ({ home: p.home, away: p.away })),
+    5000,
+  ).catch(() => new Map<string, MatchForm>());
+  for (const p of targets) {
+    const ev = evById.get(p.eventId!);
+    if (!ev) continue;
+    const mf = forms.get(`${p.home}|${p.away}`.toLowerCase()) ?? null;
+    if (!mf || (!ppg(mf.home) && !ppg(mf.away))) continue; // no usable form data — leave the market pick as-is
+    const triple = formAdjustedTriple(ev, mf);
+    const candidateCodes = [...RESULT_CODES, ...DC_CODES].filter((c) => {
+      const o = ev.outcomes[c];
+      return o && o > 1;
+    });
+    const refined = formAwareBestOutcome(ev, candidateCodes, triple);
+    if (!refined) continue;
+    if (refined.code !== p.pickCode) {
+      p.pickCode = refined.code;
+      p.pick = (PICK_LABEL[refined.code] ?? (() => refined.code))(p.home, p.away);
+      p.market = marketOf(refined.code);
+      p.reasons = [
+        ...p.reasons,
+        `Adjusted from the market favourite using real recent form (${mf.home?.summary ?? "—"} vs ${mf.away?.summary ?? "—"})`,
+      ];
+    }
+    p.odds = refined.odds.toFixed(2);
+    p.confidence = round(Math.min(0.95, refined.implied));
+  }
 }
 
 const round = (n: number, d = 4) => Math.round(n * 10 ** d) / 10 ** d;
@@ -259,54 +410,93 @@ export async function getExpertPicks(opts: ExpertOptions): Promise<ExpertResult>
   const off = band.length ? (((opts.seed ?? 0) % band.length) + band.length) % band.length : 0;
   const chosen = band.slice(off).concat(band.slice(0, off)).slice(0, count);
 
+  // Refine RESULT/DOUBLE-CHANCE picks with real recent form before returning
+  // — see the "FORM-AWARE REFINEMENT" section above for why. Only touches
+  // the 6 result/DC codes; goals/BTTS/team-goals picks pass through unchanged.
+  await refineWithForm(chosen, fixtures).catch(() => {});
+
+  // --- API-Football Intelligence enrichment (when subscription is active) ---
+  if (intelEnabled() && chosen.length > 0) {
+    const INTEL_BATCH = Math.min(chosen.length, 6); // cap parallel intel lookups
+    await Promise.all(
+      chosen.slice(0, INTEL_BATCH).map(async (p) => {
+        try {
+          const homeOdds = p.pickCode === "1" ? Number(p.odds) || 0 : 0;
+          const awayOdds = p.pickCode === "2" ? Number(p.odds) || 0 : 0;
+          const intel = await getMatchIntel(
+            p.home, p.away, p.league,
+            p.confidence, homeOdds, awayOdds,
+          );
+          p.homeMomentum = intel.homeMomentum ?? undefined;
+          p.awayMomentum = intel.awayMomentum ?? undefined;
+          p.bankerLock = intel.bankerLock ?? undefined;
+          p.giantKiller = intel.giantKiller ?? undefined;
+          p.trapGame = intel.trapGame ?? undefined;
+          p.intelReport = intel;
+          // Enrich signals with intel insights
+          if (intel.homeMomentum) p.signals.push(`${p.home} ${intel.homeMomentum.label} (${intel.homeMomentum.score}/100)`);
+          if (intel.awayMomentum) p.signals.push(`${p.away} ${intel.awayMomentum.label} (${intel.awayMomentum.score}/100)`);
+          if (intel.bankerLock && intel.bankerLock.tag !== "none") p.signals.push(`${intel.bankerLock.label} (${intel.bankerLock.criteriaCount}/6)`);
+          if (intel.homeStanding) p.signals.push(`${p.home}: ${intel.homeStanding.motivationTier} (${intel.homeStanding.rank}/${intel.homeStanding.totalTeams})`);
+          if (intel.awayStanding) p.signals.push(`${p.away}: ${intel.awayStanding.motivationTier} (${intel.awayStanding.rank}/${intel.awayStanding.totalTeams})`);
+          if (intel.homeInjuries && intel.homeInjuries.totalOut > 0) p.signals.push(`🏥 ${p.home}: ${intel.homeInjuries.summary}`);
+          if (intel.awayInjuries && intel.awayInjuries.totalOut > 0) p.signals.push(`🏥 ${p.away}: ${intel.awayInjuries.summary}`);
+          if (intel.trapGame && intel.trapGame.isTrap) p.signals.unshift(intel.trapGame.label); // Put trap alert first
+        } catch { /* intel is best-effort */ }
+      }),
+    ).catch(() => {});
+  }
+
   // Present soonest kick-off first.
   chosen.sort((a, b) => new Date(a.kickoff ?? 0).getTime() - new Date(b.kickoff ?? 0).getTime());
   return { picks: chosen, requested: count, windowDays: days, poolSize: eligible.length };
 }
 
 // =====================================================================
-// VALUE PICKS — higher-odds opportunities with a genuine model edge
 // =====================================================================
-// A value bet = where an INDEPENDENT model (Forebet / API-Football) rates an
-// outcome MORE likely than SportyBet's price implies. Edge = model prob −
-// de-vigged market prob; EV = model prob × odds − 1. We only surface positive-
-// edge picks at meaningful odds — real overlays, not invented ones. Coverage
-// is limited to fixtures an external model actually covers (honest constraint).
+// VALUE PICKS — multi-market opportunities with genuine mathematical edge
+// =====================================================================
+// A value bet exists where an INDEPENDENT model (Forebet / API-Football / Poisson xG)
+// rates an outcome MORE likely than SportyBet's price implies.
+// Edge = model prob − de-vigged market prob; EV = model prob × odds − 1.
+// Now evaluates multiple liquid markets (1X2, Double Chance, Over/Under, BTTS, DNB),
+// computes quarter-Kelly bankroll sizing, and integrates Bytez AI tactical explanations.
 
 export interface ValuePick extends ExpertPick {
   edge: number; // model prob − market implied (0..1)
   ev: number; // expected value: modelProb × odds − 1
-  modelProb: number; // the external model's probability for this outcome
+  modelProb: number; // the model's probability for this outcome
+  kellyPct?: number; // recommended fractional Kelly bankroll stake % (e.g. 2.5%)
+  aiInsight?: string; // Bytez AI-generated value rationale
+  marketGroup?: string; // "1X2" | "Goals" | "BTTS" | "Double Chance" | "Draw No Bet"
 }
 
 export interface ValueResult {
   picks: ValuePick[];
   requested: number;
   windowDays: number;
-  scanned: number; // fixtures with an external model opinion we could compare
+  scanned: number; // fixtures with an independent model or statistical analysis
 }
 
 export interface ValueOptions {
   count: number;
   days: number;
-  minEdge?: number; // default 0.06 (6-point overlay)
-  minOdds?: number; // default 1.7 — value needs some price
-  maxOdds?: number; // default 6 — cap wild longshots
+  minEdge?: number; // default 0.05 (5-point overlay)
+  minOdds?: number; // default 1.40 — value needs reasonable price
+  maxOdds?: number; // default 8.0 — cap wild longshots
   maxEv?: number; // default 0.45 — reject implausibly high EV (model error, not value)
+  marketFilter?: "all" | "1x2" | "goals" | "btts" | "dc" | "safe";
   seed?: number;
 }
 
 export async function getValuePicks(opts: ValueOptions): Promise<ValueResult> {
   const count = Math.max(1, Math.min(70, Math.floor(opts.count) || 5));
   const days = Math.max(1, Math.min(30, Math.floor(opts.days) || 7));
-  const minEdge = opts.minEdge ?? 0.06;
-  const minOdds = opts.minOdds ?? 1.7;
-  const maxOdds = opts.maxOdds ?? 6;
-  // Genuine value edges are modest (5–25% EV). Anything much higher means the
-  // model disagrees with the market so wildly that the MODEL is almost
-  // certainly wrong (common in low-data leagues) — that's noise, not value, so
-  // we reject it rather than headline a fake "+100% EV" pick.
+  const minEdge = opts.minEdge ?? 0.05;
+  const minOdds = opts.minOdds ?? 1.40;
+  const maxOdds = opts.maxOdds ?? 8.0;
   const maxEv = opts.maxEv ?? 0.45;
+  const marketFilter = opts.marketFilter ?? "all";
 
   const now = Date.now();
   const maxT = now + days * 86_400_000;
@@ -315,68 +505,150 @@ export async function getValuePicks(opts: ValueOptions): Promise<ValueResult> {
     getPredictions().catch(() => [] as ExtPrediction[]),
   ]);
 
-  const RESULT = ["1", "X", "2"] as const;
   const scoredVal: ValuePick[] = [];
   let scanned = 0;
+
   for (const ev of fixtures) {
     if (!ev.kickoff || ev.kickoff <= now || ev.kickoff > maxT) continue;
     const tip = findExternalTip(ev, preds);
-    if (!tip?.probs) continue; // need an independent model probability
+    const xg = analyzeEvent(ev);
+    if (!tip?.probs && !xg) continue;
     scanned += 1;
 
-    // Evaluate each 1X2 outcome for a positive edge; keep the best EV.
-    let best: { code: string; odds: number; edge: number; ev: number; modelProb: number } | null = null;
-    for (const code of RESULT) {
-      const odds = ev.outcomes[code];
-      if (!odds || odds < minOdds || odds > maxOdds) continue;
-      const idx = code === "1" ? 0 : code === "X" ? 1 : 2;
-      const modelProb = (tip.probs[idx] ?? 0) / 100;
-      if (modelProb <= 0) continue;
-      // Domain sanity: a true draw probability rarely exceeds ~42%. A model
-      // claiming more is unreliable for this fixture — skip (kills draw-spam
-      // from low-data leagues).
-      if (code === "X" && modelProb > 0.42) continue;
-      const marketProb = devig(ev.outcomes, code);
-      const edge = modelProb - marketProb;
-      const evv = modelProb * odds - 1;
-      if (edge < minEdge || evv <= 0 || evv > maxEv) continue;
-      if (!best || evv > best.ev) best = { code, odds, edge, ev: evv, modelProb };
+    // Build candidate model probabilities across multiple markets
+    const candidates: { code: string; modelProb: number; marketGroup: string }[] = [];
+
+    // 1. 1X2 Probabilities
+    let pHome = tip?.probs ? (tip.probs[0] ?? 0) / 100 : xg ? xg.pHome : 0;
+    let pDraw = tip?.probs ? (tip.probs[1] ?? 0) / 100 : xg ? xg.pDraw : 0;
+    let pAway = tip?.probs ? (tip.probs[2] ?? 0) / 100 : xg ? xg.pAway : 0;
+
+    // Normalise if sum deviates slightly
+    const pSum = pHome + pDraw + pAway;
+    if (pSum > 0) {
+      pHome /= pSum;
+      pDraw /= pSum;
+      pAway /= pSum;
     }
+
+    if (pHome > 0 && pAway > 0) {
+      candidates.push({ code: "1", modelProb: pHome, marketGroup: "1X2" });
+      if (pDraw <= 0.42) candidates.push({ code: "X", modelProb: pDraw, marketGroup: "1X2" });
+      candidates.push({ code: "2", modelProb: pAway, marketGroup: "1X2" });
+
+      // 2. Double Chance
+      candidates.push({ code: "DC1X", modelProb: Math.min(0.96, pHome + pDraw), marketGroup: "Double Chance" });
+      candidates.push({ code: "DC12", modelProb: Math.min(0.96, pHome + pAway), marketGroup: "Double Chance" });
+      candidates.push({ code: "DCX2", modelProb: Math.min(0.96, pDraw + pAway), marketGroup: "Double Chance" });
+
+      // 3. Draw No Bet (DNB)
+      const dnbSum = pHome + pAway;
+      if (dnbSum > 0) {
+        candidates.push({ code: "DNBH", modelProb: Math.min(0.95, pHome / dnbSum), marketGroup: "Draw No Bet" });
+        candidates.push({ code: "DNBA", modelProb: Math.min(0.95, pAway / dnbSum), marketGroup: "Draw No Bet" });
+      }
+    }
+
+    // 4. Over / Under Goals
+    const pO25 = xg ? xg.over25 : undefined;
+    if (pO25 !== undefined && pO25 > 0.05 && pO25 < 0.95) {
+      candidates.push({ code: "O25", modelProb: pO25, marketGroup: "Goals" });
+      candidates.push({ code: "U25", modelProb: 1 - pO25, marketGroup: "Goals" });
+    }
+
+    // 5. Both Teams To Score (BTTS)
+    const pBtts = xg ? xg.btts : undefined;
+    if (pBtts !== undefined && pBtts > 0.05 && pBtts < 0.95) {
+      candidates.push({ code: "BTTSY", modelProb: pBtts, marketGroup: "BTTS" });
+      candidates.push({ code: "BTTSN", modelProb: 1 - pBtts, marketGroup: "BTTS" });
+    }
+
+    // Evaluate each candidate outcome against live SportyBet prices
+    let best: {
+      code: string;
+      odds: number;
+      edge: number;
+      ev: number;
+      modelProb: number;
+      marketGroup: string;
+      kellyPct: number;
+    } | null = null;
+
+    for (const c of candidates) {
+      // Apply market filter if set
+      if (marketFilter === "1x2" && c.marketGroup !== "1X2") continue;
+      if (marketFilter === "goals" && c.marketGroup !== "Goals") continue;
+      if (marketFilter === "btts" && c.marketGroup !== "BTTS") continue;
+      if (marketFilter === "dc" && c.marketGroup !== "Double Chance") continue;
+      if (marketFilter === "safe" && c.marketGroup !== "Double Chance" && c.modelProb < 0.65) continue;
+
+      const odds = ev.outcomes[c.code];
+      if (!odds || odds < minOdds || odds > maxOdds) continue;
+      if (c.modelProb <= 0.15) continue;
+
+      const marketProb = devig(ev.outcomes, c.code);
+      if (marketProb <= 0) continue;
+
+      const edge = c.modelProb - marketProb;
+      const evv = c.modelProb * odds - 1;
+      if (edge < minEdge || evv <= 0 || evv > maxEv) continue;
+
+      // Quarter-Kelly optimal bankroll sizing
+      const b = odds - 1;
+      const kellyRaw = b > 0 ? (b * c.modelProb - (1 - c.modelProb)) / b : 0;
+      const kellyPct = round(Math.max(0, Math.min(0.25, kellyRaw * 0.25)) * 100, 1);
+
+      if (!best || evv > best.ev) {
+        best = {
+          code: c.code,
+          odds,
+          edge,
+          ev: evv,
+          modelProb: c.modelProb,
+          marketGroup: c.marketGroup,
+          kellyPct,
+        };
+      }
+    }
+
     if (!best) continue;
 
     const label = (PICK_LABEL[best.code] ?? (() => best.code))(ev.home, ev.away);
     const reasons = [
-      `${tip.source} model rates this ${Math.round(best.modelProb * 100)}%`,
+      `${tip?.source ? `${tip.source} + ` : ""}Model rates this ${Math.round(best.modelProb * 100)}%`,
       `market prices ${Math.round((1 / best.odds) * 100)}% (odds ${best.odds.toFixed(2)})`,
       `+${Math.round(best.edge * 100)}pt edge · EV +${Math.round(best.ev * 100)}%`,
     ];
-    if (tip.analysis) reasons.push(String(tip.analysis).slice(0, 120));
+    if (best.kellyPct > 0) reasons.push(`Quarter-Kelly stake: ~${best.kellyPct}% bankroll`);
+    if (tip?.analysis) reasons.push(String(tip.analysis).slice(0, 120));
+
     scoredVal.push({
       home: ev.home,
       away: ev.away,
       league: ev.league,
       kickoff: new Date(ev.kickoff).toISOString(),
       pick: label,
-      // Explicit outcome code in the key so booking books THIS pick (the value
-      // outcome), not the market favourite.
       key: `${ev.home}|${ev.away}|${best.code}`.toLowerCase(),
       confidence: round(best.modelProb),
       odds: best.odds.toFixed(2),
       reasons,
       signals: matchInsights(ev, best.code),
-      source: `${tip.source} vs SportyBet`,
-      url: tip.url, // link to the model's own match analysis page
+      source: tip ? `${tip.source} vs SportyBet` : "Poisson xG vs SportyBet",
+      url: tip?.url,
       eventId: ev.eventId,
       pickCode: best.code,
-      market: "1X2",
+      market: marketOf(best.code),
+      marketGroup: best.marketGroup,
       edge: round(best.edge),
       ev: round(best.ev),
       modelProb: round(best.modelProb),
+      kellyPct: best.kellyPct,
     });
   }
 
-  scoredVal.sort((a, b) => b.ev - a.ev); // best expected value first
-  // Light league diversity so it isn't all one competition.
+  scoredVal.sort((a, b) => b.ev - a.ev); // Highest expected value first
+
+  // League diversity cap so a big tournament does not crowd out the entire slate
   const perLeague = new Map<string, number>();
   const cap = Math.max(3, Math.ceil(count / 3));
   const diversified = scoredVal.filter((p) => {
@@ -386,10 +658,70 @@ export async function getValuePicks(opts: ValueOptions): Promise<ValueResult> {
     perLeague.set(lg, n + 1);
     return true;
   });
+
   const pool = diversified.length >= count ? diversified : scoredVal;
-  const band = pool.slice(0, Math.min(pool.length, count + 5));
+  const band = pool.slice(0, Math.min(pool.length, count + 6));
   const off = band.length ? (((opts.seed ?? 0) % band.length) + band.length) % band.length : 0;
   const picks = band.slice(off).concat(band.slice(0, off)).slice(0, count);
+
+  // --- API-Football Intelligence enrichment for Value Picks ---
+  if (intelEnabled() && picks.length > 0) {
+    await Promise.all(
+      picks.slice(0, 5).map(async (p) => {
+        try {
+          // Fetch full intel report
+          const odds = Number(p.odds) || 0;
+          const intel = await getMatchIntel(
+            p.home, p.away, p.league,
+            p.modelProb,
+            p.pickCode === "1" ? odds : 0,
+            p.pickCode === "2" ? odds : 0
+          );
+          
+          p.homeMomentum = intel.homeMomentum ?? undefined;
+          p.awayMomentum = intel.awayMomentum ?? undefined;
+          p.giantKiller = intel.giantKiller ?? undefined;
+          p.trapGame = intel.trapGame ?? undefined;
+          p.intelReport = intel;
+
+          if (intel.homeMomentum) p.signals.push(`${p.home} ${intel.homeMomentum.label} (${intel.homeMomentum.score}/100)`);
+          if (intel.awayMomentum) p.signals.push(`${p.away} ${intel.awayMomentum.label} (${intel.awayMomentum.score}/100)`);
+          if (intel.giantKiller && intel.giantKiller.upsetConfidence >= 30) {
+            p.signals.push(`${intel.giantKiller.label} (${intel.giantKiller.upsetConfidence}%)`);
+          }
+          if (intel.trapGame && intel.trapGame.isTrap) {
+            p.signals.unshift(intel.trapGame.label);
+          }
+        } catch { /* best-effort */ }
+      }),
+    ).catch(() => {});
+  }
+
+  // Attach Bytez AI tactical insights to top recommendations (with intel context)
+  for (let i = 0; i < Math.min(picks.length, 3); i++) {
+    const p = picks[i];
+    try {
+      if (p.intelReport?.aiInsight) {
+        p.aiInsight = p.intelReport.aiInsight;
+      } else {
+        p.aiInsight = await generateMatchValueInsight({
+          home: p.home,
+          away: p.away,
+          pick: p.pick,
+          market: p.market,
+          odds: p.odds ?? "1.80",
+          modelProb: p.modelProb,
+          edge: p.edge,
+          ev: p.ev,
+          signals: p.signals,
+          intelReport: p.intelReport,
+        });
+      }
+    } catch {
+      /* continue */
+    }
+  }
+
   picks.sort((a, b) => new Date(a.kickoff ?? 0).getTime() - new Date(b.kickoff ?? 0).getTime());
   return { picks, requested: count, windowDays: days, scanned };
 }
@@ -413,6 +745,7 @@ export interface ComboLeg {
   key: string; // bookable key (carries the explicit outcome code)
   confidence: number; // 0..1 for this leg
   ev?: number; // value legs only
+  h2h?: any; // H2HDeep
 }
 export interface Combo {
   id: string;
@@ -438,6 +771,7 @@ const asLeg = (p: {
   pickCode?: string;
   confidence: number;
   ev?: number;
+  h2h?: any;
 }): ComboLeg => ({
   home: p.home,
   away: p.away,
@@ -452,6 +786,7 @@ const asLeg = (p: {
   key: p.pickCode ? `${p.home}|${p.away}|${p.pickCode}`.toLowerCase() : p.key,
   confidence: p.confidence,
   ev: p.ev,
+  h2h: (p as any).intelReport?.h2h,
 });
 const comboOdds = (legs: ComboLeg[]) => round(legs.reduce((a, l) => a * (l.odds || 1), 1), 2);
 const comboConf = (legs: ComboLeg[]) =>
@@ -502,21 +837,30 @@ export async function getCombos(seed = 0): Promise<Combo[]> {
     });
   };
 
-  // ---- Banker / safe combos (high hit-rate, short combined odds) ----
+  // ---- 🛡️ Fort Knox (Safe) ----
+  // Built exclusively from the safest picks, prioritizing "Banker Locks".
   const safeP = safe.picks;
-  if (safeP.length >= 3)
-    push("banker3", "Banker Treble", "🏦", "safe", "3 highest-confidence safe picks — the steady one", safeP.slice(0, 3).map(asLeg));
-  if (safeP.length >= 5)
-    push("safe5", "Five-Fold Banker", "🎯", "safe", "5 short-priced picks — bigger combined odds, still high hit-rate", safeP.slice(0, 5).map(asLeg));
+  const bankerLocks = safeP.filter((p) => p.bankerLock && p.bankerLock.tag !== "none");
+  const fortKnoxLegs = [...bankerLocks, ...safeP.filter((p) => !p.bankerLock)].slice(0, 4).map(asLeg);
+  if (fortKnoxLegs.length >= 3)
+    push("banker3", "Fort Knox (Safe)", "🛡️", "safe", "The safest possible accumulator. Prioritizes 'Banker Lock' games with no red flags.", fortKnoxLegs);
 
-  // ---- Value combos (model edge; combined EV compounds) ----
+  // ---- ⚖️ Value Stack (Balanced) ----
+  // Mixes solid value edges.
   const vsorted = [...value.picks].sort((a, b) => b.ev - a.ev);
-  if (vsorted.length >= 2)
-    push("value2", "Value Double", "💎", "value", "The 2 strongest overlays combined", vsorted.slice(0, 2).map(asLeg));
-  if (vsorted.length >= 3)
-    push("value3", "Value Treble", "💎", "value", "Top 3 model-edge picks — higher odds", vsorted.slice(0, 3).map(asLeg));
-  if (vsorted.length >= 5)
-    push("value5", "Value Accumulator", "💎", "value", "5 overlays — high odds, higher variance", vsorted.slice(0, 5).map(asLeg));
+  if (vsorted.length >= 4)
+    push("value4", "Value Stack (Balanced)", "⚖️", "value", "Mathematically optimized 4-leg accumulator using only the highest Expected Value (EV) overlays.", vsorted.slice(0, 4).map(asLeg));
+
+  // ---- 🚀 The Moonshot (High Odds) ----
+  // Combines Giant Killers and high-priced results.
+  const giantKillers = result.picks.filter(p => p.giantKiller && p.giantKiller.upsetConfidence >= 30);
+  const bigResults = result.picks.filter(p => Number(p.odds) >= 2.0 && !p.giantKiller);
+  const moonshotLegs = [...giantKillers, ...bigResults]
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, 5)
+    .map(asLeg);
+  if (moonshotLegs.length >= 3)
+    push("moonshot", "The Moonshot", "🚀", "big", "High risk, massive reward. Built from underdogs (Giant Killers) and high-priced value picks.", moonshotLegs);
 
   // ---- Big-odds combo (bigger payout from higher-priced favourites) ----
   const bigLegs = result.picks
@@ -538,26 +882,8 @@ export async function getCombos(seed = 0): Promise<Combo[]> {
     .filter((p) => Number(p.odds) > 1) // any real price
     .sort((a, b) => b.confidence - a.confidence);
   const usedTargets = new Set<string>();
-  const buildToTarget = (target: number): ComboLeg[] | null => {
-    const legs: ComboLeg[] = [];
-    let prod = 1;
-    for (const p of boostPool) {
-      if (prod >= target) break;
-      if (legs.length >= 50) break; // safe legs are short-priced → allow more
-      legs.push(asLeg(p));
-      prod *= Number(p.odds) || 1;
-    }
-    // Only accept if we genuinely reached the tier and it's a real multi.
-    return prod >= target * 0.85 && legs.length >= 2 ? legs : null;
-  };
-  for (const [target, label] of [
-    [5, "~5×"],
-    [10, "~10×"],
-    [25, "~25×"],
-    [50, "~50×"],
-    [100, "~100×"],
-  ] as [number, string][]) {
-    const legs = buildToTarget(target);
+  for (const target of [5, 10, 25, 50, 100]) {
+    const legs = buildBoosterLegs(boostPool, target);
     if (!legs) continue;
     const key = legs.length + ":" + legs[legs.length - 1].key; // dedupe identical builds
     if (usedTargets.has(key)) continue;
@@ -565,7 +891,7 @@ export async function getCombos(seed = 0): Promise<Combo[]> {
     const wp = comboWinProb(legs);
     push(
       `boost${target}`,
-      `Safe Booster ${label}`,
+      `Safe Booster ~${target}×`,
       "🔥",
       "boost",
       `${legs.length} Double-Chance / safe legs to reach ~${target}× — the safest way to that payout (each leg ~75-90%). Win chance ≈ ${wp !== null ? Math.round(wp * 100) : "?"}% — still a long shot; every leg must land.`,
@@ -574,6 +900,284 @@ export async function getCombos(seed = 0): Promise<Combo[]> {
   }
 
   return combos;
+}
+
+/**
+ * Greedily stack the highest-confidence legs from `pool` (sorted descending)
+ * until the combined odds clear `target`, capped at 50 legs. Returns null if
+ * the pool can't genuinely reach ~85% of the target — never pads a fake
+ * result. Shared by getCombos()'s fixed tiers and getOddsBoosters()'s custom
+ * ones, so both build accumulators the exact same honest way.
+ */
+interface BoosterAttempt {
+  legs: ComboLeg[];
+  reached: number; // combined odds actually stacked, even on failure
+  ok: boolean; // true only if it genuinely reached ~85% of target
+}
+function buildBoosterAttempt(pool: ExpertPick[], target: number): BoosterAttempt {
+  const legs: ComboLeg[] = [];
+  let prod = 1;
+  for (const p of pool) {
+    if (prod >= target) break;
+    if (legs.length >= 50) break; // safe legs are short-priced → allow more
+    legs.push(asLeg(p));
+    prod *= Number(p.odds) || 1;
+  }
+  return { legs, reached: round(prod, 2), ok: prod >= target * 0.85 && legs.length >= 2 };
+}
+function buildBoosterLegs(pool: ExpertPick[], target: number): ComboLeg[] | null {
+  const a = buildBoosterAttempt(pool, target);
+  return a.ok ? a.legs : null;
+}
+
+export interface OddsBoosterOptions {
+  targets?: number[]; // combined-odds tiers to attempt, e.g. [5, 10, 30, 40]
+  days?: number;
+  minConfidence?: number; // per-leg floor on the safe pool; default 0.6
+  seed?: number;
+}
+
+/**
+ * Odds-boosted accumulators at CUSTOM target tiers (used by the Demo Wallet's
+ * auto-generator, which wants specific odds like 5×/10×/30×/40×, not the
+ * fixed tiers getCombos() shows on the Value Combos tab). Same safe-pool +
+ * greedy-stack logic as getCombos()'s boosters — just its own fetch so it can
+ * run independently (e.g. from a button click) without disturbing that tab's
+ * cadence. Each combo's `winProb` is the REAL combined chance every leg
+ * lands — at big odds tiers this is honestly low; no combo of confident legs
+ * can multiply to 30-50× while staying near 90% combined, and this never
+ * pretends otherwise.
+ */
+export interface OddsBoosterAttempt {
+  target: number;
+  ok: boolean; // false = couldn't genuinely reach ~85% of this target today
+  combo: Combo | null;
+  reached: number; // combined odds actually stacked, reported even on failure
+  legsAvailable: number;
+}
+
+/**
+ * Attempts EVERY requested target and reports back on all of them — including
+ * ones that couldn't be reached — so a caller (the Demo Wallet auto-generator)
+ * can tell the user honestly "why" a tier was skipped instead of it silently
+ * vanishing.
+ */
+export async function getOddsBoosters(opts: OddsBoosterOptions = {}): Promise<OddsBoosterAttempt[]> {
+  const targets = opts.targets ?? [5, 10, 25, 50, 100];
+  const days = opts.days ?? 21;
+  const minConfidence = opts.minConfidence ?? 0.6;
+  const seed = opts.seed ?? 0;
+  const boostSafe = await getExpertPicks({ count: 70, days, gameType: "safe", minConfidence, seed });
+  const pool = boostSafe.picks.filter((p) => Number(p.odds) > 1).sort((a, b) => b.confidence - a.confidence);
+  const usedTargets = new Set<string>();
+  const attempts: OddsBoosterAttempt[] = [];
+  for (const target of [...targets].sort((a, b) => a - b)) {
+    const built = buildBoosterAttempt(pool, target);
+    const dedupeKey = built.legs.length ? `${built.legs.length}:${built.legs[built.legs.length - 1].key}` : "";
+    if (!built.ok || (dedupeKey && usedTargets.has(dedupeKey))) {
+      attempts.push({ target, ok: false, combo: null, reached: built.reached, legsAvailable: built.legs.length });
+      continue;
+    }
+    usedTargets.add(dedupeKey);
+    const wp = comboWinProb(built.legs);
+    attempts.push({
+      target,
+      ok: true,
+      reached: built.reached,
+      legsAvailable: built.legs.length,
+      combo: {
+        id: `boost${target}`,
+        title: `Safe Booster ~${target}×`,
+        emoji: "🔥",
+        kind: "boost",
+        note: `${built.legs.length} Double-Chance / safe legs to reach ~${target}× — each leg ~75-90%. Win chance ≈ ${wp !== null ? Math.round(wp * 100) : "?"}% — still a long shot; every leg must land.`,
+        legs: built.legs,
+        combinedOdds: comboOdds(built.legs),
+        avgConfidence: comboConf(built.legs),
+        totalEv: null,
+        winProb: wp,
+      },
+    });
+  }
+  return attempts;
+}
+
+// =====================================================================
+// ANALYST SLIP — a genuine cross-market read, not a Double-Chance reflex
+// =====================================================================
+// The old auto-generator only ever drew from the "safe" Double-Chance pool,
+// so its slips were structurally "Home or Draw" on nearly every leg — a
+// mechanical stack, not analysis. This builds each leg from WHICHEVER market
+// (result, Double Chance, Over/Under, BTTS, or a genuine value overlay) is
+// actually strongest for THAT fixture — the same judgment call a scout makes
+// match-by-match — and carries the real reasoning (market price, recent-form
+// read, signal agreement) into the leg so the user can see WHY, not just what.
+
+export interface AnalystLeg {
+  home: string;
+  away: string;
+  league?: string;
+  kickoff?: string;
+  market?: string;
+  pick: string;
+  odds: number;
+  confidence: number; // 0..1, form-aware where data allows
+  key: string; // bookable "home|away|CODE"
+  eventId?: string;
+  reasons: string[]; // the analyst's actual reasoning for this leg
+}
+
+export interface AnalystSlipOptions {
+  numGames?: number; // desired leg count, 2..50
+  minOdds?: number; // desired combined-odds floor
+  maxOdds?: number; // desired combined-odds ceiling
+  days?: number;
+  seed?: number;
+}
+
+export interface AnalystSlipResult {
+  legs: AnalystLeg[];
+  totalOdds: number;
+  combinedChance: number | null; // real ∏ of each leg's confidence
+  requested: { numGames?: number; minOdds?: number; maxOdds?: number };
+  note: string; // honest summary of how well the request was met
+}
+
+/** One candidate per fixture: whichever market genuinely reads strongest —
+ *  not a fixed market family — built from a wide, form-aware cross-market
+ *  scan (result / goals / BTTS / safe / value), each already refined against
+ *  real recent form where the data supports it. */
+async function analystCandidatePool(days: number, seed: number): Promise<ExpertPick[]> {
+  const [result, goals, btts, safe, value] = await Promise.all([
+    getExpertPicks({ count: 70, days, gameType: "result", minConfidence: 0.5, seed }).catch(() => ({ picks: [] as ExpertPick[] })),
+    getExpertPicks({ count: 70, days, gameType: "goals", minConfidence: 0.5, seed }).catch(() => ({ picks: [] as ExpertPick[] })),
+    getExpertPicks({ count: 70, days, gameType: "btts", minConfidence: 0.5, seed }).catch(() => ({ picks: [] as ExpertPick[] })),
+    getExpertPicks({ count: 70, days, gameType: "safe", minConfidence: 0.5, seed }).catch(() => ({ picks: [] as ExpertPick[] })),
+    getValuePicks({ count: 30, days: Math.max(days, 7), seed }).catch(() => ({ picks: [] as ValuePick[] })),
+  ]);
+  const byFixture = new Map<string, ExpertPick>();
+  for (const p of [...result.picks, ...goals.picks, ...btts.picks, ...safe.picks, ...value.picks]) {
+    const cur = byFixture.get(p.key);
+    // Whichever market has the higher (form-aware) confidence wins the
+    // fixture — the genuine "which cover is safest here" judgment call,
+    // rather than always defaulting to one market family.
+    if (!cur || p.confidence > cur.confidence) byFixture.set(p.key, p);
+  }
+  return [...byFixture.values()].sort((a, b) => b.confidence - a.confidence);
+}
+
+function toAnalystLeg(p: ExpertPick): AnalystLeg {
+  return {
+    home: p.home,
+    away: p.away,
+    league: p.league,
+    kickoff: p.kickoff,
+    market: p.market,
+    pick: p.pick,
+    odds: Number(p.odds) || 0,
+    confidence: p.confidence,
+    key: p.pickCode ? `${p.home}|${p.away}|${p.pickCode}`.toLowerCase() : p.key,
+    eventId: p.eventId,
+    // Full analyst commentary: the market/form reasoning PLUS the supporting
+    // market-read signals (goals lean, safest cover) — real analysis, not
+    // just the one-line "market odds X%" that made every leg read the same.
+    reasons: [...p.reasons, ...p.signals],
+  };
+}
+
+const combinedOddsOf = (legs: AnalystLeg[]) => round(legs.reduce((a, l) => a * (l.odds || 1), 1), 2);
+const combinedChanceOf = (legs: AnalystLeg[]) =>
+  legs.length ? round(legs.reduce((a, l) => a * l.confidence, 1)) : null;
+
+/**
+ * Build ONE tailored accumulator to the user's actual brief — a leg count
+ * and/or an odds range — from the cross-market, form-aware candidate pool.
+ * Never pads with weak legs to hit a number, and never fabricates a target
+ * it can't reach: `note` says plainly when the brief couldn't be fully met
+ * and what was achieved instead.
+ */
+export async function buildAnalystSlip(opts: AnalystSlipOptions = {}): Promise<AnalystSlipResult> {
+  const days = opts.days ?? 7;
+  const seed = opts.seed ?? Math.floor(Date.now() / (8 * 60_000));
+  const numGames = opts.numGames ? Math.max(2, Math.min(50, Math.floor(opts.numGames))) : undefined;
+  const minOdds = opts.minOdds && opts.minOdds > 1 ? opts.minOdds : undefined;
+  const maxOdds = opts.maxOdds && opts.maxOdds > 1 ? opts.maxOdds : undefined;
+  const requested = { numGames, minOdds, maxOdds };
+
+  const pool = await analystCandidatePool(days, seed);
+  if (!pool.length) return { legs: [], totalOdds: 1, combinedChance: null, requested, note: "No qualifying matches are live right now — try again shortly." };
+
+  let legs: AnalystLeg[];
+  let note: string;
+
+  if (numGames) {
+    // Start with the numGames strongest reads, then nudge toward the odds
+    // range (if given) by swapping the marginal leg for a pool candidate that
+    // moves total odds the right direction — never changing the leg COUNT
+    // the user asked for.
+    legs = pool.slice(0, numGames).map(toAnalystLeg);
+    const used = new Set(legs.map((l) => l.key));
+    if ((minOdds || maxOdds) && pool.length > numGames) {
+      const rest = pool.slice(numGames).map(toAnalystLeg);
+      let guard = 0;
+      while (guard++ < 200) {
+        const total = combinedOddsOf(legs);
+        const tooLow = minOdds !== undefined && total < minOdds;
+        const tooHigh = maxOdds !== undefined && total > maxOdds;
+        if (!tooLow && !tooHigh) break;
+        // Swap the leg contributing least toward the needed direction for the
+        // best available replacement that helps, keeping confidence as high
+        // as possible among candidates that actually move things the right way.
+        let swapped = false;
+        for (let i = legs.length - 1; i >= 0 && !swapped; i--) {
+          const candidate = rest.find((r) => {
+            if (used.has(r.key)) return false;
+            const projected = (total / (legs[i].odds || 1)) * (r.odds || 1);
+            return tooLow ? projected > total : projected < total;
+          });
+          if (!candidate) continue;
+          used.delete(legs[i].key);
+          used.add(candidate.key);
+          legs[i] = candidate;
+          swapped = true;
+        }
+        if (!swapped) break; // pool exhausted — report honestly below
+      }
+    }
+    const total = combinedOddsOf(legs);
+    const metRange = (!minOdds || total >= minOdds * 0.9) && (!maxOdds || total <= maxOdds * 1.15);
+    note = metRange
+      ? `${legs.length} legs, exactly as requested.`
+      : `${legs.length} legs as requested, but today's live matches land the combined odds at ${total} — ${
+          minOdds && total < minOdds
+            ? `not enough strong candidates to reach ${minOdds}× at this leg count. Try more games or a lower target.`
+            : `couldn't trim below ${maxOdds}× at this leg count without weak legs. Try fewer games or a higher target.`
+        }`;
+  } else if (minOdds || maxOdds) {
+    // No fixed leg count — stack the strongest reads until inside the range.
+    const target = maxOdds ?? minOdds!;
+    const built: AnalystLeg[] = [];
+    let total = 1;
+    for (const p of pool) {
+      if (minOdds === undefined && total >= target) break;
+      if (maxOdds !== undefined && total * (Number(p.odds) || 1) > maxOdds && built.length >= 2) continue;
+      built.push(toAnalystLeg(p));
+      total *= Number(p.odds) || 1;
+      if (built.length >= 50) break;
+      if (minOdds !== undefined && total >= minOdds) break;
+    }
+    legs = built;
+    const reachedMin = minOdds === undefined || total >= minOdds * 0.85;
+    note = reachedMin
+      ? `${legs.length} legs to hit your odds target.`
+      : `Best reachable today is ${round(total, 2)}× with ${legs.length} legs (fewer strong matches than usual) — short of your ${minOdds}× target.`;
+  } else {
+    // No brief given — a sensible, genuinely analyst-picked default.
+    legs = pool.slice(0, 5).map(toAnalystLeg);
+    note = `5 of today's strongest cross-market reads (no target given).`;
+  }
+
+  return { legs, totalOdds: combinedOddsOf(legs), combinedChance: combinedChanceOf(legs), requested, note };
 }
 
 // =====================================================================
@@ -633,8 +1237,9 @@ export async function logExpertPicks(): Promise<number> {
   return logged;
 }
 
-/** Did this pick win, given a "H:A" final score? null = void/unknown. */
-function settlePick(pickCode: string, score: string): boolean | null {
+/** Did this pick win, given a "H:A" final score? null = void/unknown.
+ *  Exported for the demo-bet simulator, which settles the same pick codes. */
+export function settlePick(pickCode: string, score: string): boolean | null {
   const m = score.match(/(\d+)\s*:\s*(\d+)/);
   if (!m) return null;
   const h = Number(m[1]);
@@ -647,6 +1252,10 @@ function settlePick(pickCode: string, score: string): boolean | null {
       return h === a;
     case "2":
       return h < a;
+    case "O05":
+      return total >= 1;
+    case "U05":
+      return total === 0;
     case "O15":
       return total >= 2;
     case "O25":
@@ -694,7 +1303,7 @@ function settlePick(pickCode: string, score: string): boolean | null {
   }
 }
 
-async function fetchEventScore(
+export async function fetchEventScore(
   eventId: string,
 ): Promise<{ ended: boolean; score?: string } | null> {
   const controller = new AbortController();

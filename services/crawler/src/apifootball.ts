@@ -163,6 +163,92 @@ async function predictionFor(fx: AfFixture): Promise<ExtPrediction | null> {
   return result;
 }
 
+// ---- Head-to-head (dedicated /fixtures/headtohead endpoint) ----
+// API-Football's H2H coverage is far deeper than free sources — including
+// small leagues — so when a key is set, this is the primary H2H source.
+// (Local name matcher — not imported from forebet-ai, to avoid a module cycle.)
+
+const afNorm = (s: string) =>
+  s
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9 ]/g, " ")
+    .replace(/\b(fc|fk|sk|cf|sc|ac|afc|cd|if|bk|club|de)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+function afNamesMatch(a: string, b: string): boolean {
+  const na = afNorm(a);
+  const nb = afNorm(b);
+  if (!na || !nb) return false;
+  if (na === nb || na.includes(nb) || nb.includes(na)) return true;
+  const ta = new Set(na.split(" ").filter((t) => t.length >= 4));
+  return nb.split(" ").some((t) => t.length >= 4 && ta.has(t));
+}
+
+const afTeamCache = new Map<string, { at: number; id: number | null }>();
+const AF_TEAM_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Resolve a team name to API-Football's team id.
+ *  null = confirmed unknown; "err" = API/budget failure (inconclusive). */
+async function afTeamId(name: string): Promise<number | null | "err"> {
+  const key = afNorm(name);
+  const hit = afTeamCache.get(key);
+  if (hit && Date.now() - hit.at < AF_TEAM_TTL_MS) return hit.id;
+  const json = await apiGet(`/teams?search=${encodeURIComponent(name.slice(0, 60))}`);
+  if (!json) return "err";
+  const rows: any[] = json.response ?? [];
+  const exact = rows.find((r) => afNorm(String(r?.team?.name ?? "")) === key);
+  const fuzzy = rows.find((r) => afNamesMatch(String(r?.team?.name ?? ""), name));
+  const id = Number((exact ?? fuzzy)?.team?.id) || null;
+  afTeamCache.set(key, { at: Date.now(), id });
+  return id;
+}
+
+export interface AfMeeting {
+  date: string; // "2026-03-07"
+  home: string;
+  away: string;
+  homeScore: number;
+  awayScore: number;
+}
+
+/**
+ * Last finished meetings between two clubs (newest first, ≤10), with real
+ * final scores. Returns null when the adapter is off / out of budget / errors
+ * (inconclusive — caller should fall back), or [] when API-Football genuinely
+ * has no recorded meetings.
+ */
+export async function getAfHeadToHead(homeName: string, awayName: string): Promise<AfMeeting[] | null> {
+  if (!apiFootballEnabled()) return null;
+  const h = await afTeamId(homeName);
+  if (h === "err") return null;
+  const a = await afTeamId(awayName);
+  if (a === "err") return null;
+  if (h === null || a === null) return [];
+  const json = await apiGet(`/fixtures/headtohead?h2h=${h}-${a}&last=10`);
+  if (!json) return null;
+  const out: AfMeeting[] = [];
+  for (const r of json.response ?? []) {
+    const st = String(r?.fixture?.status?.short ?? "");
+    if (!["FT", "AET", "PEN"].includes(st)) continue; // finished matches only
+    const gh = r?.goals?.home;
+    const ga = r?.goals?.away;
+    if (gh === null || gh === undefined || ga === null || ga === undefined) continue;
+    if (!r?.teams?.home?.name || !r?.teams?.away?.name) continue;
+    out.push({
+      date: String(r?.fixture?.date ?? "").slice(0, 10),
+      home: String(r.teams.home.name),
+      away: String(r.teams.away.name),
+      homeScore: Number(gh),
+      awayScore: Number(ga),
+    });
+  }
+  out.sort((x, y) => (y.date > x.date ? 1 : y.date < x.date ? -1 : 0));
+  return out.slice(0, 10);
+}
+
 let feedCache: { at: number; data: ExtPrediction[] } | null = null;
 const FEED_TTL_MS = 150 * 1000;
 
