@@ -4,6 +4,6 @@
     "dockerfilePath": "services/crawler/Dockerfile"
   },
   "deploy": {
-    "preDeployCommand": ["cd packages/db && pnpm exec prisma migrate deploy && pnpm exec tsx prisma/seed.ts"]
+    "preDeployCommand": ["cd packages/db && pnpm exec prisma migrate deploy"]
   }
 }
