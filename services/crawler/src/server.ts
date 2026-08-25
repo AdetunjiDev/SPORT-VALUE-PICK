@@ -6271,10 +6271,13 @@ export function startServer() {
     }
   });
 
-  server.listen(config.port, () => {
-    console.log(`Dashboard:  http://localhost:${config.port}`);
-    console.log(`Health:     http://localhost:${config.port}/health`);
-    console.log(`JSON API:   http://localhost:${config.port}/api/codes`);
+  return new Promise<typeof server>((resolve, reject) => {
+    server.listen(config.port, () => {
+      console.log(`Dashboard:  http://localhost:${config.port}`);
+      console.log(`Health:     http://localhost:${config.port}/health`);
+      console.log(`JSON API:   http://localhost:${config.port}/api/codes`);
+      resolve(server);
+    });
+    server.on("error", reject);
   });
-  return server;
 }
