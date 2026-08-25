@@ -14,33 +14,37 @@ process.on("unhandledRejection", (reason) => {
   console.error("[unhandledRejection] Non-fatal rejection caught, continuing:", reason);
 });
 
-let server: Awaited<ReturnType<typeof startServer>> | undefined;
+let server: ReturnType<typeof startServer> | undefined;
 
-async function bootstrap() {
+function bootstrap() {
   // Ensure the database schema is up to date before anything tries to use
   // it (e.g. the scheduler querying the `sources` table). This runs once
   // on startup, applying any pending migrations.
-  const migrated = await runMigrations();
-  if (!migrated) {
-    console.warn(
-      "[bootstrap] Database migrations status unknown — starting server in read-only mode. Crawler scheduler disabled until DB is initialized.",
-    );
-  }
-
-  server = await startServer();
-  
-  // Only start the scheduler if we're confident the database schema exists
-  if (migrated) {
-    startScheduler();
-  } else {
-    console.warn("[bootstrap] Scheduler not started — database schema may not be initialized.");
-  }
+  runMigrations().then(migrated => {
+    if (!migrated) {
+      console.warn(
+        "[bootstrap] Database migrations status unknown — starting server in read-only mode. Crawler scheduler disabled until DB is initialized.",
+      );
+    }
+    
+    server = startServer();
+    
+    // Only start the scheduler if we're confident the database schema exists
+    if (migrated) {
+      // Give server time to bind before starting scheduler
+      setTimeout(() => {
+        startScheduler();
+      }, 500);
+    } else {
+      console.warn("[bootstrap] Scheduler not started — database schema may not be initialized.");
+    }
+  }).catch((err) => {
+    console.error("[bootstrap] Fatal error during startup:", err?.message ?? err);
+    process.exit(1);
+  });
 }
 
-bootstrap().catch((err) => {
-  console.error("[bootstrap] Fatal error during startup:", err?.message ?? err);
-  process.exit(1);
-});
+bootstrap();
 
 async function shutdown() {
   console.log("\nShutting down…");
