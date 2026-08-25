@@ -14,7 +14,7 @@ process.on("unhandledRejection", (reason) => {
   console.error("[unhandledRejection] Non-fatal rejection caught, continuing:", reason);
 });
 
-let server: ReturnType<typeof startServer> | undefined;
+let server: Awaited<ReturnType<typeof startServer>> | undefined;
 
 async function bootstrap() {
   // Ensure the database schema is up to date before anything tries to use
@@ -27,7 +27,7 @@ async function bootstrap() {
     );
   }
 
-  server = startServer();
+  server = await startServer();
   
   // Only start the scheduler if we're confident the database schema exists
   if (migrated) {
