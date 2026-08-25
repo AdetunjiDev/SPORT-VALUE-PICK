@@ -807,7 +807,7 @@ export async function getMatchIntel(
   homeOdds?: number,
   awayOdds?: number,
 ): Promise<MatchIntelReport> {
-  const [homeMom, awayMom, h2h, homeStd, awayStd, homeInj, awayInj] = await Promise.all([
+  let [homeMom, awayMom, h2h, homeStd, awayStd, homeInj, awayInj] = await Promise.all([
     getTeamMomentum(home).catch(() => null),
     getTeamMomentum(away).catch(() => null),
     getH2HDeep(home, away).catch(() => null),
