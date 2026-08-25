@@ -5,11 +5,11 @@ import { runMigrations } from "./runMigrations.js";
 
 console.log("SportyBet AI · Crawler v1 starting…");
 
-// Keep the process alive even if an external service (Telegram, OCR, etc.)
-// throws an unhandled error — log it and continue.
 process.on("uncaughtException", (err) => {
-  console.error("[uncaughtException] Non-fatal error caught, continuing:", err?.message ?? err);
+  console.error("[uncaughtException] FATAL:", err?.message ?? err);
+  process.exit(1);
 });
+
 process.on("unhandledRejection", (reason) => {
   console.error("[unhandledRejection] Non-fatal rejection caught, continuing:", reason);
 });
@@ -22,13 +22,19 @@ async function bootstrap() {
   // on startup, applying any pending migrations.
   const migrated = await runMigrations();
   if (!migrated) {
-    console.error(
-      "[bootstrap] Database migrations failed — continuing startup, but queries may fail until this is resolved.",
+    console.warn(
+      "[bootstrap] Database migrations status unknown — starting server in read-only mode. Crawler scheduler disabled until DB is initialized.",
     );
   }
 
   server = startServer();
-  startScheduler();
+  
+  // Only start the scheduler if we're confident the database schema exists
+  if (migrated) {
+    startScheduler();
+  } else {
+    console.warn("[bootstrap] Scheduler not started — database schema may not be initialized.");
+  }
 }
 
 bootstrap().catch((err) => {
@@ -44,6 +50,6 @@ async function shutdown() {
   process.exit(0);
 }
 
-process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
