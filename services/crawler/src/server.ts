@@ -837,8 +837,20 @@ async function renderDashboard(
   // Hide INVALID codes everywhere — they're confirmed junk (wrong bookmaker,
   // promos, or expired), so users only ever see real, usable codes.
   const notInvalid = { status: { not: "INVALID" as const } };
-  const [codes, totalCodes, sourceCount, lastRuns, aiSlips, activeCount, dateRows] =
-    await Promise.all([
+  
+  let codes: any[] = [];
+  let totalCodes = 0;
+  let sourceCount = 0;
+  let lastRuns: any[] = [];
+  let aiSlips: any[] = [];
+  let activeCount = 0;
+  let dateRows: any[] = [];
+  let tgChannels = 0;
+
+  // Try to fetch database data; if tables don't exist, use defaults
+  try {
+    [codes, totalCodes, sourceCount, lastRuns, aiSlips, activeCount, dateRows] =
+      await Promise.all([
       prisma.humanCode.findMany({
         where: { ...codeWhere, ...notInvalid },
         orderBy: { foundAt: "desc" },
@@ -853,12 +865,21 @@ async function renderDashboard(
       prisma.$queryRaw<{ d: string; n: number }[]>`
         SELECT to_char("foundAt" AT TIME ZONE 'Africa/Lagos', 'YYYY-MM-DD') AS d, count(*)::int AS n
         FROM human_codes WHERE status <> 'INVALID' GROUP BY 1 ORDER BY 1 DESC LIMIT 14`,
-    ]);
+      ]);
+    
+    // Also fetch telegram channels safely
+    tgChannels = await prisma.source.count({ where: { enabled: true, type: "TELEGRAM" } });
+  } catch (dbErr: any) {
+    console.warn(
+      "[server] Database tables not initialized (normal during first startup):",
+      dbErr?.message?.split("\n")[0] ?? dbErr
+    );
+    // Continue with empty defaults - the dashboard will show no codes until migrations run
+  }
 
   // Telegram data-source status: are we reading via the OFFICIAL API or the
   // public web-preview scrape? Surfaced on the dashboard so it's visible.
   const tgApiLive = telegramClientEnabled();
-  const tgChannels = await prisma.source.count({ where: { enabled: true, type: "TELEGRAM" } });
 
   // Feature the latest ACTIVE code in the hero — never an INVALID/expired one.
   const latest = codes.find((c) => c.status === "ACTIVE") ?? codes[0];
