@@ -65,6 +65,9 @@ services:
     environment:
       # Override host-oriented values from .env with in-network service names.
       DATABASE_URL: postgresql://${POSTGRES_USER:-sportybet}:${POSTGRES_PASSWORD:-sportybet_dev_pw}@postgres:5432/${POSTGRES_DB:-sportybet}?schema=public
+      # Prisma needs a non-pooled connection for migrations. Against local
+      # Postgres there is no pooler, so it is the same URL.
+      DIRECT_URL: postgresql://${POSTGRES_USER:-sportybet}:${POSTGRES_PASSWORD:-sportybet_dev_pw}@postgres:5432/${POSTGRES_DB:-sportybet}?schema=public
       REDIS_URL: redis://redis:6379
       CRAWLER_PORT: "4100"
       DEFAULT_CRAWL_INTERVAL_SEC: "180"

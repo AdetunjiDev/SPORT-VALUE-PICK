@@ -11,8 +11,14 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  // Runtime connection. On Supabase this is the TRANSACTION pooler (port 6543)
+  // with ?pgbouncer=true&connection_limit=1. Locally it is plain Postgres.
+  url       = env("DATABASE_URL")
+  // Migrations and introspection cannot run through a transaction pooler.
+  // On Supabase this is the SESSION pooler (port 5432). Locally it is the
+  // same value as DATABASE_URL.
+  directUrl = env("DIRECT_URL")
 }
 
 // =====================================================
