@@ -25,12 +25,23 @@
   command = """
     pnpm install --frozen-lockfile && \
     pnpm --filter @sportybet/db generate && \
+    echo '--- verifying externals are visible at the repo root ---' && \
+    for p in @prisma/client .prisma/client telegram; do \
+      test -e "node_modules/$p" \
+        || { echo "BUILD ABORTED: node_modules/$p is missing. Netlify cannot ship an external package it cannot find at the repo root, and the function would crash at runtime with ERR_MODULE_NOT_FOUND. Check that .npmrc still sets node-linker=hoisted."; exit 1; }; \
+      echo "  ok  node_modules/$p"; \
+    done && \
+    test -n "$(find node_modules/.prisma/client -name 'libquery_engine-rhel*' -print -quit 2>/dev/null)" \
+      || { echo "BUILD ABORTED: the rhel-openssl-3.0.x Prisma engine was not generated. Netlify runs on Amazon Linux; without it every query fails on cold start. Check binaryTargets in packages/db/prisma/schema.prisma."; exit 1; } && \
+    echo '  ok  rhel prisma engine present' && \
     npx --yes esbuild@0.24.2 netlify/src/app.mts netlify/src/crawl.mts \
       --bundle --platform=node --format=esm --target=node20 \
       --outdir=netlify/functions --out-extension:.js=.mjs \
       --external:@prisma/client --external:.prisma \
       --external:telegram --external:node-tesseract-ocr \
       --banner:js="import{createRequire as __cr}from'module';const require=__cr(import.meta.url);" && \
+    grep -q '@sportybet/' netlify/functions/app.mjs \
+      && { echo "BUILD ABORTED: a bare @sportybet import survived bundling; it will not resolve at runtime."; exit 1; } || true && \
     mkdir -p public && echo 'ok' > public/index.html
   """
   publish = "public"
