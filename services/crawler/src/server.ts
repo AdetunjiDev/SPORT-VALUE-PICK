@@ -817,7 +817,6 @@ async function renderDashboard(
     ? await prisma.savedPick.findMany({ where: { userId }, orderBy: { createdAt: "desc" }, take: 8 }).catch(() => [])
     : [];
   const isPremium = tier === "premium";
-  const freshCut = Date.now() - config.freeDelayMin * 60_000;
 
   // Date filter. Default view = TODAY (current codes); "all" shows everything;
   // a YYYY-MM-DD shows that WAT calendar day.
@@ -867,7 +866,10 @@ async function renderDashboard(
   const lastRunIso = lastRunAt ? new Date(lastRunAt).toISOString() : "";
 
   // ---- Hero (latest code) ----
-  const latestLocked = latest ? !isPremium && new Date(latest.foundAt).getTime() > freshCut : false;
+  // The hero shows the newest code, which is rank 0 in the table below, so it
+  // is covered by the free allowance and must agree with it — showing a
+  // padlock here while the same code sits unlocked one row down reads as a bug.
+  const latestLocked = latest ? !isPremium && config.freeCodeAllowance < 1 : false;
   const heroCard = latest
     ? `
     <div class="hero" id="hero3d">
@@ -993,9 +995,13 @@ async function renderDashboard(
   // ---- Human codes table ----
   const rows = codes
     .map((c, i) => {
-      const locked = !isPremium && new Date(c.foundAt).getTime() > freshCut;
+      // Free users read the newest `freeCodeAllowance` codes in this list in
+      // full, whatever their age — that is the free allowance. Past it, the
+      // code is locked. Rows are already newest-first, so the index is the
+      // rank. Premium is never locked.
+      const locked = !isPremium && i >= config.freeCodeAllowance;
       const codeCell = locked
-        ? `<a class="lock" href="/upgrade" title="Fresh code — upgrade to unlock">🔒 Premium</a>`
+        ? `<a class="lock" href="/upgrade" title="Free allowance used — upgrade to unlock every code">🔒 Premium</a>`
         : `<span class="ccopy" title="Click to copy" onclick="cp(this,'${esc(c.code)}')">${esc(c.code)}</span>`;
       // Per-code actions: 🎮 simulate it with demo money, ✏️ open its games in
       // AI Analysis (original picks pre-ticked) to fix and regenerate. Only
@@ -4126,7 +4132,7 @@ async function renderDashboard(
       ${
         isPremium
           ? ""
-          : `<div class="upsell"><div class="grow"><b>Standard tier execution active.</b><br/>Execution is subject to a ${config.freeDelayMin}-minute latency protocol. Institutional clients receive zero-latency execution codes and proprietary predictive models.</div><a class="btn gold" href="/upgrade">⭐ Authorize 24-Hour Terminal Access</a></div>`
+          : `<div class="upsell"><div class="grow"><b>Free tier active.</b><br/>You can open the ${config.freeCodeAllowance} newest codes in any view — everything past that is locked. Premium unlocks every code, plus proprietary predictive models.</div><a class="btn gold" href="/upgrade">⭐ Authorize 24-Hour Terminal Access</a></div>`
       }
       <div class="kpis">${kpis}</div>
       ${body}
@@ -5182,7 +5188,7 @@ function renderUpgrade(
     return `<div class="plan${pop ? " pop" : ""}">
       <h3>${p.label}</h3><div class="price">${fmtNgn(p.ngn)}<small>${per}</small></div>
       <ul>
-        <li><b>Instant</b> fresh codes — no ${config.freeDelayMin}-min delay</li>
+        <li><b>Every</b> code unlocked — not just the newest ${config.freeCodeAllowance}</li>
         <li>All AI slips with <b>booking codes</b></li>
         <li>Expert, Value &amp; Combo picks unlocked</li>
         <li>${note}</li>
@@ -5243,7 +5249,7 @@ function renderUpgrade(
 </style></head><body><div class="wrap">
   <a href="/">← Back to dashboard</a>
   <h1 style="margin-top:14px">Go Premium — instant codes, zero delay 👑</h1>
-  <div class="lead">Standard tier execution is subject to a ${config.freeDelayMin}-minute latency protocol. Institutional clients receive zero-latency execution codes and proprietary predictive models. Pay once securely via institutional partners — no auto-renewal.</div>
+  <div class="lead">Free accounts can open the ${config.freeCodeAllowance} newest codes in any view. Institutional clients unlock every code plus proprietary predictive models. Pay once securely via institutional partners — no auto-renewal.</div>
   ${
     opts.premiumUntil
       ? `<div class="demo" style="border-color:rgba(52,211,153,.4);margin:0 0 20px"><b style="color:#0f8a52">✓ Premium active</b>

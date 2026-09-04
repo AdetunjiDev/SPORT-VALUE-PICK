@@ -30,6 +30,17 @@ export const config = {
   // --- Monetization ---
   premiumKey: process.env.PREMIUM_ACCESS_KEY ?? "vip2026", // demo/testing unlock only
   freeDelayMin: Number(process.env.FREE_CODE_DELAY_MIN ?? 20), // free tier sees codes this many min late
+  // How many codes a free user can read in full, counted from the newest in
+  // whatever list they are looking at. These are unlocked regardless of
+  // freeDelayMin, so the dashboard always shows real codes instead of a wall
+  // of padlocks; everything past the allowance stays locked behind /upgrade.
+  // Guard the parse: a typo'd value would make Number() return NaN, and every
+  // `rank >= NaN` comparison is false, so NOTHING would ever lock and the
+  // whole archive would be free. Fall back to the default instead.
+  freeCodeAllowance: (() => {
+    const n = Number(process.env.FREE_CODE_ALLOWANCE ?? 20);
+    return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 20;
+  })(),
   // Default tier when no premium cookie is present. Set to "premium" locally so
   // the owner isn't paywalled while developing; leave unset (→ free) in prod.
   defaultTier: process.env.DEFAULT_TIER === "premium" ? "premium" : "free",
