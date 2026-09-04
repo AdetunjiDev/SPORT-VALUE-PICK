@@ -1,10 +1,10 @@
 // =====================================================================
- // Netlify runtime bootstrap helpers.
- //
- // Call preparePrismaEnv() at the start of every function invocation,
- // before any Prisma query. The engine binary is staged next to the
- // function under node_modules/.prisma/client during the Netlify build.
- // =====================================================================
+// Netlify runtime bootstrap helpers.
+//
+// Call preparePrismaEnv() at the start of every function invocation,
+// before any Prisma query. The engine binary is staged next to the
+// function during the Netlify build.
+// =====================================================================
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,9 +19,11 @@ export function preparePrismaEnv(): void {
   // When bundled into netlify/functions/app.mjs, import.meta.url is that file.
   const here = dirname(fileURLToPath(import.meta.url));
   const candidates = [
+    join(here, RHEL_ENGINE),
     join(here, "node_modules", ".prisma", "client", RHEL_ENGINE),
+    join(process.cwd(), "netlify", "functions", RHEL_ENGINE),
     join(process.cwd(), "netlify", "functions", "node_modules", ".prisma", "client", RHEL_ENGINE),
-    join(process.cwd(), "node_modules", ".prisma", "client", RHEL_ENGINE),
+    join(process.cwd(), "packages", "db", "generated", "client", RHEL_ENGINE),
   ];
 
   for (const p of candidates) {

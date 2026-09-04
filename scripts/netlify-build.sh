@@ -2,17 +2,15 @@
 # =====================================================================
 # Netlify build for Sporty Value Pick AI.
 #
-# Produces:
-#   netlify/functions/app.mjs
-#   netlify/functions/crawl.mjs
-#   netlify/functions/node_modules/@prisma/client/**
-#   netlify/functions/node_modules/.prisma/client/**  (generated + rhel engine)
-#
-# node_bundler = "none" so Netlify does not re-bundle and replace our
-# generated Prisma client with an uninitialized stub. telegram is bundled
-# into the handlers so it cannot fail with ERR_MODULE_NOT_FOUND.
+# Prisma generates to packages/db/generated/client (see schema.prisma
+# `output`), which is stable under pnpm. We then stage that client next to
+# the bundled functions as node_modules/.prisma/client so runtime resolution
+# and PRISMA_QUERY_ENGINE_LIBRARY both work.
 # =====================================================================
 set -euo pipefail
+
+GENERATED="packages/db/generated/client"
+RHEL_ENGINE="libquery_engine-rhel-openssl-3.0.x.so.node"
 
 run_pnpm() {
   if command -v pnpm >/dev/null 2>&1; then
@@ -23,8 +21,9 @@ run_pnpm() {
 }
 
 echo '--- node_modules layout guard ---'
-if [ -d node_modules ] && [ ! -d node_modules/@prisma/client ]; then
-  echo '  cached node_modules predates node-linker=hoisted (no @prisma/client at root) - removing it'
+if [ -d node_modules ] && [ ! -e node_modules/.prisma ] && [ ! -d node_modules/@prisma/client ] \
+   && [ -d node_modules/.pnpm ]; then
+  echo '  cached node_modules looks like a stale pnpm layout - removing it'
   rm -rf node_modules packages/*/node_modules services/*/node_modules
 else
   echo '  layout ok or no cache present'
@@ -35,60 +34,36 @@ run_pnpm install --frozen-lockfile --prod=false
 echo '--- prisma generate ---'
 run_pnpm --filter @sportybet/db generate
 
-echo '--- locating a real generated Prisma client ---'
-mapfile -t REAL_CLIENTS < <(
-  find node_modules -type f -path '*/.prisma/client/schema.prisma' -print 2>/dev/null \
-    | sed 's#/schema.prisma$##'
-)
-
-if [ "${#REAL_CLIENTS[@]}" -eq 0 ]; then
-  echo "BUILD ABORTED: prisma generate did not produce node_modules/**/.prisma/client/schema.prisma."
+echo '--- verifying generated client ---'
+if [ ! -f "$GENERATED/schema.prisma" ]; then
+  echo "BUILD ABORTED: missing $GENERATED/schema.prisma after prisma generate."
+  echo "Check generator.output in packages/db/prisma/schema.prisma."
   exit 1
 fi
-
-CLIENT=""
-for d in "${REAL_CLIENTS[@]}"; do
-  if ls "$d"/libquery_engine-rhel-openssl-3.0.x.so.node >/dev/null 2>&1; then
-    CLIENT="$d"
-    break
-  fi
-done
-
-if [ -z "$CLIENT" ]; then
-  echo "BUILD ABORTED: no generated client contains libquery_engine-rhel-openssl-3.0.x.so.node."
-  printf '  %s\n' "${REAL_CLIENTS[@]}"
+if [ ! -f "$GENERATED/$RHEL_ENGINE" ]; then
+  echo "BUILD ABORTED: missing $GENERATED/$RHEL_ENGINE."
+  echo "Check binaryTargets includes rhel-openssl-3.0.x."
+  ls -la "$GENERATED" || true
   exit 1
 fi
-echo "  using: $CLIENT"
-
-echo '--- installing generated client at the canonical root path ---'
-rm -rf node_modules/.prisma/client
-mkdir -p node_modules/.prisma
-cp -a "$CLIENT" node_modules/.prisma/client
-
-if grep -ql 'did not initialize yet' node_modules/.prisma/client/*.js 2>/dev/null; then
-  echo "BUILD ABORTED: node_modules/.prisma/client is still the uninitialized stub."
+if grep -ql 'did not initialize yet' "$GENERATED"/*.js 2>/dev/null; then
+  echo "BUILD ABORTED: generated client is still the uninitialized stub."
   exit 1
 fi
-test -f node_modules/.prisma/client/schema.prisma
-test -f node_modules/.prisma/client/libquery_engine-rhel-openssl-3.0.x.so.node
-echo '  ok  node_modules/.prisma/client'
-
-test -e "node_modules/@prisma/client" \
-  || { echo "BUILD ABORTED: node_modules/@prisma/client missing (need node-linker=hoisted)."; exit 1; }
+echo "  ok  $GENERATED (schema + rhel engine)"
 
 echo '--- bundling Netlify functions ---'
 rm -rf netlify/functions
 mkdir -p netlify/functions
 
-# Workspace packages inlined; @prisma/client left external (native engine);
-# telegram BUNDLED; node-tesseract-ocr optional and absent on Netlify.
+# Workspace packages (including packages/db/generated) are inlined.
+# Native .node engines stay as files beside the function; tesseract is optional.
 npx --yes esbuild@0.24.2 \
   netlify/src/app.mts \
   netlify/src/crawl.mts \
   --bundle --platform=node --format=esm --target=node20 \
   --outdir=netlify/functions --out-extension:.js=.mjs \
-  --external:@prisma/client --external:.prisma \
+  --external:*.node \
   --external:node-tesseract-ocr \
   --banner:js="import{createRequire as __cr}from'module';const require=__cr(import.meta.url);"
 
@@ -102,18 +77,22 @@ if grep -q '@sportybet/' netlify/functions/app.mjs; then
 fi
 echo '  ok  netlify/functions/*.mjs'
 
-echo '--- staging Prisma next to the functions ---'
-mkdir -p netlify/functions/node_modules/.prisma netlify/functions/node_modules/@prisma
-rm -rf netlify/functions/node_modules/.prisma/client netlify/functions/node_modules/@prisma/client
-cp -a node_modules/.prisma/client netlify/functions/node_modules/.prisma/client
-cp -a node_modules/@prisma/client netlify/functions/node_modules/@prisma/client
+echo '--- staging Prisma client + engine next to the functions ---'
+# Node resolves .prisma from the function directory; preparePrismaEnv also
+# points PRISMA_QUERY_ENGINE_LIBRARY at this engine file.
+mkdir -p netlify/functions/node_modules/.prisma
+rm -rf netlify/functions/node_modules/.prisma/client
+cp -a "$GENERATED" netlify/functions/node_modules/.prisma/client
+
+# Also drop the engine next to the .mjs in case a bundled require looks here.
+cp -f "$GENERATED/$RHEL_ENGINE" "netlify/functions/$RHEL_ENGINE"
 
 if grep -ql 'did not initialize yet' netlify/functions/node_modules/.prisma/client/*.js 2>/dev/null; then
   echo "BUILD ABORTED: staged prisma client is still the uninitialized stub."
   exit 1
 fi
 test -f netlify/functions/node_modules/.prisma/client/schema.prisma
-test -f netlify/functions/node_modules/.prisma/client/libquery_engine-rhel-openssl-3.0.x.so.node
+test -f "netlify/functions/node_modules/.prisma/client/$RHEL_ENGINE"
 echo '  ok  staged Prisma client + rhel engine'
 
 mkdir -p public

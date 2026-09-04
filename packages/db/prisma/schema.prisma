@@ -8,6 +8,10 @@
 
 generator client {
   provider = "prisma-client-js"
+  // Predictable path outside pnpm's virtual store. On Netlify, default output
+  // lands under node_modules/.pnpm/@prisma+client@.../ and the build used to
+  // self-clobber when it rm'd node_modules/.prisma/client then tried to cp it.
+  output   = "../generated/client"
   // "native" covers local dev and the Docker image. Netlify Functions run on
   // AWS Lambda (Amazon Linux 2023, OpenSSL 3), which needs its own engine
   // binary compiled in at generate time — without it the function throws

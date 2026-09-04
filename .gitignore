@@ -20,6 +20,7 @@ out/
 # Prisma
 packages/db/prisma/*.db
 packages/db/prisma/migrations/dev/
+packages/db/generated/
 
 # Logs
 *.log

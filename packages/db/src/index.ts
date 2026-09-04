@@ -1,4 +1,4 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient } from "../generated/client";
 
 // Singleton across hot-reloads / worker imports.
 const globalForPrisma = globalThis as unknown as {
@@ -15,5 +15,5 @@ if (process.env.NODE_ENV !== "production") {
   globalForPrisma.prisma = prisma;
 }
 
-export * from "@prisma/client";
+export * from "../generated/client";
 export default prisma;

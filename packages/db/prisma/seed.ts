@@ -4,7 +4,7 @@
  * (Google News RSS, Reddit public JSON, YouTube search RSS,
  * and generic RSS feeds) — no ToS-violating scraping.
  */
-import { PrismaClient, Role, SourceType } from "@prisma/client";
+import { PrismaClient, Role, SourceType } from "../generated/client";
 import { createHash } from "node:crypto";
 
 const prisma = new PrismaClient();
