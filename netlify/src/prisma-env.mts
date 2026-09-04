@@ -1,29 +1,26 @@
 // =====================================================================
-// Netlify runtime bootstrap helpers.
-//
-// Must run BEFORE any module that constructs PrismaClient. ESM static
-// imports are hoisted, so call sites use dynamic import() of the heavy
-// handler only after preparePrismaEnv().
-// =====================================================================
+ // Netlify runtime bootstrap helpers.
+ //
+ // Call preparePrismaEnv() at the start of every function invocation,
+ // before any Prisma query. The engine binary is staged next to the
+ // function under node_modules/.prisma/client during the Netlify build.
+ // =====================================================================
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const RHEL_ENGINE = "libquery_engine-rhel-openssl-3.0.x.so.node";
 
-/** Point Prisma at the staged rhel engine before @prisma/client loads. */
+/** Point Prisma at the staged rhel engine before any query runs. */
 export function preparePrismaEnv(): void {
   const existing = process.env.PRISMA_QUERY_ENGINE_LIBRARY;
   if (existing && existsSync(existing)) return;
 
-  // When this file is bundled into netlify/functions/app.mjs, import.meta.url
-  // is that output file — so `here` is the functions directory on Lambda.
+  // When bundled into netlify/functions/app.mjs, import.meta.url is that file.
   const here = dirname(fileURLToPath(import.meta.url));
   const candidates = [
     join(here, "node_modules", ".prisma", "client", RHEL_ENGINE),
-    join(here, "..", "runtime", "node_modules", ".prisma", "client", RHEL_ENGINE),
     join(process.cwd(), "netlify", "functions", "node_modules", ".prisma", "client", RHEL_ENGINE),
-    join(process.cwd(), "netlify", "runtime", "node_modules", ".prisma", "client", RHEL_ENGINE),
     join(process.cwd(), "node_modules", ".prisma", "client", RHEL_ENGINE),
   ];
 
@@ -39,7 +36,7 @@ export function missingDatabaseUrlMessage(): string | null {
   if (!process.env.DATABASE_URL?.trim()) {
     return [
       "DATABASE_URL is not set in the Netlify environment.",
-      "Site settings → Environment variables → add DATABASE_URL (and DIRECT_URL),",
+      "Site settings -> Environment variables -> add DATABASE_URL (and DIRECT_URL),",
       "then Clear cache and deploy.",
     ].join(" ");
   }
@@ -59,7 +56,7 @@ export function errorHtml(title: string, detail: string): Response {
 </style></head><body>
 <h1>${title}</h1>
 <pre>${safe}</pre>
-<p>Open Netlify → Functions → <strong>app</strong> logs for the full stack. After fixing env/build, use <em>Clear cache and deploy</em>.</p>
+<p>Open Netlify -> Functions -> <strong>app</strong> logs for the full stack. After fixing env/build, use <em>Clear cache and deploy</em>.</p>
 </body></html>`;
   return new Response(html, {
     status: 500,

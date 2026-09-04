@@ -51,4 +51,3 @@ docker-data/
 coverage/
 .nyc_output/
 netlify/functions/
-netlify/runtime/

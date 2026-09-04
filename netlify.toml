@@ -2,8 +2,8 @@
 # Netlify configuration for Sporty Value Pick AI.
 #
 # There is no static site here. Every route is rendered at request time
-# by netlify/functions/app.mjs (bootstrap) → netlify/runtime/app-handler.mjs.
-# The `publish` directory exists only because Netlify requires one.
+# by netlify/functions/app.mjs. The `publish` directory exists only
+# because Netlify requires one.
 # =====================================================================
 
 [build]
@@ -15,22 +15,22 @@
 
   # ---- Secrets scanning ----
   # Omit only non-secret keys whose values appear throughout source.
+  # FREE_CODE_ALLOWANCE / FREE_CODE_DELAY_MIN default to "20" which matches
+  # dozens of source files — without an omit the deploy fails the scan.
   # Never omit DATABASE_URL, DIRECT_URL, SESSION_SECRET, API keys, etc.
-  SECRETS_SCAN_OMIT_KEYS = "NODE_ENV,ALLOW_SIGNUP,PUBLIC_BASE_URL,SUPABASE_URL,SUPABASE_ANON_KEY,APIFOOTBALL_PROVIDER,APIFOOTBALL_DAILY_BUDGET,APIFOOTBALL_INTEL_BUDGET,APIFOOTBALL_PREDS_PER_CYCLE,DEFAULT_CRAWL_INTERVAL_SEC,PLAN_DAILY_NGN,PLAN_WEEKLY_NGN,PLAN_MONTHLY_NGN,TELEGRAM_MSG_LIMIT,TELEGRAM_OCR_PER_CHANNEL,TELEGRAM_API_ID"
+  SECRETS_SCAN_OMIT_KEYS = "NODE_ENV,ALLOW_SIGNUP,PUBLIC_BASE_URL,SUPABASE_URL,SUPABASE_ANON_KEY,APIFOOTBALL_PROVIDER,APIFOOTBALL_DAILY_BUDGET,APIFOOTBALL_INTEL_BUDGET,APIFOOTBALL_PREDS_PER_CYCLE,DEFAULT_CRAWL_INTERVAL_SEC,PLAN_DAILY_NGN,PLAN_WEEKLY_NGN,PLAN_MONTHLY_NGN,TELEGRAM_MSG_LIMIT,TELEGRAM_OCR_PER_CHANNEL,TELEGRAM_API_ID,FREE_CODE_ALLOWANCE,FREE_CODE_DELAY_MIN"
   SECRETS_SCAN_OMIT_PATHS = ".env.example,README.md,deploy/DEPLOY.md"
 
 [functions]
   directory = "netlify/functions"
-  # We pre-bundle everything. Letting Netlify's esbuild re-process the
-  # functions previously reintroduced an uninitialized Prisma stub and
-  # produced opaque "An unknown error has occurred" crashes.
+  # Pre-bundled by scripts/netlify-build.sh. Do not let Netlify re-esbuild —
+  # that previously reintroduced an uninitialized Prisma stub.
   node_bundler = "none"
-  # Pro / Enterprise: raise sync limit (default 10s). Free tier stays at 10s;
-  # the app handler returns a clear HTML error instead of an unhandled crash.
+  # Pro/Enterprise may honor this; free tier stays at ~10s.
   timeout = 26
   included_files = [
-    "netlify/runtime/**",
-    "netlify/functions/node_modules/**",
+    "netlify/functions/node_modules/.prisma/client/**",
+    "netlify/functions/node_modules/@prisma/client/**",
     "packages/db/prisma/schema.prisma"
   ]
 
