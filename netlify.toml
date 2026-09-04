@@ -9,7 +9,30 @@
 # =====================================================================
 
 [build]
-  command = "pnpm install --frozen-lockfile && pnpm --filter @sportybet/db generate && mkdir -p public && echo 'ok' > public/index.html"
+  # We bundle the functions ourselves rather than letting Netlify's bundler
+  # do it. Netlify externalises bare imports for ESM functions, so
+  # "@sportybet/db" and "@sportybet/shared" were left unresolved and the
+  # function crashed at runtime with ERR_MODULE_NOT_FOUND. Those are pnpm
+  # workspace packages whose entry point is raw TypeScript (src/index.ts),
+  # so they must be compiled in, not linked at runtime.
+  #
+  # esbuild follows the workspace symlinks, compiles the TS and emits one
+  # self-contained .mjs per function into netlify/functions/. Only true
+  # natives stay external: @prisma/client ships a platform .node engine,
+  # telegram (gramJS) does dynamic requires, and node-tesseract-ocr is
+  # absent by design here -- ocr.ts already treats its absence as
+  # "image OCR off" rather than an error.
+  command = """
+    pnpm install --frozen-lockfile && \
+    pnpm --filter @sportybet/db generate && \
+    npx --yes esbuild@0.24.2 netlify/src/app.mts netlify/src/crawl.mts \
+      --bundle --platform=node --format=esm --target=node20 \
+      --outdir=netlify/functions --out-extension:.js=.mjs \
+      --external:@prisma/client --external:.prisma \
+      --external:telegram --external:node-tesseract-ocr \
+      --banner:js="import{createRequire as __cr}from'module';const require=__cr(import.meta.url);" && \
+    mkdir -p public && echo 'ok' > public/index.html
+  """
   publish = "public"
 
 [build.environment]
