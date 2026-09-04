@@ -23,6 +23,13 @@
   # absent by design here -- ocr.ts already treats its absence as
   # "image OCR off" rather than an error.
   command = """
+    echo '--- node_modules layout guard ---' && \
+    if [ -d node_modules ] && [ ! -d node_modules/@prisma/client ]; then \
+      echo '  cached node_modules predates node-linker=hoisted (no @prisma/client at root) - removing it'; \
+      rm -rf node_modules packages/*/node_modules services/*/node_modules; \
+    else \
+      echo '  layout ok or no cache present'; \
+    fi && \
     pnpm install --frozen-lockfile && \
     pnpm --filter @sportybet/db generate && \
     echo '--- verifying externals are visible at the repo root ---' && \
