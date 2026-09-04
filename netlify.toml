@@ -9,51 +9,26 @@
 # =====================================================================
 
 [build]
-  # We bundle the functions ourselves rather than letting Netlify's bundler
-  # do it. Netlify externalises bare imports for ESM functions, so
-  # "@sportybet/db" and "@sportybet/shared" were left unresolved and the
-  # function crashed at runtime with ERR_MODULE_NOT_FOUND. Those are pnpm
-  # workspace packages whose entry point is raw TypeScript (src/index.ts),
-  # so they must be compiled in, not linked at runtime.
+  # Build logic lives in scripts/netlify-build.sh so the Prisma staging and
+  # stub/engine assertions stay reviewable. Summary of what it does and why:
   #
-  # esbuild follows the workspace symlinks, compiles the TS and emits one
-  # self-contained .mjs per function into netlify/functions/. Only true
-  # natives stay external: @prisma/client ships a platform .node engine,
-  # telegram (gramJS) does dynamic requires, and node-tesseract-ocr is
-  # absent by design here -- ocr.ts already treats its absence as
-  # "image OCR off" rather than an error.
-  command = """
-    echo '--- node_modules layout guard ---' && \
-    if [ -d node_modules ] && [ ! -d node_modules/@prisma/client ]; then \
-      echo '  cached node_modules predates node-linker=hoisted (no @prisma/client at root) - removing it'; \
-      rm -rf node_modules packages/*/node_modules services/*/node_modules; \
-    else \
-      echo '  layout ok or no cache present'; \
-    fi && \
-    pnpm install --frozen-lockfile --prod=false && \
-    pnpm --filter @sportybet/db generate && \
-    echo '--- verifying externals are visible at the repo root ---' && \
-    for p in @prisma/client telegram; do \
-      test -e "node_modules/$p" \
-        || { echo "BUILD ABORTED: node_modules/$p is missing. Netlify cannot ship an external package it cannot find at the repo root, and the function would crash at runtime with ERR_MODULE_NOT_FOUND. Check that .npmrc still sets node-linker=hoisted."; exit 1; }; \
-      echo "  ok  node_modules/$p"; \
-    done && \
-    echo '--- locating the rhel prisma engine ---' && \
-    find node_modules -name 'libquery_engine-rhel*' 2>/dev/null | head -5 | sed 's/^/  found: /' && \
-    if [ -z "$(find node_modules -name 'libquery_engine-rhel*' -print -quit 2>/dev/null)" ]; then \
-      echo "BUILD ABORTED: no rhel-openssl-3.0.x Prisma engine anywhere under node_modules. Netlify runs on Amazon Linux; without it every query fails on cold start. Check binaryTargets in packages/db/prisma/schema.prisma."; \
-      exit 1; \
-    fi && \
-    npx --yes esbuild@0.24.2 netlify/src/app.mts netlify/src/crawl.mts \
-      --bundle --platform=node --format=esm --target=node20 \
-      --outdir=netlify/functions --out-extension:.js=.mjs \
-      --external:@prisma/client --external:.prisma \
-      --external:telegram --external:node-tesseract-ocr \
-      --banner:js="import{createRequire as __cr}from'module';const require=__cr(import.meta.url);" && \
-    grep -q '@sportybet/' netlify/functions/app.mjs \
-      && { echo "BUILD ABORTED: a bare @sportybet import survived bundling; it will not resolve at runtime."; exit 1; } || true && \
-    mkdir -p public && echo 'ok' > public/index.html
-  """
+  #   1. Self-heal a stale (pre-hoist) node_modules cache.
+  #   2. pnpm install --prod=false — NODE_ENV=production would prune the
+  #      prisma CLI and reshape the tree so generate writes under .pnpm
+  #      while a stub remains at node_modules/.prisma/client.
+  #   3. prisma generate, then REQUIRE the client dir to contain
+  #      schema.prisma + libquery_engine-rhel-openssl-3.0.x.so.node and to
+  #      NOT contain the "did not initialize yet" stub. A previous check
+  #      that searched for the rhel engine anywhere under node_modules was
+  #      a false positive: the prisma CLI package also ships that binary.
+  #   4. Force-copy the real client to node_modules/.prisma/client.
+  #   5. esbuild-bundle the functions (workspace TS packages inlined;
+  #      @prisma/client + telegram left external because of native/dynamic
+  #      requires).
+  #   6. Stage @prisma/client + .prisma/client next to the functions so
+  #      Node resolves a known-good copy from
+  #      /var/task/netlify/functions/node_modules before any root stub.
+  command = "bash scripts/netlify-build.sh"
   publish = "public"
 
 [build.environment]
@@ -80,20 +55,21 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
-  # Prisma must not be bundled by esbuild -- the engine is a native .node
-  # binary that has to be shipped as a real file, not inlined.
-  external_node_modules = ["@prisma/client", ".prisma", "telegram"]
-  # The engine can land in either place depending on how pnpm arranged the
-  # tree, which in turn depends on whether devDependencies were pruned. The
-  # build log showed prisma generate writing to the .pnpm inner path rather
-  # than the root, so both are shipped -- a missing engine is a cold-start
-  # failure on every single request, and the extra patterns cost nothing when
-  # they match nothing.
+  # Prisma must not be bundled by Netlify's esbuild — the engine is a native
+  # .node binary. telegram (gramJS) does dynamic requires.
+  # ".prisma" is not an npm package; listing it here does nothing useful and
+  # previously suggested the bundler would somehow ship the generated client.
+  # We ship Prisma ourselves via included_files from the staged tree the
+  # build script writes under netlify/functions/node_modules/.
+  external_node_modules = ["@prisma/client", "telegram"]
+  # Function-local staging wins Node resolution from
+  # /var/task/netlify/functions/app.mjs. Root patterns remain as a fallback
+  # for any code path that walks up to /var/task/node_modules.
   included_files = [
+    "netlify/functions/node_modules/.prisma/client/**",
+    "netlify/functions/node_modules/@prisma/client/**",
     "node_modules/.prisma/client/**",
     "node_modules/@prisma/client/**",
-    "node_modules/.pnpm/@prisma+client*/node_modules/.prisma/client/**",
-    "node_modules/.pnpm/@prisma+client*/node_modules/@prisma/client/**",
     "packages/db/prisma/schema.prisma"
   ]
 

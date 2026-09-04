@@ -121,3 +121,31 @@ Postgres data lives in the `postgres_data` volume. Snapshot the VPS or run
 git pull
 docker compose -f docker-compose.prod.yml up -d --build
 ```
+
+---
+
+## Netlify (serverless path)
+
+The site can also run as Netlify Functions (`scripts/netlify-build.sh` +
+`netlify.toml`). That path is already wired; this section is for when a deploy
+goes red.
+
+### Required env vars
+Set the same secrets you use locally / on VPS in **Site settings → Environment
+variables**, including at least `DATABASE_URL`, `DIRECT_URL`, `SESSION_SECRET`,
+and whatever provider keys the crawl needs. `NODE_ENV=production` is fine — the
+build script installs with `--prod=false` so the Prisma CLI is still available
+at generate time.
+
+### If the function crashes with Prisma errors
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `@prisma/client did not initialize yet` | Stub client shipped instead of generated one | Redeploy. The build now aborts if the client is still a stub or missing `schema.prisma` / the rhel engine **in the client directory**. |
+| `Query engine library for current platform could not be found` | Missing `rhel-openssl-3.0.x` binary | Confirm `binaryTargets` in `packages/db/prisma/schema.prisma` still includes `rhel-openssl-3.0.x`, then redeploy. |
+| `ERR_MODULE_NOT_FOUND: @prisma/client` / `telegram` | Non-hoisted `node_modules` | Confirm `.npmrc` still has `node-linker=hoisted`. Clear the Netlify build cache and redeploy. |
+| Secrets scan fails on `ALLOW_SIGNUP` / `NODE_ENV` / etc. | Non-secret values appear in source | Those keys belong in `SECRETS_SCAN_OMIT_KEYS` in `netlify.toml` — do **not** omit real credentials. |
+
+### Clear cache and deploy
+Netlify → **Deploys → Trigger deploy → Clear cache and deploy site** when the
+build log shows a stale / pre-hoist `node_modules` layout or an unexplained
+Prisma path mismatch after `.npmrc` or lockfile changes.

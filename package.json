@@ -24,7 +24,8 @@
     "infra:down": "docker compose down",
     "infra:logs": "docker compose logs -f",
     "stack:up": "docker compose up -d --build",
-    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md}\""
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md}\"",
+    "netlify:build": "bash scripts/netlify-build.sh"
   },
   "devDependencies": {
     "prettier": "^3.3.3",
