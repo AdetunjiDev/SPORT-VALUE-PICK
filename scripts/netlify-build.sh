@@ -2,22 +2,28 @@
 # =====================================================================
 # Netlify build for Sporty Value Pick AI.
 #
-# Why this is a script (not an inline netlify.toml command):
-#   The Prisma client must be generated AND the exact files that Node will
-#   resolve at runtime must be the generated ones, not the uninitialized
-#   stub @prisma/client ships before `prisma generate`. A previous build
-#   asserted "rhel engine exists somewhere under node_modules", which also
-#   matched engines bundled inside the `prisma` CLI package — so the build
-#   went green while the function still shipped the stub and crashed with:
+# Layout produced:
+#   netlify/functions/app.mjs      - thin bootstrap (sets Prisma engine path)
+#   netlify/functions/crawl.mjs    - thin bootstrap + schedule
+#   netlify/runtime/app-handler.mjs
+#   netlify/runtime/crawl-handler.mjs
+#   netlify/runtime/node_modules/{@prisma,.prisma}/...
 #
-#     @prisma/client did not initialize yet. Please run "prisma generate"
-#
-# This script generates, verifies the CLIENT directory (not the CLI),
-# stages that client next to the bundled functions (so resolution from
-# /var/task/netlify/functions/app.mjs hits a known-good copy first), then
-# esbuilds the two function entrypoints.
+# node_bundler = "none" so Netlify does not re-run esbuild and cannot
+# replace our generated Prisma client with an uninitialized stub.
+# telegram is bundled into the handlers (no longer an external) so its
+# dynamic requires cannot fail with ERR_MODULE_NOT_FOUND at runtime.
 # =====================================================================
 set -euo pipefail
+
+# Netlify usually injects pnpm via packageManager; fall back to npx.
+run_pnpm() {
+  if command -v pnpm >/dev/null 2>&1; then
+    pnpm "$@"
+  else
+    npx --yes pnpm@10.33.2 "$@"
+  fi
+}
 
 echo '--- node_modules layout guard ---'
 if [ -d node_modules ] && [ ! -d node_modules/@prisma/client ]; then
@@ -27,16 +33,12 @@ else
   echo '  layout ok or no cache present'
 fi
 
-# Keep devDependencies even when Netlify sets NODE_ENV=production — we need
-# the prisma CLI to generate, and pruning reshapes the tree so generate can
-# write to a .pnpm inner path while a stub remains at the root.
-pnpm install --frozen-lockfile --prod=false
+run_pnpm install --frozen-lockfile --prod=false
 
 echo '--- prisma generate ---'
-pnpm --filter @sportybet/db generate
+run_pnpm --filter @sportybet/db generate
 
 echo '--- locating a real generated Prisma client ---'
-# A real client always has schema.prisma. The uninitialized stub does not.
 mapfile -t REAL_CLIENTS < <(
   find node_modules -type f -path '*/.prisma/client/schema.prisma' -print 2>/dev/null \
     | sed 's#/schema.prisma$##'
@@ -44,7 +46,6 @@ mapfile -t REAL_CLIENTS < <(
 
 if [ "${#REAL_CLIENTS[@]}" -eq 0 ]; then
   echo "BUILD ABORTED: prisma generate did not produce node_modules/**/.prisma/client/schema.prisma."
-  echo "Without that file the function would crash at runtime with '@prisma/client did not initialize yet'."
   exit 1
 fi
 
@@ -57,20 +58,13 @@ for d in "${REAL_CLIENTS[@]}"; do
 done
 
 if [ -z "$CLIENT" ]; then
-  echo "BUILD ABORTED: found generated client(s) but none contain libquery_engine-rhel-openssl-3.0.x.so.node."
-  echo "Netlify runs on Amazon Linux; without that engine every query fails on cold start."
-  echo "Checked:"
+  echo "BUILD ABORTED: no generated client contains libquery_engine-rhel-openssl-3.0.x.so.node."
   printf '  %s\n' "${REAL_CLIENTS[@]}"
-  echo "Check binaryTargets in packages/db/prisma/schema.prisma."
   exit 1
 fi
-
 echo "  using: $CLIENT"
 
 echo '--- installing generated client at the canonical root path ---'
-# Node (and Netlify's external packaging) resolve .prisma from the repo-root
-# node_modules first. If generate wrote only under .pnpm/..., a stub can still
-# sit at node_modules/.prisma/client and win at runtime. Force the real one.
 rm -rf node_modules/.prisma/client
 mkdir -p node_modules/.prisma
 cp -a "$CLIENT" node_modules/.prisma/client
@@ -81,52 +75,68 @@ if grep -ql 'did not initialize yet' node_modules/.prisma/client/*.js 2>/dev/nul
 fi
 test -f node_modules/.prisma/client/schema.prisma
 test -f node_modules/.prisma/client/libquery_engine-rhel-openssl-3.0.x.so.node
-echo '  ok  node_modules/.prisma/client (schema + rhel engine, not a stub)'
+echo '  ok  node_modules/.prisma/client'
 
-echo '--- verifying externals are visible at the repo root ---'
-for p in @prisma/client telegram; do
-  test -e "node_modules/$p" \
-    || { echo "BUILD ABORTED: node_modules/$p is missing. Check that .npmrc still sets node-linker=hoisted."; exit 1; }
-  echo "  ok  node_modules/$p"
-done
+test -e "node_modules/@prisma/client" \
+  || { echo "BUILD ABORTED: node_modules/@prisma/client missing (need node-linker=hoisted)."; exit 1; }
 
-echo '--- bundling Netlify functions ---'
-mkdir -p netlify/functions
-npx --yes esbuild@0.24.2 netlify/src/app.mts netlify/src/crawl.mts \
+echo '--- bundling Netlify functions + runtime handlers ---'
+rm -rf netlify/functions netlify/runtime
+mkdir -p netlify/functions netlify/runtime
+
+# Thin bootstraps - must NOT pull in Prisma / server.ts.
+npx --yes esbuild@0.24.2 \
+  netlify/src/app.mts \
+  netlify/src/crawl.mts \
   --bundle --platform=node --format=esm --target=node20 \
   --outdir=netlify/functions --out-extension:.js=.mjs \
-  --external:@prisma/client --external:.prisma \
-  --external:telegram --external:node-tesseract-ocr \
+  --external:../runtime/app-handler.mjs \
+  --external:../runtime/crawl-handler.mjs \
   --banner:js="import{createRequire as __cr}from'module';const require=__cr(import.meta.url);"
 
-if grep -q '@sportybet/' netlify/functions/app.mjs; then
-  echo "BUILD ABORTED: a bare @sportybet import survived bundling; it will not resolve at runtime."
+# Heavy handlers - workspace packages inlined; prisma left external; telegram BUNDLED.
+npx --yes esbuild@0.24.2 \
+  netlify/src/app-handler.mts \
+  netlify/src/crawl-handler.mts \
+  --bundle --platform=node --format=esm --target=node20 \
+  --outdir=netlify/runtime --out-extension:.js=.mjs \
+  --external:@prisma/client --external:.prisma \
+  --external:node-tesseract-ocr \
+  --banner:js="import{createRequire as __cr}from'module';const require=__cr(import.meta.url);"
+
+for f in netlify/functions/app.mjs netlify/functions/crawl.mjs \
+         netlify/runtime/app-handler.mjs netlify/runtime/crawl-handler.mjs; do
+  test -f "$f" || { echo "BUILD ABORTED: missing $f"; exit 1; }
+done
+
+if grep -q '@sportybet/' netlify/runtime/app-handler.mjs; then
+  echo "BUILD ABORTED: a bare @sportybet import survived bundling."
   exit 1
 fi
-echo '  ok  netlify/functions/*.mjs'
+echo '  ok  bundled app + crawl (+ runtime handlers)'
 
-echo '--- staging Prisma next to the functions ---'
-# From /var/task/netlify/functions/app.mjs Node resolves
-#   ./node_modules/@prisma/client  before walking up to /var/task/node_modules.
-# Staging here means even if Netlify's external_node_modules copy of
-# @prisma/client somehow recreates a stub at the task root, the function-local
-# copy wins. included_files in netlify.toml ships this tree into the zip.
-mkdir -p netlify/functions/node_modules/.prisma
-rm -rf netlify/functions/node_modules/.prisma/client
+echo '--- staging Prisma into netlify/runtime/node_modules ---'
+mkdir -p netlify/runtime/node_modules/.prisma
+rm -rf netlify/runtime/node_modules/.prisma/client
+cp -a node_modules/.prisma/client netlify/runtime/node_modules/.prisma/client
+
+mkdir -p netlify/runtime/node_modules/@prisma
+rm -rf netlify/runtime/node_modules/@prisma/client
+cp -a node_modules/@prisma/client netlify/runtime/node_modules/@prisma/client
+
+# Also stage under functions/ so preparePrismaEnv finds a copy next to app.mjs.
+mkdir -p netlify/functions/node_modules/.prisma netlify/functions/node_modules/@prisma
+rm -rf netlify/functions/node_modules/.prisma/client netlify/functions/node_modules/@prisma/client
 cp -a node_modules/.prisma/client netlify/functions/node_modules/.prisma/client
-
-mkdir -p netlify/functions/node_modules/@prisma
-rm -rf netlify/functions/node_modules/@prisma/client
 cp -a node_modules/@prisma/client netlify/functions/node_modules/@prisma/client
 
-if grep -ql 'did not initialize yet' netlify/functions/node_modules/.prisma/client/*.js 2>/dev/null; then
+if grep -ql 'did not initialize yet' netlify/runtime/node_modules/.prisma/client/*.js 2>/dev/null; then
   echo "BUILD ABORTED: staged prisma client is still the uninitialized stub."
   exit 1
 fi
-test -f netlify/functions/node_modules/.prisma/client/schema.prisma
-test -f netlify/functions/node_modules/.prisma/client/libquery_engine-rhel-openssl-3.0.x.so.node
-echo '  ok  netlify/functions/node_modules/.prisma/client'
-echo '  ok  netlify/functions/node_modules/@prisma/client'
+test -f netlify/runtime/node_modules/.prisma/client/schema.prisma
+test -f netlify/runtime/node_modules/.prisma/client/libquery_engine-rhel-openssl-3.0.x.so.node
+echo '  ok  staged Prisma client + rhel engine'
 
 mkdir -p public
 echo 'ok' > public/index.html

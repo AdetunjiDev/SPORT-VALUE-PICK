@@ -2,32 +2,11 @@
 # Netlify configuration for Sporty Value Pick AI.
 #
 # There is no static site here. Every route is rendered at request time
-# by netlify/functions/app.mts, which wraps the same handleRequest() that
-# the local node:http listener uses. The `publish` directory exists only
-# because Netlify requires one; it holds a single placeholder that is
-# never served, since the function claims "/*".
+# by netlify/functions/app.mjs (bootstrap) → netlify/runtime/app-handler.mjs.
+# The `publish` directory exists only because Netlify requires one.
 # =====================================================================
 
 [build]
-  # Build logic lives in scripts/netlify-build.sh so the Prisma staging and
-  # stub/engine assertions stay reviewable. Summary of what it does and why:
-  #
-  #   1. Self-heal a stale (pre-hoist) node_modules cache.
-  #   2. pnpm install --prod=false — NODE_ENV=production would prune the
-  #      prisma CLI and reshape the tree so generate writes under .pnpm
-  #      while a stub remains at node_modules/.prisma/client.
-  #   3. prisma generate, then REQUIRE the client dir to contain
-  #      schema.prisma + libquery_engine-rhel-openssl-3.0.x.so.node and to
-  #      NOT contain the "did not initialize yet" stub. A previous check
-  #      that searched for the rhel engine anywhere under node_modules was
-  #      a false positive: the prisma CLI package also ships that binary.
-  #   4. Force-copy the real client to node_modules/.prisma/client.
-  #   5. esbuild-bundle the functions (workspace TS packages inlined;
-  #      @prisma/client + telegram left external because of native/dynamic
-  #      requires).
-  #   6. Stage @prisma/client + .prisma/client next to the functions so
-  #      Node resolves a known-good copy from
-  #      /var/task/netlify/functions/node_modules before any root stub.
   command = "bash scripts/netlify-build.sh"
   publish = "public"
 
@@ -35,49 +14,26 @@
   NODE_VERSION = "20"
 
   # ---- Secrets scanning ----
-  # Netlify scans build output for the VALUE of every configured env var.
-  # Several of ours are ordinary constants, not secrets, and their values
-  # occur throughout the source: ALLOW_SIGNUP=1 matches the digit "1" in
-  # 59 files, TELEGRAM_MSG_LIMIT=25 in 21, NODE_ENV=production in 5. Those
-  # matches are what fail the build, not a leak.
-  #
-  # Only genuinely non-secret keys are omitted here. Every real credential
-  # -- DATABASE_URL, DIRECT_URL, SUPABASE_SERVICE_ROLE_KEY, REDIS_URL,
-  # SESSION_SECRET, APP_PASSWORD, ADMIN_KEY, APIFOOTBALL_KEY,
-  # BYTEZ_API_KEY, TELEGRAM_API_HASH, TELEGRAM_SESSION -- stays scanned,
-  # so an actual leak still breaks the build. Do not add them here.
+  # Omit only non-secret keys whose values appear throughout source.
+  # Never omit DATABASE_URL, DIRECT_URL, SESSION_SECRET, API keys, etc.
   SECRETS_SCAN_OMIT_KEYS = "NODE_ENV,ALLOW_SIGNUP,PUBLIC_BASE_URL,SUPABASE_URL,SUPABASE_ANON_KEY,APIFOOTBALL_PROVIDER,APIFOOTBALL_DAILY_BUDGET,APIFOOTBALL_INTEL_BUDGET,APIFOOTBALL_PREDS_PER_CYCLE,DEFAULT_CRAWL_INTERVAL_SEC,PLAN_DAILY_NGN,PLAN_WEEKLY_NGN,PLAN_MONTHLY_NGN,TELEGRAM_MSG_LIMIT,TELEGRAM_OCR_PER_CHANNEL,TELEGRAM_API_ID"
-
-  # .env.example ships placeholder credentials for local Docker; they are
-  # not real and would otherwise trip the scanner.
   SECRETS_SCAN_OMIT_PATHS = ".env.example,README.md,deploy/DEPLOY.md"
 
 [functions]
   directory = "netlify/functions"
-  node_bundler = "esbuild"
-  # Prisma must not be bundled by Netlify's esbuild — the engine is a native
-  # .node binary. telegram (gramJS) does dynamic requires.
-  # ".prisma" is not an npm package; listing it here does nothing useful and
-  # previously suggested the bundler would somehow ship the generated client.
-  # We ship Prisma ourselves via included_files from the staged tree the
-  # build script writes under netlify/functions/node_modules/.
-  external_node_modules = ["@prisma/client", "telegram"]
-  # Function-local staging wins Node resolution from
-  # /var/task/netlify/functions/app.mjs. Root patterns remain as a fallback
-  # for any code path that walks up to /var/task/node_modules.
+  # We pre-bundle everything. Letting Netlify's esbuild re-process the
+  # functions previously reintroduced an uninitialized Prisma stub and
+  # produced opaque "An unknown error has occurred" crashes.
+  node_bundler = "none"
+  # Pro / Enterprise: raise sync limit (default 10s). Free tier stays at 10s;
+  # the app handler returns a clear HTML error instead of an unhandled crash.
+  timeout = 26
   included_files = [
-    "netlify/functions/node_modules/.prisma/client/**",
-    "netlify/functions/node_modules/@prisma/client/**",
-    "node_modules/.prisma/client/**",
-    "node_modules/@prisma/client/**",
+    "netlify/runtime/**",
+    "netlify/functions/node_modules/**",
     "packages/db/prisma/schema.prisma"
   ]
 
-# ---------------------------------------------------------------------
-# Routing: hand every path to the app function. force = true is required,
-# otherwise Netlify serves the placeholder public/index.html at "/" and
-# only falls through to the function on a miss.
-# ---------------------------------------------------------------------
 [[redirects]]
   from = "/*"
   to = "/.netlify/functions/app"

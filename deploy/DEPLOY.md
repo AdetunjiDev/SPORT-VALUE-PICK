@@ -137,13 +137,15 @@ and whatever provider keys the crawl needs. `NODE_ENV=production` is fine — th
 build script installs with `--prod=false` so the Prisma CLI is still available
 at generate time.
 
-### If the function crashes with Prisma errors
+### If the function crashes with Prisma / opaque errors
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `@prisma/client did not initialize yet` | Stub client shipped instead of generated one | Redeploy. The build now aborts if the client is still a stub or missing `schema.prisma` / the rhel engine **in the client directory**. |
-| `Query engine library for current platform could not be found` | Missing `rhel-openssl-3.0.x` binary | Confirm `binaryTargets` in `packages/db/prisma/schema.prisma` still includes `rhel-openssl-3.0.x`, then redeploy. |
-| `ERR_MODULE_NOT_FOUND: @prisma/client` / `telegram` | Non-hoisted `node_modules` | Confirm `.npmrc` still has `node-linker=hoisted`. Clear the Netlify build cache and redeploy. |
-| Secrets scan fails on `ALLOW_SIGNUP` / `NODE_ENV` / etc. | Non-secret values appear in source | Those keys belong in `SECRETS_SCAN_OMIT_KEYS` in `netlify.toml` — do **not** omit real credentials. |
+| `@prisma/client did not initialize yet` | Stub client shipped instead of generated one | Redeploy with cache clear. Build aborts if the client is still a stub. |
+| `An unknown error has occurred` (no stack) | Unhandled throw / timeout / bad packaging | Current build returns an HTML error page with the real message instead of crashing. Check Functions → app logs. Confirm `DATABASE_URL` is set. Free tier sync limit is ~10s — heavy dashboard renders can still time out. |
+| `Query engine library for current platform could not be found` | Missing `rhel-openssl-3.0.x` binary | Confirm `binaryTargets` includes `rhel-openssl-3.0.x`, then redeploy. |
+| `ERR_MODULE_NOT_FOUND: @prisma/client` | Non-hoisted `node_modules` | Confirm `.npmrc` has `node-linker=hoisted`. Clear cache and redeploy. |
+| `Missing DATABASE_URL` HTML page | Env var not configured on the site | Add `DATABASE_URL` (+ `DIRECT_URL`) in Netlify env, redeploy. |
+| Secrets scan fails on `ALLOW_SIGNUP` / `NODE_ENV` / etc. | Non-secret values appear in source | Those keys belong in `SECRETS_SCAN_OMIT_KEYS` — do **not** omit real credentials. |
 
 ### Clear cache and deploy
 Netlify → **Deploys → Trigger deploy → Clear cache and deploy site** when the
