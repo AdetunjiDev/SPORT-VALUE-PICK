@@ -8,7 +8,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "generate": "prisma generate",
+    "generate": "prisma generate && node ./scripts/sync-prisma-client.mjs",
     "migrate": "dotenv -e ../../.env -- prisma migrate dev",
     "migrate:deploy": "dotenv -e ../../.env -- prisma migrate deploy",
     "push": "dotenv -e ../../.env -- prisma db push",

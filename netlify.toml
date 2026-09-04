@@ -13,19 +13,15 @@
 [build.environment]
   NODE_VERSION = "20"
 
-  # ---- Secrets scanning ----
-  # Omit only non-secret keys whose values appear throughout source.
-  # Never omit DATABASE_URL, DIRECT_URL, SESSION_SECRET, API keys, etc.
   SECRETS_SCAN_OMIT_KEYS = "NODE_ENV,ALLOW_SIGNUP,PUBLIC_BASE_URL,SUPABASE_URL,SUPABASE_ANON_KEY,APIFOOTBALL_PROVIDER,APIFOOTBALL_DAILY_BUDGET,APIFOOTBALL_INTEL_BUDGET,APIFOOTBALL_PREDS_PER_CYCLE,DEFAULT_CRAWL_INTERVAL_SEC,PLAN_DAILY_NGN,PLAN_WEEKLY_NGN,PLAN_MONTHLY_NGN,TELEGRAM_MSG_LIMIT,TELEGRAM_OCR_PER_CHANNEL,TELEGRAM_API_ID,FREE_CODE_ALLOWANCE,FREE_CODE_DELAY_MIN"
   SECRETS_SCAN_OMIT_PATHS = ".env.example,README.md,deploy/DEPLOY.md"
 
 [functions]
   directory = "netlify/functions"
-  # Pre-bundled by scripts/netlify-build.sh. Do not let Netlify re-esbuild.
   node_bundler = "none"
   included_files = [
     "netlify/functions/node_modules/.prisma/client/**",
-    "netlify/functions/libquery_engine-rhel-openssl-3.0.x.so.node",
+    "netlify/functions/node_modules/@prisma/client/**",
     "packages/db/prisma/schema.prisma"
   ]
 
