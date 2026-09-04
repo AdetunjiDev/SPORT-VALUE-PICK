@@ -30,17 +30,20 @@
     else \
       echo '  layout ok or no cache present'; \
     fi && \
-    pnpm install --frozen-lockfile && \
+    pnpm install --frozen-lockfile --prod=false && \
     pnpm --filter @sportybet/db generate && \
     echo '--- verifying externals are visible at the repo root ---' && \
-    for p in @prisma/client .prisma/client telegram; do \
+    for p in @prisma/client telegram; do \
       test -e "node_modules/$p" \
         || { echo "BUILD ABORTED: node_modules/$p is missing. Netlify cannot ship an external package it cannot find at the repo root, and the function would crash at runtime with ERR_MODULE_NOT_FOUND. Check that .npmrc still sets node-linker=hoisted."; exit 1; }; \
       echo "  ok  node_modules/$p"; \
     done && \
-    test -n "$(find node_modules/.prisma/client -name 'libquery_engine-rhel*' -print -quit 2>/dev/null)" \
-      || { echo "BUILD ABORTED: the rhel-openssl-3.0.x Prisma engine was not generated. Netlify runs on Amazon Linux; without it every query fails on cold start. Check binaryTargets in packages/db/prisma/schema.prisma."; exit 1; } && \
-    echo '  ok  rhel prisma engine present' && \
+    echo '--- locating the rhel prisma engine ---' && \
+    find node_modules -name 'libquery_engine-rhel*' 2>/dev/null | head -5 | sed 's/^/  found: /' && \
+    if [ -z "$(find node_modules -name 'libquery_engine-rhel*' -print -quit 2>/dev/null)" ]; then \
+      echo "BUILD ABORTED: no rhel-openssl-3.0.x Prisma engine anywhere under node_modules. Netlify runs on Amazon Linux; without it every query fails on cold start. Check binaryTargets in packages/db/prisma/schema.prisma."; \
+      exit 1; \
+    fi && \
     npx --yes esbuild@0.24.2 netlify/src/app.mts netlify/src/crawl.mts \
       --bundle --platform=node --format=esm --target=node20 \
       --outdir=netlify/functions --out-extension:.js=.mjs \
@@ -80,9 +83,17 @@
   # Prisma must not be bundled by esbuild -- the engine is a native .node
   # binary that has to be shipped as a real file, not inlined.
   external_node_modules = ["@prisma/client", ".prisma", "telegram"]
+  # The engine can land in either place depending on how pnpm arranged the
+  # tree, which in turn depends on whether devDependencies were pruned. The
+  # build log showed prisma generate writing to the .pnpm inner path rather
+  # than the root, so both are shipped -- a missing engine is a cold-start
+  # failure on every single request, and the extra patterns cost nothing when
+  # they match nothing.
   included_files = [
     "node_modules/.prisma/client/**",
     "node_modules/@prisma/client/**",
+    "node_modules/.pnpm/@prisma+client*/node_modules/.prisma/client/**",
+    "node_modules/.pnpm/@prisma+client*/node_modules/@prisma/client/**",
     "packages/db/prisma/schema.prisma"
   ]
 
