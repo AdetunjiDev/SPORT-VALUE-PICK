@@ -14,9 +14,24 @@
 
 [build.environment]
   NODE_VERSION = "20"
-  # Prisma reads this at generate time; the Lambda engine is declared via
-  # binaryTargets in schema.prisma.
-  PRISMA_CLIENT_ENGINE_TYPE = "binary"
+
+  # ---- Secrets scanning ----
+  # Netlify scans build output for the VALUE of every configured env var.
+  # Several of ours are ordinary constants, not secrets, and their values
+  # occur throughout the source: ALLOW_SIGNUP=1 matches the digit "1" in
+  # 59 files, TELEGRAM_MSG_LIMIT=25 in 21, NODE_ENV=production in 5. Those
+  # matches are what fail the build, not a leak.
+  #
+  # Only genuinely non-secret keys are omitted here. Every real credential
+  # -- DATABASE_URL, DIRECT_URL, SUPABASE_SERVICE_ROLE_KEY, REDIS_URL,
+  # SESSION_SECRET, APP_PASSWORD, ADMIN_KEY, APIFOOTBALL_KEY,
+  # BYTEZ_API_KEY, TELEGRAM_API_HASH, TELEGRAM_SESSION -- stays scanned,
+  # so an actual leak still breaks the build. Do not add them here.
+  SECRETS_SCAN_OMIT_KEYS = "NODE_ENV,ALLOW_SIGNUP,PUBLIC_BASE_URL,SUPABASE_URL,SUPABASE_ANON_KEY,APIFOOTBALL_PROVIDER,APIFOOTBALL_DAILY_BUDGET,APIFOOTBALL_INTEL_BUDGET,APIFOOTBALL_PREDS_PER_CYCLE,DEFAULT_CRAWL_INTERVAL_SEC,PLAN_DAILY_NGN,PLAN_WEEKLY_NGN,PLAN_MONTHLY_NGN,TELEGRAM_MSG_LIMIT,TELEGRAM_OCR_PER_CHANNEL,TELEGRAM_API_ID"
+
+  # .env.example ships placeholder credentials for local Docker; they are
+  # not real and would otherwise trip the scanner.
+  SECRETS_SCAN_OMIT_PATHS = ".env.example,README.md,deploy/DEPLOY.md"
 
 [functions]
   directory = "netlify/functions"
