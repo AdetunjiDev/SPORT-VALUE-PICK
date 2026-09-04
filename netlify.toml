@@ -1,0 +1,42 @@
+# =====================================================================
+# Netlify configuration for Sporty Value Pick AI.
+#
+# There is no static site here. Every route is rendered at request time
+# by netlify/functions/app.mts, which wraps the same handleRequest() that
+# the local node:http listener uses. The `publish` directory exists only
+# because Netlify requires one; it holds a single placeholder that is
+# never served, since the function claims "/*".
+# =====================================================================
+
+[build]
+  command = "pnpm install --frozen-lockfile && pnpm --filter @sportybet/db generate && mkdir -p public && echo 'ok' > public/index.html"
+  publish = "public"
+
+[build.environment]
+  NODE_VERSION = "20"
+  # Prisma reads this at generate time; the Lambda engine is declared via
+  # binaryTargets in schema.prisma.
+  PRISMA_CLIENT_ENGINE_TYPE = "binary"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+  # Prisma must not be bundled by esbuild -- the engine is a native .node
+  # binary that has to be shipped as a real file, not inlined.
+  external_node_modules = ["@prisma/client", ".prisma", "telegram"]
+  included_files = [
+    "node_modules/.prisma/client/**",
+    "node_modules/@prisma/client/**",
+    "packages/db/prisma/schema.prisma"
+  ]
+
+# ---------------------------------------------------------------------
+# Routing: hand every path to the app function. force = true is required,
+# otherwise Netlify serves the placeholder public/index.html at "/" and
+# only falls through to the function on a miss.
+# ---------------------------------------------------------------------
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/app"
+  status = 200
+  force = true

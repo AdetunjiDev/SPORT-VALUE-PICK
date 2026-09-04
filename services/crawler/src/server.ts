@@ -5275,8 +5275,19 @@ function renderUpgrade(
 </div></body></html>`;
 }
 
-export function startServer() {
-  const server = http.createServer(async (req, res) => {
+/**
+ * The entire HTTP surface — every route, rendered server-side.
+ *
+ * Extracted from startServer so the same code can be driven two ways: by a
+ * long-lived node:http listener locally and in Docker, or by a serverless
+ * adapter (Netlify Functions) where no listener exists. The body is left at
+ * its original indentation on purpose — it is dense with HTML/CSS/JS
+ * template literals whose whitespace is significant.
+ */
+export async function handleRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+) {
     try {
       const url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
 
@@ -6269,7 +6280,10 @@ export function startServer() {
       res.writeHead(500, { "Content-Type": "text/plain" });
       res.end(`Error: ${err?.message ?? err}`);
     }
-  });
+}
+
+export function startServer() {
+  const server = http.createServer(handleRequest);
 
   server.listen(config.port, () => {
     console.log(`Dashboard:  http://localhost:${config.port}`);

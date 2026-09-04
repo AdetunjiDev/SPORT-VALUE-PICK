@@ -8,11 +8,23 @@
 
 generator client {
   provider = "prisma-client-js"
+  // "native" covers local dev and the Docker image. Netlify Functions run on
+  // AWS Lambda (Amazon Linux 2023, OpenSSL 3), which needs its own engine
+  // binary compiled in at generate time — without it the function throws
+  // "Query engine library for current platform could not be found" on cold
+  // start, and only in production.
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  // Runtime connection. On Supabase this is the TRANSACTION pooler (port 6543)
+  // with ?pgbouncer=true&connection_limit=1. Locally it is plain Postgres.
+  url       = env("DATABASE_URL")
+  // Migrations and introspection cannot run through a transaction pooler.
+  // On Supabase this is the SESSION pooler (port 5432). Locally it is the
+  // same value as DATABASE_URL.
+  directUrl = env("DIRECT_URL")
 }
 
 // =====================================================
