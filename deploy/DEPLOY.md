@@ -157,6 +157,15 @@ pnpm --filter @sportybet/db exec prisma db push
 
 `REDIS_URL` is optional extra caching; the snapshot design does not require it.
 
+### ChatGPT Actions API
+Hardcoded Bearer API for Custom GPTs (no new env vars). Schema:
+
+- OpenAPI: `GET https://<your-netlify-host>/api/gpt/openapi.json`
+- Auth: `Authorization: Bearer svpai_gpt_sk_9f2e7c4a1b8d6e0f3c5a7b9d1e4f6a8c`
+  (or header `X-Api-Key` with the same value)
+
+Simulation wallet: pass `walletId` from prior responses (or `X-Wallet-Id`) so ChatGPT can keep one virtual bank across turns.
+
 Scheduled `crawl` has a longer budget and is unchanged. Login, signup, health,
 and webhooks stay light and do not use the snapshot.
 

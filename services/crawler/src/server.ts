@@ -11,6 +11,7 @@ import {
   snapshotIsFresh,
   type HumanDashboardSnapshotPayload,
 } from "./snapshot.js";
+import { handleChatGptApi } from "./chatgpt-api.js";
 import { getPredictions } from "./predictions.js";
 import { planForTips, legsForFixtureKeys, getSportyFixtures, fetchEventById, fuzzyTeamsMatch, PICKS, devig, type SbEvent } from "./forebet-ai.js";
 import { createBookingCode } from "./booker.js";
@@ -883,8 +884,6 @@ async function renderDashboard(
         ...c,
         foundAt: new Date(c.foundAt as unknown as string),
         verifiedAt: c.verifiedAt ? new Date(c.verifiedAt as unknown as string) : c.verifiedAt,
-        createdAt: c.createdAt ? new Date(c.createdAt as unknown as string) : c.createdAt,
-        updatedAt: c.updatedAt ? new Date(c.updatedAt as unknown as string) : c.updatedAt,
       }));
     let allCodes = hydrate(humanSnap.codes);
     if (day) {
@@ -5392,6 +5391,9 @@ export async function handleRequest(
         res.end(JSON.stringify({ received: true }));
         return;
       }
+
+      // ---- ChatGPT Actions API (Bearer key; bypasses APP_PASSWORD) ----
+      if (await handleChatGptApi(req, res, url)) return;
 
       // ---- User session ----
       const sessionUserId = verifySession(readCookie(cookies, "sid"));
