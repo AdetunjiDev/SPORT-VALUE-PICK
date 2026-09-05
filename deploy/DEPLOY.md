@@ -130,6 +130,36 @@ The site can also run as Netlify Functions (`scripts/netlify-build.sh` +
 `netlify.toml`). That path is already wired; this section is for when a deploy
 goes red.
 
+### Sync timeout (~10s) and dashboard snapshots
+Netlify **sync** functions (the `app` handler) are killed at about **10 seconds**
+on the free tier. When that happens Netlify shows “This function has crashed”
+— that is a platform timeout, not a Prisma bug.
+
+Mitigations in this repo:
+
+1. **Soft deadline (~8s)** in `netlify/src/app.mts` — if work is still running,
+   the function returns a friendly “still warming / retry” HTML page with
+   auto-refresh instead of letting Netlify kill the Lambda cold.
+2. **`RenderSnapshot` (Postgres)** — after each successful scheduled crawl
+   (`netlify/src/crawl.mts`, every ~3 minutes), the scheduler upserts a
+   `dashboard-human` row with the list/KPI payload the human dashboard needs.
+   On Netlify/Lambda, `/` prefers that snapshot when it is fresher than
+   ~10 minutes, so the HTTP path is mostly one read + light session work.
+
+Before relying on the fast path, apply the Prisma schema to production so the
+`render_snapshots` table exists:
+
+```bash
+# from repo root, with DATABASE_URL / DIRECT_URL set
+pnpm --filter @sportybet/db exec prisma db push
+# or: prisma migrate deploy  (if you use migrations)
+```
+
+`REDIS_URL` is optional extra caching; the snapshot design does not require it.
+
+Scheduled `crawl` has a longer budget and is unchanged. Login, signup, health,
+and webhooks stay light and do not use the snapshot.
+
 ### Required env vars
 Set the same secrets you use locally / on VPS in **Site settings → Environment
 variables**, including at least `DATABASE_URL`, `DIRECT_URL`, `SESSION_SECRET`,
@@ -141,7 +171,8 @@ at generate time.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `@prisma/client did not initialize yet` | Stub client shipped instead of generated one | Redeploy with cache clear. Build aborts if the client is still a stub. |
-| `An unknown error has occurred` (no stack) | Unhandled throw / timeout / bad packaging | Current build returns an HTML error page with the real message instead of crashing. Check Functions → app logs. Confirm `DATABASE_URL` is set. Free tier sync limit is ~10s — heavy dashboard renders can still time out. |
+| `An unknown error has occurred` / crash page | Unhandled throw, packaging, or hard timeout | Soft-timeout returns retry HTML; check Functions → app logs for `[netlify/app] soft-timeout` or real errors. Confirm `DATABASE_URL` and that `render_snapshots` exists (`db push`). |
+| Soft-timeout retry page keeps looping | Snapshot cold / missing table | Wait for one successful scheduled crawl, or run `db push` then trigger crawl. |
 | `Query engine library for current platform could not be found` | Missing `rhel-openssl-3.0.x` binary | Confirm `binaryTargets` includes `rhel-openssl-3.0.x`, then redeploy. |
 | `ERR_MODULE_NOT_FOUND: @prisma/client` | Non-hoisted `node_modules` | Confirm `.npmrc` has `node-linker=hoisted`. Clear cache and redeploy. |
 | `Missing DATABASE_URL` HTML page | Env var not configured on the site | Add `DATABASE_URL` (+ `DIRECT_URL`) in Netlify env, redeploy. |

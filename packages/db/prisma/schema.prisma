@@ -795,6 +795,17 @@ model LookupCache {
   @@map("lookup_cache")
 }
 
+// Precomputed dashboard payload written after each crawl so Netlify's ~10s
+// sync function can serve the human dashboard as a single fast read instead
+// of recomputing expert/recommended pools on every request.
+model RenderSnapshot {
+  id        String   @id // e.g. "dashboard-human"
+  payload   Json
+  updatedAt DateTime @updatedAt
+
+  @@map("render_snapshots")
+}
+
 // Track record for Expert Picks: each distinct recommendation the engine makes
 // is logged once, then settled after kickoff against SportyBet's own final
 // score (factsCenter/event) — giving an HONEST, auditable hit-rate by

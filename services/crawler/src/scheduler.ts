@@ -7,6 +7,7 @@ import { settleDemoBets, pruneOldDemoBets } from "./demo.js";
 import { getSportyFixtures } from "./forebet-ai.js";
 import { runDueAutopilots } from "./autopilot.js";
 import { config } from "./config.js";
+import { writeDashboardSnapshot } from "./snapshot.js";
 
 let running = false;
 let runningSince = 0; // when the in-flight cycle started (for the stuck-cycle watchdog)
@@ -110,6 +111,16 @@ export async function runCycle(trigger: string): Promise<string> {
     console.log(lastSummary);
     for (const r of results.filter((x) => x.error)) {
       console.warn(`  ! ${r.sourceName}: ${r.error}`);
+    }
+    // Refresh the serverless dashboard snapshot. Best-effort — never fail the cycle.
+    try {
+      await writeDashboardSnapshot({ lastRunAt, lastSummary });
+      console.log("[snapshot] dashboard-human updated");
+    } catch (err) {
+      console.warn(
+        "[snapshot] write failed:",
+        err instanceof Error ? err.message : err,
+      );
     }
     return lastSummary;
   } finally {

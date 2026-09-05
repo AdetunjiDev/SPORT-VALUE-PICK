@@ -5,6 +5,12 @@ import { RESPONSIBLE_GAMBLING_DISCLAIMER } from "@sportybet/shared";
 import { config } from "./config.js";
 import { isEmailEnabled } from "./mailer.js";
 import { runCycle, lastRunAt, nextRunAt, lastSummary, intervalSec } from "./scheduler.js";
+import {
+  isServerlessRuntime,
+  readDashboardSnapshot,
+  snapshotIsFresh,
+  type HumanDashboardSnapshotPayload,
+} from "./snapshot.js";
 import { getPredictions } from "./predictions.js";
 import { planForTips, legsForFixtureKeys, getSportyFixtures, fetchEventById, fuzzyTeamsMatch, PICKS, devig, type SbEvent } from "./forebet-ai.js";
 import { createBookingCode } from "./booker.js";
@@ -521,6 +527,15 @@ async function renderDashboard(
 ): Promise<string> {
   const bookie = getBookmaker(bookieId);
   const liveBookie = activeBookmaker();
+
+  // On Netlify/Lambda, prefer a fresh post-crawl snapshot for the default
+  // human dashboard so we stay under the ~10s sync limit.
+  let humanSnap: HumanDashboardSnapshotPayload | null = null;
+  if (mode === "human" && isServerlessRuntime()) {
+    const snap = await readDashboardSnapshot();
+    if (snap && snapshotIsFresh(snap.updatedAt)) humanSnap = snap.payload;
+  }
+
   const preds = mode === "pred" ? await getPredictions() : [];
   // Expert picks: highest-confidence selections across the chosen day window.
   // This scans several days of fixtures and blends in live form lookups per
@@ -559,9 +574,12 @@ async function renderDashboard(
   // Same cost problem as Expert Picks above, times four (result/goals/btts/
   // value pools computed in parallel on every load of the default Dashboard
   // page) — cached the same way, per 8-minute window.
+  // On serverless with a fresh snapshot we skip this entirely (biggest timeout cause).
   const recommended =
     mode !== "human"
       ? ([] as typeof expertPicks)
+      : humanSnap
+        ? ([] as typeof expertPicks)
       : await cached(`dash:reco:v1:${dashSeed}`, 500, async () => {
     const seed = dashSeed;
     const MIN_CONF = 0.55;
@@ -836,34 +854,89 @@ async function renderDashboard(
   // Hide INVALID codes everywhere — they're confirmed junk (wrong bookmaker,
   // promos, or expired), so users only ever see real, usable codes.
   const notInvalid = { status: { not: "INVALID" as const } };
-  const [codes, totalCodes, sourceCount, lastRuns, aiSlips, activeCount, dateRows] =
-    await Promise.all([
-      prisma.humanCode.findMany({
-        where: { ...codeWhere, ...notInvalid },
-        orderBy: { foundAt: "desc" },
-        take: 150,
-        include: { source: true, score: true },
-      }),
-      prisma.humanCode.count({ where: notInvalid }),
-      prisma.source.count({ where: { enabled: true } }),
-      prisma.crawlRun.findMany({ orderBy: { startedAt: "desc" }, take: 8, include: { source: true } }),
-      prisma.aiBetSlip.findMany({ orderBy: { totalOdds: "asc" } }),
-      prisma.humanCode.count({ where: { status: "ACTIVE" } }),
-      prisma.$queryRaw<{ d: string; n: number }[]>`
-        SELECT to_char("foundAt" AT TIME ZONE 'Africa/Lagos', 'YYYY-MM-DD') AS d, count(*)::int AS n
-        FROM human_codes WHERE status <> 'INVALID' GROUP BY 1 ORDER BY 1 DESC LIMIT 14`,
-    ]);
 
-  // Telegram data-source status: are we reading via the OFFICIAL API or the
-  // public web-preview scrape? Surfaced on the dashboard so it's visible.
-  const tgApiLive = telegramClientEnabled();
-  const tgChannels = await prisma.source.count({ where: { enabled: true, type: "TELEGRAM" } });
+  type DashCode = Awaited<
+    ReturnType<
+      typeof prisma.humanCode.findMany<{
+        include: { source: true; score: true };
+      }>
+    >
+  >[number];
+
+  let codes: DashCode[];
+  let totalCodes: number;
+  let sourceCount: number;
+  let lastRuns: Awaited<
+    ReturnType<
+      typeof prisma.crawlRun.findMany<{ include: { source: true } }>
+    >
+  >;
+  let aiSlips: Awaited<ReturnType<typeof prisma.aiBetSlip.findMany>>;
+  let activeCount: number;
+  let dateRows: { d: string; n: number }[];
+  let tgApiLive: boolean;
+  let tgChannels: number;
+
+  if (humanSnap) {
+    const hydrate = (rows: unknown[]): DashCode[] =>
+      (rows as DashCode[]).map((c) => ({
+        ...c,
+        foundAt: new Date(c.foundAt as unknown as string),
+        verifiedAt: c.verifiedAt ? new Date(c.verifiedAt as unknown as string) : c.verifiedAt,
+        createdAt: c.createdAt ? new Date(c.createdAt as unknown as string) : c.createdAt,
+        updatedAt: c.updatedAt ? new Date(c.updatedAt as unknown as string) : c.updatedAt,
+      }));
+    let allCodes = hydrate(humanSnap.codes);
+    if (day) {
+      const gte = new Date(`${day}T00:00:00+01:00`).getTime();
+      const lte = new Date(`${day}T23:59:59.999+01:00`).getTime();
+      allCodes = allCodes.filter((c) => {
+        const t = new Date(c.foundAt).getTime();
+        return t >= gte && t <= lte;
+      });
+    }
+    codes = allCodes;
+    totalCodes = humanSnap.totalCodes;
+    sourceCount = humanSnap.sourceCount;
+    lastRuns = [];
+    aiSlips = humanSnap.aiSlips as typeof aiSlips;
+    activeCount = humanSnap.activeCount;
+    dateRows = humanSnap.dateRows;
+    tgApiLive = humanSnap.tgApiLive;
+    tgChannels = humanSnap.tgChannels;
+  } else {
+    [codes, totalCodes, sourceCount, lastRuns, aiSlips, activeCount, dateRows] =
+      await Promise.all([
+        prisma.humanCode.findMany({
+          where: { ...codeWhere, ...notInvalid },
+          orderBy: { foundAt: "desc" },
+          take: 150,
+          include: { source: true, score: true },
+        }),
+        prisma.humanCode.count({ where: notInvalid }),
+        prisma.source.count({ where: { enabled: true } }),
+        prisma.crawlRun.findMany({ orderBy: { startedAt: "desc" }, take: 8, include: { source: true } }),
+        prisma.aiBetSlip.findMany({ orderBy: { totalOdds: "asc" } }),
+        prisma.humanCode.count({ where: { status: "ACTIVE" } }),
+        prisma.$queryRaw<{ d: string; n: number }[]>`
+          SELECT to_char("foundAt" AT TIME ZONE 'Africa/Lagos', 'YYYY-MM-DD') AS d, count(*)::int AS n
+          FROM human_codes WHERE status <> 'INVALID' GROUP BY 1 ORDER BY 1 DESC LIMIT 14`,
+      ]);
+
+    // Telegram data-source status: are we reading via the OFFICIAL API or the
+    // public web-preview scrape? Surfaced on the dashboard so it's visible.
+    tgApiLive = telegramClientEnabled();
+    tgChannels = await prisma.source.count({ where: { enabled: true, type: "TELEGRAM" } });
+  }
 
   // Feature the latest ACTIVE code in the hero — never an INVALID/expired one.
   const latest = codes.find((c) => c.status === "ACTIVE") ?? codes[0];
   const nextMs = nextRunAt ? new Date(nextRunAt).getTime() : 0;
-  const lastUpd = lastRunAt ? new Date(lastRunAt).toLocaleTimeString() : "—";
-  const lastRunIso = lastRunAt ? new Date(lastRunAt).toISOString() : "";
+  const effectiveLastRun =
+    lastRunAt ??
+    (humanSnap?.lastRunAt ? new Date(humanSnap.lastRunAt) : null);
+  const lastUpd = effectiveLastRun ? new Date(effectiveLastRun).toLocaleTimeString() : "—";
+  const lastRunIso = effectiveLastRun ? new Date(effectiveLastRun).toISOString() : "";
 
   // ---- Hero (latest code) ----
   // The hero shows the newest code, which is rank 0 in the table below, so it
@@ -2944,7 +3017,7 @@ async function renderDashboard(
             <div class="card">
               <div class="card-head"><h3>Crawl activity</h3></div>
               <ul class="runs">${runRows || '<li class="muted">No runs yet.</li>'}</ul>
-              <div class="muted small mono">${esc(lastSummary)}</div>
+              <div class="muted small mono">${esc(humanSnap?.lastSummary || lastSummary)}</div>
             </div>
           </div>`
               : ""
