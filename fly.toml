@@ -1,0 +1,69 @@
+# =====================================================================
+# Fly.io deployment for Sporty Value Pick AI.
+#
+# Chosen because it runs the existing Dockerfile as-is: no bundler, no
+# node_modules tracing, no function packaging. The failures on Netlify
+# were all build-system failures, never application failures.
+#
+# Deploy:  fly launch --no-deploy --copy-config   (first time only)
+#          fly secrets import < project.env       (loads every secret)
+#          fly deploy
+# =====================================================================
+
+app = "sporty-value-pick"
+primary_region = "lhr"           # London — nearest Fly region to Supabase eu-west-1
+
+[build]
+  dockerfile = "services/crawler/Dockerfile"
+
+[env]
+  # config.ts prefers PORT over CRAWLER_PORT, and Fly does not inject one,
+  # so it is set here to match internal_port below.
+  PORT = "4100"
+  NODE_ENV = "production"
+  TZ = "Africa/Lagos"
+  DEFAULT_CRAWL_INTERVAL_SEC = "180"
+  # DEFAULT_TIER is deliberately unset. Setting it to "premium" (as local
+  # docker-compose does) would hand every visitor a free Premium account and
+  # the paywall would never fire.
+
+[http_service]
+  internal_port = 4100
+  force_https = true
+
+  # This app is NOT a request-driven web service. It crawls every 180s whether
+  # or not anyone is visiting, so the machine must never be suspended: an
+  # auto-stopped instance is a crawler that has silently stopped collecting.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 40
+    hard_limit = 80
+
+# ---------------------------------------------------------------------
+# Health check.
+#
+# /health returns 200 only when the crawl loop is armed AND on schedule,
+# and 503 with scheduler "not-armed"/"overdue" otherwise. Fly restarts the
+# machine on sustained failure, so a wedged crawler recovers by itself
+# instead of sitting dead behind a green light for days.
+#
+# grace_period is generous: the container installs nothing at boot but does
+# connect to Supabase and run a first crawl cycle, whose p95 is ~14s with a
+# tail into minutes. Restarting mid-first-cycle would be worse than waiting.
+# ---------------------------------------------------------------------
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "10s"
+  grace_period = "120s"
+  method = "GET"
+  path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  # 512MB is not enough: the image carries Prisma's query engine, the gramJS
+  # Telegram client and tesseract, and a crawl cycle holds fixtures in memory.
+  memory = "1gb"
