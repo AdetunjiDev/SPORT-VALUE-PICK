@@ -4,7 +4,7 @@ import { prisma } from "@sportybet/db";
 import { RESPONSIBLE_GAMBLING_DISCLAIMER } from "@sportybet/shared";
 import { config } from "./config.js";
 import { isEmailEnabled } from "./mailer.js";
-import { runCycle, lastRunAt, nextRunAt, lastSummary, intervalSec } from "./scheduler.js";
+import { runCycle, lastRunAt, nextRunAt, lastSummary, intervalSec, schedulerArmed, overdueMs } from "./scheduler.js";
 import { getPredictions } from "./predictions.js";
 import { planForTips, legsForFixtureKeys, getSportyFixtures, fetchEventById, fuzzyTeamsMatch, PICKS, devig, type SbEvent } from "./forebet-ai.js";
 import { createBookingCode } from "./booker.js";
@@ -5648,10 +5648,23 @@ export async function handleRequest(
         return;
       }
       if (url.pathname === "/health") {
-        res.writeHead(200, { "Content-Type": "application/json" });
+        // This is what a hosting platform polls to decide whether to restart
+        // the container, so it has to report REAL health. It used to return a
+        // hardcoded ok:true — which is why the crawler could sit dead for eight
+        // days behind a green healthcheck. A dead or badly overdue crawl loop
+        // now answers 503, and the platform recycles the instance.
+        const armed = schedulerArmed();
+        const behindMs = overdueMs();
+        const healthy = armed && behindMs === 0;
+        res.writeHead(healthy ? 200 : 503, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
         res.end(
           JSON.stringify({
-            ok: true,
+            ok: healthy,
+            scheduler: armed ? (behindMs === 0 ? "running" : "overdue") : "not-armed",
+            overdueSeconds: Math.round(behindMs / 1000),
             lastRunAt,
             nextRunAt,
             intervalSec,

@@ -23,6 +23,28 @@ export let nextRunAt: Date | null = null;
 export let lastSummary = "";
 export const intervalSec = config.defaultIntervalSec;
 
+// Whether the crawl loop is actually running. /health reports this, and a host
+// platform restarts the container when it is false — which is the difference
+// between a dead crawler being noticed in seconds and being noticed in days.
+let armed = false;
+
+/** True once startScheduler() has installed its timers. */
+export function schedulerArmed(): boolean {
+  return armed;
+}
+
+/**
+ * How overdue the crawl loop is, in milliseconds — 0 when on schedule.
+ * A cycle can legitimately overrun (the p95 is ~14s but the tail reaches
+ * minutes), so only a gap of several intervals means something is wrong.
+ */
+export function overdueMs(): number {
+  if (!armed || !lastRunAt) return 0;
+  const gap = Date.now() - lastRunAt.getTime();
+  const allowed = config.defaultIntervalSec * 1000 * 3;
+  return gap > allowed ? gap - allowed : 0;
+}
+
 // Recompute AI slips every cycle (default). This is cheap — delta booking in
 // generateAiSlips() reuses existing codes when a slip's selections are
 // unchanged and only mints a new SportyBet code when the picks actually change
@@ -120,6 +142,7 @@ export async function runCycle(trigger: string): Promise<string> {
 export function startScheduler() {
   const intervalMs = config.defaultIntervalSec * 1000;
   console.log(`Scheduler: crawling every ${config.defaultIntervalSec}s.`);
+  armed = true;
   // Kick off immediately, then on the interval.
   void runCycle("startup");
   nextRunAt = new Date(Date.now() + intervalMs);
@@ -146,4 +169,5 @@ export function startScheduler() {
 export function stopScheduler() {
   if (timer) clearInterval(timer);
   if (watchdog) clearInterval(watchdog);
+  armed = false;
 }
