@@ -836,22 +836,29 @@ async function renderDashboard(
   // Hide INVALID codes everywhere — they're confirmed junk (wrong bookmaker,
   // promos, or expired), so users only ever see real, usable codes.
   const notInvalid = { status: { not: "INVALID" as const } };
+  // Every code belongs to exactly one bookmaker, so the whole view is scoped to
+  // the selected one. This has to be applied to the counts and the date tabs as
+  // well as the table: filtering only the table would show an empty list under
+  // date tabs still claiming hundreds of codes, which reads as a broken page
+  // rather than as "this bookmaker has no codes yet".
+  const bookieWhere = { bookmaker: bookie.id };
   const [codes, totalCodes, sourceCount, lastRuns, aiSlips, activeCount, dateRows] =
     await Promise.all([
       prisma.humanCode.findMany({
-        where: { ...codeWhere, ...notInvalid },
+        where: { ...codeWhere, ...notInvalid, ...bookieWhere },
         orderBy: { foundAt: "desc" },
         take: 150,
         include: { source: true, score: true },
       }),
-      prisma.humanCode.count({ where: notInvalid }),
+      prisma.humanCode.count({ where: { ...notInvalid, ...bookieWhere } }),
       prisma.source.count({ where: { enabled: true } }),
       prisma.crawlRun.findMany({ orderBy: { startedAt: "desc" }, take: 8, include: { source: true } }),
       prisma.aiBetSlip.findMany({ orderBy: { totalOdds: "asc" } }),
-      prisma.humanCode.count({ where: { status: "ACTIVE" } }),
+      prisma.humanCode.count({ where: { status: "ACTIVE", ...bookieWhere } }),
       prisma.$queryRaw<{ d: string; n: number }[]>`
         SELECT to_char("foundAt" AT TIME ZONE 'Africa/Lagos', 'YYYY-MM-DD') AS d, count(*)::int AS n
-        FROM human_codes WHERE status <> 'INVALID' GROUP BY 1 ORDER BY 1 DESC LIMIT 14`,
+        FROM human_codes WHERE status <> 'INVALID' AND bookmaker = ${bookie.id}
+        GROUP BY 1 ORDER BY 1 DESC LIMIT 14`,
     ]);
 
   // Telegram data-source status: are we reading via the OFFICIAL API or the
@@ -2920,7 +2927,14 @@ async function renderDashboard(
                     <th>Code</th><th>Type</th><th>Score</th><th>Odds</th><th>Games</th>
                     <th>League</th><th>Found</th><th>Expires</th>${isAdmin ? "<th>Source</th>" : ""}<th>Status</th><th title="🎮 demo-test the code · ✏️ edit its games in AI Analysis">Try</th>
                   </tr></thead>
-                  <tbody id="rows">${rows || `<tr><td colspan="${isAdmin ? 11 : 10}" class="muted" style="text-align:center;padding:24px">No codes for ${showAll ? "any date yet" : dayLabel(day) + " yet"} — new codes appear as soon as they're discovered. Try “ALL” or an earlier date above.</td></tr>`}</tbody>
+                  <tbody id="rows">${
+                    rows ||
+                    (bookie.status !== "live"
+                      // A bookmaker with no adapter has no codes on ANY date, so
+                      // "try an earlier date" would send the user in circles.
+                      ? `<tr><td colspan="${isAdmin ? 11 : 10}" class="muted" style="text-align:center;padding:24px">No ${esc(bookie.name)} codes yet — its integration isn't built, so nothing is being discovered for it. Codes from other bookmakers can't be shown here, because a booking code only works on the bookmaker that issued it. <a href="/bookmaker?id=${liveBookie.id}">Switch to ${esc(liveBookie.name)}</a>.</td></tr>`
+                      : `<tr><td colspan="${isAdmin ? 11 : 10}" class="muted" style="text-align:center;padding:24px">No codes for ${showAll ? "any date yet" : dayLabel(day) + " yet"} — new codes appear as soon as they're discovered. Try “ALL” or an earlier date above.</td></tr>`)
+                  }</tbody>
                 </table>
               </div>
             </div>
@@ -4107,7 +4121,7 @@ async function renderDashboard(
     <div class="content">
       ${
         bookie.status !== "live"
-          ? `<div class="bookie-soon">🚧 <b>${esc(bookie.emoji + " " + bookie.name)} is coming soon.</b> ${bookie.note ? esc(bookie.note.charAt(0).toUpperCase() + bookie.note.slice(1)) + ". " : ""}It needs its own odds + booking-code integration before it goes live. Meanwhile you're seeing <b>${esc(liveBookie.emoji + " " + liveBookie.name)}</b> data — codes generated here are ${esc(liveBookie.name)} codes. <a href="/bookmaker?id=${liveBookie.id}">Switch to ${esc(liveBookie.name)}</a></div>`
+          ? `<div class="bookie-soon">🚧 <b>${esc(bookie.emoji + " " + bookie.name)} is coming soon.</b> ${bookie.note ? esc(bookie.note.charAt(0).toUpperCase() + bookie.note.slice(1)) + ". " : ""}It needs its own odds + booking-code integration before it goes live, so there are <b>no ${esc(bookie.name)} codes yet</b> — a booking code only works on the bookmaker that issued it, so ${esc(liveBookie.name)} codes cannot be shown here. <a href="/bookmaker?id=${liveBookie.id}">Switch to ${esc(liveBookie.emoji + " " + liveBookie.name)}</a> to see live codes.</div>`
           : ""
       }
       <div class="risk-banner" id="riskBanner">

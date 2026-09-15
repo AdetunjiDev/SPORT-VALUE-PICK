@@ -327,6 +327,11 @@ model HumanCode {
   datePublished DateTime?
   matchDate     DateTime?
   contentHash   String     @unique // dedupe key (code + source + day)
+  // Which bookmaker issued this code. A booking code is an opaque reference to
+  // a slip inside ONE bookmaker's system — it is not portable, so every code
+  // has to record where it came from before the dashboard can filter by
+  // platform. Existing rows are all SportyBet, hence the default.
+  bookmaker     String     @default("sportybet")
   betType       String? // multiple | system | single (from SportyBet)
   selections    Json? // [{ eventId, home, away, league, kickoff, market, pick, odds }]
   foundAt       DateTime   @default(now())
@@ -342,6 +347,8 @@ model HumanCode {
   @@index([code])
   @@index([status, foundAt])
   @@index([codeType])
+  // The dashboard's default view is "this bookmaker, newest first".
+  @@index([bookmaker, foundAt])
   @@map("human_codes")
 }
 
@@ -707,10 +714,13 @@ model GeneratedCode {
   games         Int      @default(0)
   totalOdds     Float    @default(1)
   legs          Json? // [{ home, away, league, pick, odds, kickoff }]
+  // Which bookmaker this code was created on — see the note on HumanCode.
+  bookmaker     String   @default("sportybet")
   createdAt     DateTime @default(now()) // the day + time it was generated
 
   @@index([generatorName, createdAt])
   @@index([createdAt])
+  @@index([bookmaker, createdAt])
   @@map("generated_codes")
 }
 
